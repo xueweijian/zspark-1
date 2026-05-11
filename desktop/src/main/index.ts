@@ -1,8 +1,8 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } from 'electron'
 import type { OpenDialogOptions } from 'electron'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
-import { dirname, join } from 'node:path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream } from 'node:fs'
+import { basename, delimiter, dirname, join } from 'node:path'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync } from 'node:fs'
 import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
@@ -25,6 +25,11 @@ const PROVIDER_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/models'
 const SETTINGS_PATH = join(app.getPath('userData'), 'zspark-settings.json')
 const WORKSPACE_ROOT = resolveWorkspaceRoot(process.cwd())
 const ATTACHMENTS_DIR = join(WORKSPACE_ROOT, '.zspark-attachments')
+const CODEX_RUNTIME_DEPS_DIR = join(app.getPath('home'), '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies')
+const CODEX_RUNTIME_NODE = join(CODEX_RUNTIME_DEPS_DIR, 'node', 'bin', process.platform === 'win32' ? 'node.exe' : 'node')
+const CODEX_RUNTIME_NODE_MODULES = join(CODEX_RUNTIME_DEPS_DIR, 'node', 'node_modules')
+const CODEX_RUNTIME_PYTHON = join(CODEX_RUNTIME_DEPS_DIR, 'python', 'bin', process.platform === 'win32' ? 'python.exe' : 'python3')
+const MAX_CODEX_LOG_BYTES = 8 * 1024 * 1024
 
 function resolveWorkspaceRoot(start: string): string {
   let dir = start
@@ -86,6 +91,60 @@ function normalizeProviderBaseUrl(rawBaseUrl: string): string {
   } catch {
     return rawBaseUrl.trim().replace(/\/+$/, '')
   }
+}
+
+function workspaceRuntimeInfo() {
+  const available = existsSync(CODEX_RUNTIME_NODE) && existsSync(CODEX_RUNTIME_NODE_MODULES) && existsSync(CODEX_RUNTIME_PYTHON)
+  return {
+    nodePath: CODEX_RUNTIME_NODE,
+    nodeModulesPath: CODEX_RUNTIME_NODE_MODULES,
+    pythonPath: CODEX_RUNTIME_PYTHON,
+    available
+  }
+}
+
+function workspaceRuntimeEnv(): Record<string, string> {
+  const rt = workspaceRuntimeInfo()
+  if (!rt.available) return {}
+  return {
+    ZSPARK_CODEX_RUNTIME_NODE: rt.nodePath,
+    ZSPARK_CODEX_RUNTIME_NODE_MODULES: rt.nodeModulesPath,
+    ZSPARK_CODEX_RUNTIME_PYTHON: rt.pythonPath,
+    NODE_PATH: [rt.nodeModulesPath, process.env.NODE_PATH].filter(Boolean).join(delimiter),
+    PATH: `${dirname(rt.nodePath)}${delimiter}${process.env.PATH ?? ''}`
+  }
+}
+
+function rotateLogIfLarge(path: string) {
+  try {
+    if (!existsSync(path) || statSync(path).size < MAX_CODEX_LOG_BYTES) return
+    renameSync(path, `${path}.1`)
+  } catch {
+    // Diagnostics must never prevent the app-server from starting.
+  }
+}
+
+function formatCodexLogChunk(channel: 'stdout' | 'stderr', chunk: string): string {
+  return chunk.split(/\n/).map((line, index, lines) => {
+    if (!line && index === lines.length - 1) return ''
+    const trimmed = line.trim()
+    if (trimmed) {
+      try {
+        const json = JSON.parse(trimmed)
+        if (json?.method === 'item/agentMessage/delta') {
+          const params = json.params ?? {}
+          return `[${channel}] ${JSON.stringify({
+            method: json.method,
+            threadId: params.threadId,
+            turnId: params.turnId,
+            itemId: params.itemId,
+            deltaChars: String(params.delta ?? '').length
+          })}\n`
+        }
+      } catch {}
+    }
+    return `[${channel}] ${line}\n`
+  }).join('')
 }
 
 /**
@@ -154,24 +213,25 @@ function spawnCodex() {
   // turning on full RUST_LOG noise in the chat UI.
   const logPath = join(app.getPath('userData'), 'codex-stream.log')
   mkdirSync(app.getPath('userData'), { recursive: true })
+  rotateLogIfLarge(logPath)
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' })
   logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(providerArgs)} ===\n`)
   const child = spawn(bin, [...providerArgs, 'app-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     cwd: WORKSPACE_ROOT,
-    env: { ...process.env, ...providerEnv, RUST_LOG: process.env.RUST_LOG ?? 'codex_core::client=debug,codex_core::chat_completions=debug,info' }
+    env: { ...process.env, ...workspaceRuntimeEnv(), ...providerEnv, RUST_LOG: process.env.RUST_LOG ?? 'warn,codex_app_server=info' }
   })
   codex = child
   child.stdout.on('data', (b) => {
     if (codex !== child) return
     const s = b.toString()
-    logStream.write(`[stdout] ${s}`)
+    logStream.write(formatCodexLogChunk('stdout', s))
     mainWindow?.webContents.send('codex:stdout', s)
   })
   child.stderr.on('data', (b) => {
     if (codex !== child) return
     const s = b.toString()
-    logStream.write(`[stderr] ${s}`)
+    logStream.write(formatCodexLogChunk('stderr', s))
     mainWindow?.webContents.send('codex:stderr', s)
   })
   child.on('exit', (code) => {
@@ -277,7 +337,8 @@ ipcMain.handle('runtime:get', () => {
           model: settings.provider.model,
           wireApi: settings.provider.wireApi
         }
-      : undefined
+      : undefined,
+    workspaceRuntime: workspaceRuntimeInfo()
   }
 })
 
@@ -293,6 +354,21 @@ ipcMain.handle('path:reveal', (_e, filePath: string) => {
   if (!filePath) return { ok: false, error: 'Missing file path' }
   shell.showItemInFolder(filePath)
   return { ok: true }
+})
+
+ipcMain.handle('path:download', async (_e, filePath: string) => {
+  if (!filePath) return { ok: false, error: 'Missing file path' }
+  if (!existsSync(filePath)) return { ok: false, error: 'File does not exist' }
+  const save = mainWindow
+    ? await dialog.showSaveDialog(mainWindow, { defaultPath: join(app.getPath('downloads'), basename(filePath)) })
+    : await dialog.showSaveDialog({ defaultPath: join(app.getPath('downloads'), basename(filePath)) })
+  if (save.canceled || !save.filePath) return { ok: false, canceled: true }
+  try {
+    copyFileSync(filePath, save.filePath)
+    return { ok: true, path: save.filePath }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
 })
 
 app.whenReady().then(async () => {

@@ -8,6 +8,7 @@ const api = {
   discoverLocalSkills: () => ipcRenderer.invoke('skills:localAvailability'),
   openPath: (path: string) => ipcRenderer.invoke('path:open', path),
   revealPath: (path: string) => ipcRenderer.invoke('path:reveal', path),
+  downloadPath: (path: string) => ipcRenderer.invoke('path:download', path),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (s: any) => ipcRenderer.invoke('settings:save', s),
   onStdout: (cb: (s: string) => void) => ipcRenderer.on('codex:stdout', (_e, s) => cb(s)),

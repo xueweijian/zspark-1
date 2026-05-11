@@ -14,6 +14,7 @@ import {
   suggestedPromptForAttachments,
   type SkillCategory
 } from './skillCatalog'
+import { normalizeMarkdownForDisplay } from './markdown'
 import { formatApprovalPolicy, formatSandboxPolicy, shortPath } from './runtimeDisplay'
 
 declare global {
@@ -26,6 +27,7 @@ declare global {
       discoverLocalSkills: () => Promise<DiscoverLocalSkillsResult>
       openPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       revealPath: (path: string) => Promise<{ ok: boolean; error?: string }>
+      downloadPath: (path: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>
       getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
       saveSettings: (s: any) => Promise<boolean>
       onStdout: (cb: (s: string) => void) => void
@@ -91,6 +93,7 @@ interface Activity {
 type Block =
   | { type: 'user'; id: string; text: string }
   | { type: 'agent'; id: string; text: string }
+  | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[] }
   | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
 
 type ToastKind = 'info' | 'warn' | 'error'
@@ -149,6 +152,14 @@ interface RuntimeHostInfo {
   codexRunning: boolean
   bridgePort: number | null
   provider?: { baseUrl: string; model: string; wireApi: 'responses' | 'chat' }
+  workspaceRuntime?: WorkspaceRuntimeInfo
+}
+
+interface WorkspaceRuntimeInfo {
+  nodePath: string
+  nodeModulesPath: string
+  pythonPath: string
+  available: boolean
 }
 
 interface RuntimeInfo extends Partial<RuntimeHostInfo> {
@@ -265,8 +276,81 @@ function describeChange(kind: any) {
 marked.setOptions({ gfm: true, breaks: true })
 
 function Markdown({ text }: { text: string }) {
-  const html = useMemo(() => DOMPurify.sanitize(marked.parse(text || '', { async: false }) as string), [text])
+  const html = useMemo(() => {
+    const normalized = normalizeMarkdownForDisplay(text || '')
+    return DOMPurify.sanitize(marked.parse(normalized, { async: false }) as string)
+  }, [text])
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />
+}
+
+function filesFromChanges(changes: any[], base?: string, now = Date.now()): WorkspaceFile[] {
+  return changes.map((change, index) => {
+    const fullPath = resolveWorkspacePath(String(change.path ?? ''), base)
+    const status = changeKindLabel(change.kind)
+    return {
+      id: `chg-${now}-${index}`,
+      name: basename(fullPath),
+      path: fullPath,
+      source: 'change' as const,
+      status,
+      detail: describeChange(change.kind),
+      updatedAt: now
+    }
+  }).filter((file) => file.path)
+}
+
+function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string[] {
+  if (!skills.some((skill) => inferSkillCategory(skill) === 'office')) return []
+  const rt = runtime.workspaceRuntime
+  if (!rt?.available) {
+    return [
+      'Selected Office skill requirement: produce an actual editable artifact file in the workspace. Do not answer with only a specification unless a runtime/setup blocker is real and explicitly observed.'
+    ]
+  }
+
+  return [
+    [
+      'Zspark local runtime for the selected Office skill:',
+      `- Node.js executable: ${rt.nodePath}`,
+      `- Node.js packages: ${rt.nodeModulesPath}`,
+      `- Python executable: ${rt.pythonPath}`,
+      'Use these bundled dependencies for documents, spreadsheets, and presentations.',
+      'Run artifact builders from an output work directory; if ESM module resolution cannot find @oai/artifact-tool, create a local node_modules symlink to the Node.js packages path above.',
+      'For PPTX/presentation tasks, use @oai/artifact-tool from this runtime, build/export an actual .pptx in the workspace, and report the final file path. Do not claim artifact-tool cannot be executed unless a command failed.'
+    ].join('\n')
+  ]
+}
+
+function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; files: WorkspaceFile[] } {
+  const blocks: Block[] = []
+  const files: WorkspaceFile[] = []
+
+  for (const turn of turns) {
+    const items = Array.isArray(turn?.items) ? turn.items : []
+    for (const item of items) {
+      if (item?.type === 'userMessage') {
+        const txt = formatUserInputContent(item.content ?? [])
+        if (txt) blocks.push({ type: 'user', id: `replay-u-${item.id}`, text: txt })
+      } else if (item?.type === 'agentMessage') {
+        const txt = item.text ?? ''
+        if (txt) blocks.push({ type: 'agent', id: `replay-a-${item.id}`, text: txt })
+      } else if (item?.type === 'fileChange') {
+        const changed = filesFromChanges(item.changes ?? [], base, Date.now())
+        if (changed.length) {
+          files.push(...changed)
+          blocks.push({
+            type: 'files',
+            id: `replay-files-${item.id}`,
+            turnId: String(turn?.id ?? ''),
+            title: `${changed.length} file${changed.length === 1 ? '' : 's'} ready`,
+            files: changed
+          })
+        }
+      }
+    }
+  }
+
+  return { blocks, files }
 }
 
 function actIcon(k: ActivityKind) {
@@ -396,22 +480,15 @@ export function App() {
       return [...byPath.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 24)
     })
   }
-  const recordFileChanges = (changes: any[]) => {
-    const base = runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot
-    const now = Date.now()
-    upsertWorkspaceFiles(changes.map((change, index) => {
-      const fullPath = resolveWorkspacePath(String(change.path ?? ''), base)
-      const status = changeKindLabel(change.kind)
-      return {
-        id: `chg-${now}-${index}`,
-        name: basename(fullPath),
-        path: fullPath,
-        source: 'change' as const,
-        status,
-        detail: describeChange(change.kind),
-        updatedAt: now
-      }
-    }).filter((file) => file.path))
+  const upsertArtifactBlock = (turnId: string, itemId: string, files: WorkspaceFile[]) => {
+    if (files.length === 0) return
+    const id = `files-${itemId}`
+    const title = `${files.length} file${files.length === 1 ? '' : 's'} ready`
+    setBlocks((bs) => {
+      const next = { type: 'files' as const, id, turnId, title, files }
+      if (bs.some((b) => b.id === id)) return bs.map((b) => (b.id === id ? next : b))
+      return [...bs, next]
+    })
   }
 
   const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {
@@ -591,7 +668,9 @@ export function App() {
             if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'file', title })
             else {
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'file', title })
-              recordFileChanges(changes)
+              const files = filesFromChanges(changes, runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot)
+              upsertWorkspaceFiles(files)
+              upsertArtifactBlock(turnId, itemId, files)
               updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail })
             }
             return
@@ -707,23 +786,24 @@ export function App() {
     setBlocks([])
     try {
       const t = await send('thread/resume', { threadId: id })
+      if (t.error) throw new Error(t.error.message)
       applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? id)
       setPanel(null)
-      // Replay items into bubbles (best-effort: preview + saved messages)
-      const items = await send('thread/turns/items/list', { threadId: id, limit: 200 })
-      const list = items.result?.items ?? []
-      const replay: Block[] = []
-      for (const it of list) {
-        if (it?.type === 'userMessage') {
-          const txt = formatUserInputContent(it.content ?? [])
-          replay.push({ type: 'user', id: `replay-u-${it.id}`, text: txt })
-        } else if (it?.type === 'agentMessage') {
-          const txt = it.text ?? ''
-          if (txt) replay.push({ type: 'agent', id: `replay-a-${it.id}`, text: txt })
-        }
+      let threadForReplay = t.result?.thread
+      if (!Array.isArray(threadForReplay?.turns) || threadForReplay.turns.length === 0) {
+        const read = await send('thread/read', { threadId: id, includeTurns: true })
+        if (read.error) throw new Error(read.error.message)
+        threadForReplay = read.result?.thread ?? threadForReplay
       }
-      setBlocks(replay)
+      const base = t.result?.cwd ?? threadForReplay?.cwd ?? runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot
+      const replay = blocksFromThreadTurns(threadForReplay?.turns ?? [], base)
+      if (replay.files.length) upsertWorkspaceFiles(replay.files)
+      if (replay.blocks.length) setBlocks(replay.blocks)
+      else {
+        const preview = threads.find((candidate) => candidate.id === id)?.preview?.trim()
+        if (preview) setBlocks([{ type: 'user', id: `preview-${id}`, text: preview }])
+      }
     } catch (e: any) { toast('error', e?.message ?? String(e)) }
   }
   const deleteThread = async (id: string, e?: React.MouseEvent) => {
@@ -808,6 +888,20 @@ export function App() {
     try {
       const result = await window.zspark.revealPath(path)
       if (!result.ok) toast('error', result.error ?? 'Could not reveal file')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
+  }
+
+  const downloadFilePath = async (path?: string) => {
+    if (!path) return
+    try {
+      const result = await window.zspark.downloadPath(path)
+      if (result.ok) {
+        toast('info', `Saved to ${shortPath(result.path)}`)
+      } else if (!result.canceled) {
+        toast('error', result.error ?? 'Could not download file')
+      }
     } catch (err: any) {
       toast('error', err?.message ?? String(err))
     }
@@ -910,6 +1004,7 @@ export function App() {
         contextLines.push(`Use skill: ${skill.name}`)
       }
     }
+    contextLines.push(...officeRuntimeContext(currentSkills, runtimeRef.current))
     for (const attachment of currentAttachments) {
       if (attachment.kind === 'image') {
         inputItems.push({ type: 'localImage', path: attachment.path })
@@ -974,6 +1069,7 @@ export function App() {
   const runtimeCwd = runtime.cwd ?? runtime.workspaceRoot
   const runtimeProvider = runtime.provider?.model ?? runtime.model
   const runtimeProviderName = runtime.modelProvider ?? (runtime.provider ? 'zspark' : undefined)
+  const streamingAgentId = currentTurn.current ? agentForTurn.current.get(currentTurn.current.turnId) : undefined
 
   return (
     <div className="app">
@@ -1021,7 +1117,36 @@ export function App() {
           ) : (
             blocks.map((b) => {
               if (b.type === 'user') return <div key={b.id} className="bubble user">{b.text}</div>
-              if (b.type === 'agent') return <div key={b.id} className="bubble assistant"><Markdown text={b.text} /></div>
+              if (b.type === 'agent') return <div key={b.id} className={`bubble assistant${streaming && b.id === streamingAgentId ? ' streaming' : ''}`}><Markdown text={b.text} /></div>
+              if (b.type === 'files') {
+                return (
+                  <div key={b.id} className="artifact-card">
+                    <div className="artifact-head">
+                      <div>
+                        <div className="artifact-title">{b.title}</div>
+                        <div className="artifact-sub">Generated in this turn</div>
+                      </div>
+                      <IconFile />
+                    </div>
+                    <div className="artifact-list">
+                      {b.files.map((file) => (
+                        <div className="artifact-row" key={file.path}>
+                          <div className="artifact-file">
+                            <span className={`file-status file-status-${file.status}`}>{file.status}</span>
+                            <button title={file.path} onClick={() => openFilePath(file.path)}>{file.name}</button>
+                            <small title={file.path}>{shortPath(file.path)}</small>
+                          </div>
+                          <div className="artifact-actions">
+                            <button className="primary" onClick={() => downloadFilePath(file.path)}>Download</button>
+                            <button onClick={() => openFilePath(file.path)}>Open</button>
+                            <button onClick={() => revealFilePath(file.path)}>Reveal</button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )
+              }
               const dur = (b.endedAt ?? Date.now()) - b.startedAt
               const running = !b.endedAt
               const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
@@ -1119,6 +1244,7 @@ export function App() {
           <div className="kv"><span className="k">Model</span><span className="v">{runtimeProvider ?? '—'}</span></div>
           <div className="kv"><span className="k">Provider</span><span className="v">{runtimeProviderName ?? '—'}</span></div>
           <div className="kv"><span className="k">Wire API</span><span className="v">{runtime.provider?.wireApi ?? 'responses'}</span></div>
+          <div className="kv"><span className="k">Artifacts</span><span className="v">{runtime.workspaceRuntime?.available ? 'runtime ready' : 'runtime missing'}</span></div>
           <div className="kv"><span className="k">Sandbox</span><span className="v">{formatSandboxPolicy(runtime.sandbox, runtime.permissionProfile)}</span></div>
           <div className="kv"><span className="k">Approval</span><span className="v">{formatApprovalPolicy(runtime.approvalPolicy)}</span></div>
           {runtime.activePermissionProfile?.id && <div className="kv"><span className="k">Profile</span><span className="v">{runtime.activePermissionProfile.id}</span></div>}
