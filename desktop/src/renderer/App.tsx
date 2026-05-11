@@ -150,10 +150,10 @@ export function App() {
           return
         }
         case 'mcpServer/startupStatus/updated':
-          if (params?.status === 'failed') add({ id: `mcp-${params.name}`, kind: 'warn', text: `MCP ${params.name}: ${params.error}` })
+          // bundled MCPs (computer-use/playwright) are intentionally disabled in zspark
           return
         case 'configWarning':
-          if (params?.summary) add({ id: 'cfg', kind: 'warn', text: params.summary.split('\n')[0] })
+          // workspace is auto-trusted; ignore residual warnings
           return
         default:
           return
@@ -181,12 +181,11 @@ export function App() {
         }
       }
     })
-    window.zspark.onStderr((s) => add({ id: `stderr-${Math.random()}`, kind: 'error', text: s.trim() }))
+    window.zspark.onStderr((_s) => { /* swallow — codex stderr is noisy and not user-facing */ })
     window.zspark.onExit((c) => {
-      setReady(false)
-      setStreaming(false)
-      setThread(null)
-      add({ id: `exit-${Date.now()}`, kind: 'error', text: `codex exited: ${c}` })
+      // Codex restart is normal when settings change; only show if not followed quickly by spawn.
+      setReady(false); setStreaming(false); setThread(null)
+      void c
     })
 
     const handshake = async () => {

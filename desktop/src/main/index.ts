@@ -61,11 +61,25 @@ function resolveCodexBinary(): string {
  *   model_providers.zspark.env_key = "ZSPARK_API_KEY"
  *
  * The api key itself is passed via env var, never on argv.
+ *
+ * We also disable the bundled computer-use / playwright MCP servers and
+ * trust the zspark workspace so the chat doesn't get spammed by config
+ * warnings or MCP startup failures (those bundled MCPs need optional
+ * platform binaries that aren't relevant inside zspark).
  */
 function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<string, string> } {
-  if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: [], env: {} }
   const tomlString = (s: string) => `"${s.replace(/"/g, '\\"')}"`
+  const baseArgs = [
+    // Trust our own workspace so codex stops nagging about project-local
+    // config every spawn. The path is whatever directory the binary
+    // happens to look at; trust the parent so any subfolder counts.
+    '-c', `projects.${tomlString(homedir() + '/aml/zspark-work/zspark')}.trust_level=${tomlString('trusted')}`,
+    // Drop the bundled MCP servers — zspark ships its own skills.
+    '-c', `mcp_servers={}`
+  ]
+  if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: baseArgs, env: {} }
   const args = [
+    ...baseArgs,
     '-c', `model=${tomlString(p.model)}`,
     '-c', `model_provider=${tomlString('zspark')}`,
     '-c', `model_providers.zspark.name=${tomlString('zspark')}`,
