@@ -1,4 +1,6 @@
-import React, { useEffect, useRef, useState } from 'react'
+import React, { useEffect, useMemo, useRef, useState } from 'react'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 import {
   IconNewChat, IconSearch, IconSkills, IconPlugins, IconAutomations,
   IconProject, IconSend, IconClose, IconSettings, IconChevron,
@@ -187,13 +189,27 @@ export function App() {
           const blockId = `turn-${turnId}`
           currentTurn.current = { turnId, blockId }
           agentForTurn.current.clear()
-          setBlocks((bs) => [...bs, { type: 'turn', id: blockId, turnId, activities: [], collapsed: false, startedAt: Date.now() }])
+          // Pre-create a Thinking activity so users see immediate feedback
+          // even when the upstream model doesn't stream reasoning deltas.
+          const thinkingId = `thinking-${turnId}`
+          itemActivity.current.set(thinkingId, thinkingId)
+          setBlocks((bs) => [
+            ...bs,
+            {
+              type: 'turn', id: blockId, turnId, collapsed: false, startedAt: Date.now(),
+              activities: [{ id: thinkingId, kind: 'reasoning', title: 'Thinking', status: 'running', startedAt: Date.now() }]
+            }
+          ])
           return
         }
         case 'turn/completed': {
           setStreaming(false)
           const turnId = params.turnId as string
-          updateTurn(turnId, (t) => ({ ...t, endedAt: Date.now(), collapsed: true }))
+          updateTurn(turnId, (t) => {
+            // Mark any still-running activities done at end of turn (incl. our placeholder Thinking)
+            const acts = t.activities.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now(), title: a.kind === 'reasoning' ? 'Thought' : a.title } : a))
+            return { ...t, endedAt: Date.now(), collapsed: true, activities: acts }
+          })
           currentTurn.current = null
           return
         }
