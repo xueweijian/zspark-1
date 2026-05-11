@@ -213,6 +213,25 @@ export function App() {
           currentTurn.current = null
           return
         }
+        case 'error':
+        case 'warning': {
+          // Codex pushes a top-level {"method":"error"} when the upstream
+          // provider rejects the request body (e.g. vLLM choking on the
+          // codex Responses API shape). Surface it instead of swallowing.
+          if (method === 'warning') {
+            const wm = params?.message ?? ''
+            if (wm) toast('warn', wm)
+            return
+          }
+          setStreaming(false)
+          const cur = currentTurn.current
+          if (cur) updateTurn(cur.turnId, (t) => ({ ...t, endedAt: Date.now() }))
+          let msg = params?.error?.message ?? params?.message ?? 'Provider error'
+          try { const inner = JSON.parse(msg); msg = inner?.error?.message ?? msg } catch {}
+          if (msg.length > 500) msg = msg.slice(0, 500) + '…'
+          toast('error', msg)
+          return
+        }
         case 'item/agentMessage/delta': {
           const turnId = params.turnId as string
           const cur = currentTurn.current
