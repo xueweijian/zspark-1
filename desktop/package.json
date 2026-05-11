@@ -1,0 +1,40 @@
+{
+  "name": "zspark-desktop",
+  "version": "0.0.1",
+  "private": true,
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "build:win": "electron-vite build && electron-builder --win nsis",
+    "build:mac": "electron-vite build && electron-builder --mac dmg",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "electron-store": "^10.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "yjs": "^13.6.18",
+    "y-websocket": "^2.0.4"
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.5",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.1",
+    "electron": "^32.0.0",
+    "electron-builder": "^25.0.5",
+    "electron-vite": "^2.3.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.6"
+  },
+  "build": {
+    "appId": "com.zspark.desktop",
+    "productName": "zspark",
+    "files": ["out/**/*", "resources/**/*"],
+    "extraResources": [
+      { "from": "../codex-rs/target/release/codex", "to": "bin/codex", "filter": ["**/*"] }
+    ],
+    "win": { "target": "nsis", "artifactName": "zspark-${version}-win-${arch}.${ext}" },
+    "mac": { "target": "dmg", "category": "public.app-category.productivity" }
+  }
+}
