@@ -1,5 +1,8 @@
 export function normalizeMarkdownForDisplay(text: string): string {
-  const normalized = text.replace(/\r\n?/g, '\n')
+  const normalized = text
+    .replace(/<\|channel\>[A-Za-z_-]*\s*/g, '')
+    .replace(/<channel\|>\s*/g, '')
+    .replace(/\r\n?/g, '\n')
   const lines = normalized.split('\n')
   const out: string[] = []
   let inFence = false

@@ -15,6 +15,7 @@ import {
   type SkillCategory
 } from './skillCatalog'
 import { normalizeMarkdownForDisplay } from './markdown'
+import { dirname, extractArtifactPathCandidates, resolveWorkspacePath } from './artifacts'
 import { formatApprovalPolicy, formatSandboxPolicy, shortPath } from './runtimeDisplay'
 
 declare global {
@@ -28,6 +29,7 @@ declare global {
       openPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       revealPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       downloadPath: (path: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>
+      statPath: (path: string) => Promise<PathStatResult>
       getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
       saveSettings: (s: any) => Promise<boolean>
       onStdout: (cb: (s: string) => void) => void
@@ -93,7 +95,7 @@ interface Activity {
 type Block =
   | { type: 'user'; id: string; text: string }
   | { type: 'agent'; id: string; text: string }
-  | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[] }
+  | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[]; subtitle?: string; tone?: 'normal' | 'warn' }
   | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
 
 type ToastKind = 'info' | 'warn' | 'error'
@@ -146,6 +148,15 @@ interface PickAttachmentsResult {
   errors: string[]
 }
 
+interface PathStatResult {
+  exists: boolean
+  isFile?: boolean
+  isDirectory?: boolean
+  size?: number
+  mtimeMs?: number
+  error?: string
+}
+
 interface RuntimeHostInfo {
   workspaceRoot: string
   attachmentDir: string
@@ -180,7 +191,7 @@ interface WorkspaceFile {
   name: string
   path: string
   source: 'attachment' | 'change'
-  status: 'attached' | 'created' | 'modified' | 'deleted'
+  status: 'attached' | 'created' | 'modified' | 'deleted' | 'missing'
   detail?: string
   updatedAt: number
 }
@@ -253,15 +264,6 @@ function skillStatusClass(skill: SkillMeta) {
   return 'ready'
 }
 
-function isAbsolutePath(path: string) {
-  return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)
-}
-
-function resolveWorkspacePath(path: string, base?: string) {
-  if (!path || isAbsolutePath(path) || !base) return path
-  return `${base.replace(/[\\/]+$/, '')}/${path}`
-}
-
 function changeKindLabel(kind: any): WorkspaceFile['status'] {
   if (kind?.type === 'add' || kind === 'add') return 'created'
   if (kind?.type === 'delete' || kind === 'delete') return 'deleted'
@@ -271,6 +273,10 @@ function changeKindLabel(kind: any): WorkspaceFile['status'] {
 function describeChange(kind: any) {
   if (kind?.type === 'update' && kind.movePath) return `Moved from ${kind.movePath}`
   return changeKindLabel(kind)
+}
+
+function turnIdFromParams(params: any) {
+  return String(params?.turnId ?? params?.turn?.id ?? '')
 }
 
 marked.setOptions({ gfm: true, breaks: true })
@@ -308,16 +314,33 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
     ]
   }
 
+  const presentationSkill = skills.find((skill) => {
+    const text = `${skill.name} ${skill.displayName ?? ''} ${skill.path ?? ''}`
+    return /\b(presentation|presentations|pptx?|powerpoint|slides?)\b/i.test(text)
+  })
+  const presentationSkillDir = dirname(presentationSkill?.path)
+  const lines = [
+    'Zspark local runtime for the selected Office skill:',
+    `- Node.js executable: ${rt.nodePath}`,
+    `- Node.js packages: ${rt.nodeModulesPath}`,
+    `- Python executable: ${rt.pythonPath}`,
+    'Use these bundled dependencies for documents, spreadsheets, and presentations.',
+    'Hard delivery contract: create an actual editable artifact file in the workspace. A prose specification is a failure unless a real command fails and you report that command error.',
+    'Before using @oai/artifact-tool from an output work directory, run this preflight pattern:',
+    `  mkdir -p "$WORKSPACE" && cd "$WORKSPACE" && ln -sfn "${rt.nodeModulesPath}" node_modules`,
+    `  "${rt.nodePath}" -e "import('@oai/artifact-tool').then(() => console.log('artifact-tool ok'))"`,
+    'Before the final answer, verify the delivered file with `test -s "$FINAL_ARTIFACT" && ls -lh "$FINAL_ARTIFACT"`. Do not claim success or report a final path until that command succeeds.'
+  ]
+  if (presentationSkillDir) {
+    lines.push(
+      'For PPTX/presentation tasks, use the installed Presentations scripts instead of hand-waving:',
+      `- SKILL_DIR: ${presentationSkillDir}`,
+      `- Build/export helper: "${rt.nodePath}" "${presentationSkillDir}/scripts/build_artifact_deck.mjs" --slides-dir "$SLIDES_DIR" --out "$FINAL_PPTX" --preview-dir "$PREVIEW_DIR" --layout-dir "$LAYOUT_DIR"`,
+      'The final response must include only a PPTX path that exists after the verification command.'
+    )
+  }
   return [
-    [
-      'Zspark local runtime for the selected Office skill:',
-      `- Node.js executable: ${rt.nodePath}`,
-      `- Node.js packages: ${rt.nodeModulesPath}`,
-      `- Python executable: ${rt.pythonPath}`,
-      'Use these bundled dependencies for documents, spreadsheets, and presentations.',
-      'Run artifact builders from an output work directory; if ESM module resolution cannot find @oai/artifact-tool, create a local node_modules symlink to the Node.js packages path above.',
-      'For PPTX/presentation tasks, use @oai/artifact-tool from this runtime, build/export an actual .pptx in the workspace, and report the final file path. Do not claim artifact-tool cannot be executed unless a command failed.'
-    ].join('\n')
+    lines.join('\n')
   ]
 }
 
@@ -480,15 +503,63 @@ export function App() {
       return [...byPath.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 24)
     })
   }
-  const upsertArtifactBlock = (turnId: string, itemId: string, files: WorkspaceFile[]) => {
+  const upsertArtifactBlock = (
+    turnId: string,
+    itemId: string,
+    files: WorkspaceFile[],
+    options: { title?: string; subtitle?: string; tone?: 'normal' | 'warn' } = {}
+  ) => {
     if (files.length === 0) return
     const id = `files-${itemId}`
-    const title = `${files.length} file${files.length === 1 ? '' : 's'} ready`
+    const title = options.title ?? `${files.length} file${files.length === 1 ? '' : 's'} ready`
     setBlocks((bs) => {
-      const next = { type: 'files' as const, id, turnId, title, files }
+      const next = { type: 'files' as const, id, turnId, title, files, subtitle: options.subtitle, tone: options.tone ?? 'normal' }
       if (bs.some((b) => b.id === id)) return bs.map((b) => (b.id === id ? next : b))
       return [...bs, next]
     })
+  }
+
+  const verifyArtifactClaims = async (turnId: string, itemId: string, text: string) => {
+    const base = runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot
+    const candidates = extractArtifactPathCandidates(text)
+      .map((candidate) => resolveWorkspacePath(candidate, base))
+      .slice(0, 8)
+    if (!candidates.length) return
+
+    const existing: WorkspaceFile[] = []
+    const missing: WorkspaceFile[] = []
+    const now = Date.now()
+    await Promise.all(candidates.map(async (path, index) => {
+      const stat = await window.zspark.statPath(path)
+      const file: WorkspaceFile = {
+        id: `claim-${now}-${index}`,
+        name: basename(path),
+        path,
+        source: 'change',
+        status: stat.exists && stat.isFile ? 'created' : 'missing',
+        detail: stat.exists && stat.isFile
+          ? `Verified from assistant output${stat.size ? ` (${fmtBytes(stat.size)})` : ''}`
+          : 'Referenced by assistant output, but zspark could not find it on disk.',
+        updatedAt: now
+      }
+      if (file.status === 'missing') missing.push(file)
+      else existing.push(file)
+    }))
+
+    if (existing.length) {
+      upsertWorkspaceFiles(existing)
+      upsertArtifactBlock(turnId, `${itemId}-verified`, existing, {
+        subtitle: 'Verified on disk from assistant output'
+      })
+    }
+    if (missing.length) {
+      upsertArtifactBlock(turnId, `${itemId}-missing`, missing, {
+        title: 'Claimed artifact not found',
+        subtitle: 'The assistant referenced this path, but zspark could not find it on disk.',
+        tone: 'warn'
+      })
+      toast('error', `Artifact missing: ${missing.map((file) => file.name).join(', ')}`)
+    }
   }
 
   const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {
@@ -524,7 +595,8 @@ export function App() {
       switch (method) {
         case 'turn/started': {
           setStreaming(true)
-          const turnId = params.turnId as string
+          const turnId = turnIdFromParams(params)
+          if (!turnId) return
           const blockId = `turn-${turnId}`
           currentTurn.current = { turnId, blockId }
           agentForTurn.current.clear()
@@ -543,7 +615,8 @@ export function App() {
         }
         case 'turn/completed': {
           setStreaming(false)
-          const turnId = params.turnId as string
+          const turnId = turnIdFromParams(params)
+          if (!turnId) return
           updateTurn(turnId, (t) => {
             // Mark any still-running activities done at end of turn (incl. our placeholder Thinking)
             const acts = t.activities.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now(), title: a.kind === 'reasoning' ? 'Thought' : a.title } : a))
@@ -627,6 +700,7 @@ export function App() {
               setBlocks((bs) => [...bs, { type: 'agent', id: blockId, text: txt }])
             }
             updateTurn(turnId, (t) => ({ ...t, finalMessageId: agentForTurn.current.get(turnId) }))
+            void verifyArtifactClaims(turnId, String(item.id ?? `agent-${turnId}`), txt)
             return
           }
           if (item.type === 'reasoning') {
@@ -822,6 +896,18 @@ export function App() {
         setThread(t.result?.thread?.id ?? null)
       }
     } catch (err: any) { toast('error', err?.message ?? String(err)) }
+  }
+
+  const stopTurn = async () => {
+    const active = currentTurn.current
+    if (!ready || !thread || !active) return
+    try {
+      const result = await send('turn/interrupt', { threadId: thread, turnId: active.turnId })
+      if (result.error) throw new Error(result.error.message)
+      toast('info', 'Stopping current turn…')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
   }
 
   const pickAttachments = async () => {
@@ -1095,6 +1181,7 @@ export function App() {
         <div className="chat-header">
           <div className="left">Workspace</div>
           <div className="right">
+            {streaming && <button className="header-btn danger" onClick={stopTurn}><IconClose /> Stop</button>}
             <button className="header-btn" onClick={() => setShowSettings(true)}><IconSettings /> Provider</button>
             <span className={`status-dot ${statusClass}`}>{statusText}</span>
           </div>
@@ -1120,11 +1207,11 @@ export function App() {
               if (b.type === 'agent') return <div key={b.id} className={`bubble assistant${streaming && b.id === streamingAgentId ? ' streaming' : ''}`}><Markdown text={b.text} /></div>
               if (b.type === 'files') {
                 return (
-                  <div key={b.id} className="artifact-card">
+                  <div key={b.id} className={`artifact-card${b.tone === 'warn' ? ' warn' : ''}`}>
                     <div className="artifact-head">
                       <div>
                         <div className="artifact-title">{b.title}</div>
-                        <div className="artifact-sub">Generated in this turn</div>
+                        <div className="artifact-sub">{b.subtitle ?? 'Generated in this turn'}</div>
                       </div>
                       <IconFile />
                     </div>
@@ -1133,13 +1220,13 @@ export function App() {
                         <div className="artifact-row" key={file.path}>
                           <div className="artifact-file">
                             <span className={`file-status file-status-${file.status}`}>{file.status}</span>
-                            <button title={file.path} onClick={() => openFilePath(file.path)}>{file.name}</button>
+                            <button title={file.path} onClick={() => openFilePath(file.path)} disabled={file.status === 'missing'}>{file.name}</button>
                             <small title={file.path}>{shortPath(file.path)}</small>
                           </div>
                           <div className="artifact-actions">
-                            <button className="primary" onClick={() => downloadFilePath(file.path)}>Download</button>
-                            <button onClick={() => openFilePath(file.path)}>Open</button>
-                            <button onClick={() => revealFilePath(file.path)}>Reveal</button>
+                            <button className="primary" onClick={() => downloadFilePath(file.path)} disabled={file.status === 'missing'}>Download</button>
+                            <button onClick={() => openFilePath(file.path)} disabled={file.status === 'missing'}>Open</button>
+                            <button onClick={() => revealFilePath(file.path)} disabled={file.status === 'missing'}>Reveal</button>
                           </div>
                         </div>
                       ))}

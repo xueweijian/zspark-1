@@ -27,6 +27,8 @@ input,textarea,select{font:inherit}
 .chat-header .right{display:flex;gap:10px;align-items:center}
 .header-btn{display:inline-flex;align-items:center;gap:6px;background:#fff;border:1px solid #e4e4e7;color:#3f3f46;padding:5px 11px;border-radius:8px;font-size:12.5px;transition:background .12s}
 .header-btn:hover{background:#fafafa;border-color:#d4d4d8}
+.header-btn.danger{border-color:#fecaca;background:#fff;color:#991b1b}
+.header-btn.danger:hover{background:#fef2f2;border-color:#fca5a5}
 .status-dot{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#71717a;padding:4px 10px;border-radius:999px;background:#f4f4f5}
 .status-dot::before{content:'';width:7px;height:7px;border-radius:50%;background:#22c55e}
 .status-dot.off::before{background:#a1a1aa}
@@ -102,10 +104,14 @@ input,textarea,select{font:inherit}
 .md th{background:#fafafa;font-weight:600;color:#18181b}
 
 .artifact-card{align-self:flex-start;width:min(900px,100%);border:1px solid #e4e4e7;border-radius:12px;background:#fff;box-shadow:0 1px 2px rgba(0,0,0,.03);overflow:hidden}
+.artifact-card.warn{border-color:#fecaca;background:#fffafa}
+.artifact-card.warn .artifact-head{border-bottom-color:#fee2e2;background:#fef2f2;color:#991b1b}
+.artifact-card.warn .artifact-head svg{color:#b91c1c}
 .artifact-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 14px;border-bottom:1px solid #f4f4f5;background:#fafafa;color:#18181b}
 .artifact-head svg{color:#52525b;flex-shrink:0}
 .artifact-title{font-size:13.5px;font-weight:650;line-height:1.3}
 .artifact-sub{font-size:11.5px;color:#71717a;margin-top:2px}
+.artifact-card.warn .artifact-sub{color:#991b1b}
 .artifact-list{display:flex;flex-direction:column}
 .artifact-row{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 12px;border-top:1px solid #f4f4f5}
 .artifact-row:first-child{border-top:none}
@@ -113,12 +119,14 @@ input,textarea,select{font:inherit}
 .artifact-file .file-status{grid-row:1 / span 2}
 .artifact-file button{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left;color:#18181b;font-size:13px;font-weight:600}
 .artifact-file button:hover{text-decoration:underline;text-underline-offset:2px}
+.artifact-file button:disabled{cursor:not-allowed;color:#991b1b;text-decoration:none}
 .artifact-file small{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#71717a;font-size:11.5px}
 .artifact-actions{display:flex;gap:6px}
 .artifact-actions button{font-size:12px;font-weight:500;border:1px solid #d4d4d8;border-radius:7px;background:#fff;color:#18181b;padding:5px 9px;transition:background .12s,border-color .12s}
 .artifact-actions button:hover{background:#f4f4f5;border-color:#a1a1aa}
 .artifact-actions button.primary{background:#18181b;border-color:#18181b;color:#fafafa}
 .artifact-actions button.primary:hover{background:#27272a;border-color:#27272a}
+.artifact-actions button:disabled,.artifact-actions button.primary:disabled{cursor:not-allowed;background:#f4f4f5;border-color:#e4e4e7;color:#a1a1aa}
 
 /* Toast notifications */
 
@@ -182,6 +190,7 @@ input,textarea,select{font:inherit}
 .file-status-created{background:#f0fdf4;color:#15803d}
 .file-status-modified{background:#fff7ed;color:#c2410c}
 .file-status-deleted{background:#fef2f2;color:#b91c1c}
+.file-status-missing{background:#fef2f2;color:#b91c1c}
 
 /* Toast notifications */
 .toast-wrap{position:fixed;bottom:18px;right:18px;display:flex;flex-direction:column;gap:8px;z-index:60;max-width:380px}

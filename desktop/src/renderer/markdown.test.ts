@@ -10,4 +10,9 @@ describe('normalizeMarkdownForDisplay', () => {
     const input = 'Before\n\n```ts\nconst a = 1\n\n\nconst b = 2\n```\n\n\nAfter'
     expect(normalizeMarkdownForDisplay(input)).toBe('Before\n\n```ts\nconst a = 1\n\n\nconst b = 2\n```\n\nAfter')
   })
+
+  test('removes upstream channel markers before rendering', () => {
+    const input = '<|channel>thought\n<channel|><|channel>thought\n<channel|>Final answer'
+    expect(normalizeMarkdownForDisplay(input)).toBe('Final answer')
+  })
 })

@@ -371,6 +371,22 @@ ipcMain.handle('path:download', async (_e, filePath: string) => {
   }
 })
 
+ipcMain.handle('path:stat', (_e, filePath: string) => {
+  if (!filePath) return { exists: false, error: 'Missing file path' }
+  try {
+    const stat = statSync(filePath)
+    return {
+      exists: true,
+      isFile: stat.isFile(),
+      isDirectory: stat.isDirectory(),
+      size: stat.size,
+      mtimeMs: stat.mtimeMs
+    }
+  } catch {
+    return { exists: false }
+  }
+})
+
 app.whenReady().then(async () => {
   const b = await startBridge()
   bridgePort = b.port
