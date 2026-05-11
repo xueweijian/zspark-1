@@ -186,24 +186,59 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse) {
     let textAcc = ''
     let reasoningOpen = false
     let reasoningItemId = genId('rs')
-    let reasoningContentIndex = 0
-    let textContentIndex = 0
     let toolCalls: Map<number, { id: string; name: string; argsBuf: string; itemId: string; outputIndex: number }> = new Map()
     let nextOutputIndex = 1 // 0 is the message item
+    let completed = false
+
+    const finalize = () => {
+      if (completed) return
+      completed = true
+      if (reasoningOpen) {
+        sseWrite(res, 'response.output_item.done', {
+          type: 'response.output_item.done',
+          output_index: 1,
+          item: { id: reasoningItemId, type: 'reasoning', summary: [], content: [] }
+        })
+      }
+      for (const e of toolCalls.values()) {
+        sseWrite(res, 'response.output_item.done', {
+          type: 'response.output_item.done',
+          output_index: e.outputIndex,
+          item: { id: e.itemId, type: 'function_call', call_id: e.id, name: e.name, arguments: e.argsBuf }
+        })
+      }
+      sseWrite(res, 'response.output_item.done', {
+        type: 'response.output_item.done',
+        output_index: 0,
+        item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: textAcc }] }
+      })
+      sseWrite(res, 'response.completed', {
+        type: 'response.completed',
+        response: {
+          id: responseId, object: 'response', created_at: createdAt, model: payload.model,
+          status: 'completed',
+          output: [{ id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: textAcc }] }]
+        }
+      })
+      res.write('data: [DONE]\n\n')
+      res.end()
+    }
 
     upstreamRes.on('data', (chunk: Buffer) => {
       buf += chunk.toString('utf8')
-      const frames = buf.split('\n\n')
+      const frames = buf.split(/\r?\n\r?\n/)
       buf = frames.pop() ?? ''
       for (const frame of frames) {
-        const dataLine = frame.split('\n').find((l) => l.startsWith('data:'))
+        const dataLine = frame.split(/\r?\n/).find((l) => l.startsWith('data:'))
         if (!dataLine) continue
         const data = dataLine.slice(5).trim()
-        if (data === '[DONE]') continue
+        if (data === '[DONE]') { finalize(); return }
         let evt: any
         try { evt = JSON.parse(data) } catch { continue }
-        const delta = evt.choices?.[0]?.delta ?? {}
-        // 1. reasoning_content (Qwen/Kimi/DeepSeek-R1 dialect)
+        // Some providers (Azure-OpenAI) emit a `prompt_filter_results` only chunk
+        if (!evt.choices || evt.choices.length === 0) continue
+        const delta = evt.choices[0]?.delta ?? {}
+        // 1. reasoning_content
         const reasoning = delta.reasoning_content
         if (typeof reasoning === 'string' && reasoning.length) {
           if (!reasoningOpen) {
@@ -226,7 +261,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse) {
           textAcc += ctext
           sseWrite(res, 'response.output_text.delta', {
             type: 'response.output_text.delta',
-            item_id: itemId, output_index: 0, content_index: textContentIndex, delta: ctext
+            item_id: itemId, output_index: 0, content_index: 0, delta: ctext
           })
         }
         // 3. tool_calls
@@ -253,47 +288,12 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse) {
             }
           }
         }
-        // 4. finish
-        const finish = evt.choices?.[0]?.finish_reason
-        if (finish) {
-          // close reasoning if any
-          if (reasoningOpen) {
-            sseWrite(res, 'response.output_item.done', {
-              type: 'response.output_item.done',
-              output_index: 1,
-              item: { id: reasoningItemId, type: 'reasoning', summary: [], content: [] }
-            })
-          }
-          // close tool calls
-          for (const e of toolCalls.values()) {
-            sseWrite(res, 'response.output_item.done', {
-              type: 'response.output_item.done',
-              output_index: e.outputIndex,
-              item: { id: e.itemId, type: 'function_call', call_id: e.id, name: e.name, arguments: e.argsBuf }
-            })
-          }
-          // close message
-          sseWrite(res, 'response.output_item.done', {
-            type: 'response.output_item.done',
-            output_index: 0,
-            item: { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: textAcc }] }
-          })
-          sseWrite(res, 'response.completed', {
-            type: 'response.completed',
-            response: {
-              id: responseId, object: 'response', created_at: createdAt, model: payload.model,
-              status: 'completed',
-              output: [
-                { id: itemId, type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: textAcc }] }
-              ]
-            }
-          })
-          res.end()
-        }
+        // 4. finish_reason → finalize immediately
+        if (evt.choices[0]?.finish_reason) finalize()
       }
     })
-    upstreamRes.on('end', () => { if (!res.writableEnded) res.end() })
-    upstreamRes.on('error', () => { if (!res.writableEnded) res.end() })
+    upstreamRes.on('end', () => { finalize() })
+    upstreamRes.on('error', () => { finalize() })
   })
   upstreamReq.on('error', (e) => {
     if (!res.headersSent) res.writeHead(502)
