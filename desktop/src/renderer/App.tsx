@@ -71,9 +71,17 @@ interface ProviderForm { baseUrl: string; apiKey: string; model: string; wireApi
 
 function fmtDuration(ms: number) {
   const s = Math.round(ms / 1000)
+  if (s < 1) return '<1s'
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   return `${m}m ${s % 60}s`
+}
+
+marked.setOptions({ gfm: true, breaks: true })
+
+function Markdown({ text }: { text: string }) {
+  const html = useMemo(() => DOMPurify.sanitize(marked.parse(text || '', { async: false }) as string), [text])
+  return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 function actIcon(k: ActivityKind) {
@@ -206,9 +214,14 @@ export function App() {
         case 'item/reasoning/textDelta': {
           const turnId = params.turnId as string
           if (!currentTurn.current || currentTurn.current.turnId !== turnId) return
-          const itemId = params.itemId as string
-          ensureActivity(turnId, itemId, { kind: 'reasoning', title: 'Thinking' })
-          appendActivityDetail(turnId, itemId, params.delta ?? '')
+          // Route reasoning deltas into the placeholder Thinking activity so
+          // we have one accumulator regardless of how many reasoning items
+          // the model produces.
+          const placeholderId = `thinking-${turnId}`
+          if (!itemActivity.current.has(placeholderId)) {
+            ensureActivity(turnId, placeholderId, { kind: 'reasoning', title: 'Thinking' })
+          }
+          appendActivityDetail(turnId, placeholderId, params.delta ?? '')
           return
         }
         case 'item/started':
@@ -236,12 +249,14 @@ export function App() {
             return
           }
           if (item.type === 'reasoning') {
-            // Use existing activity (created by deltas) — finalize it on completion
+            // If the upstream returned reasoning as a single completed item
+            // (no deltas), append the summary/content to the placeholder.
             if (method === 'item/completed') {
-              const itemId = item.id as string
-              if (itemActivity.current.has(itemId)) {
-                updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title: 'Thought' })
-              }
+              const placeholderId = `thinking-${turnId}`
+              const summary = Array.isArray(item.summary) ? item.summary.join('\n\n') : ''
+              const content = Array.isArray(item.content) ? item.content.join('\n\n') : ''
+              const txt = (summary + (summary && content ? '\n\n' : '') + content).trim()
+              if (txt) appendActivityDetail(turnId, placeholderId, txt)
             }
             return
           }
@@ -397,16 +412,20 @@ export function App() {
           ) : (
             blocks.map((b) => {
               if (b.type === 'user') return <div key={b.id} className="bubble user">{b.text}</div>
-              if (b.type === 'agent') return <div key={b.id} className="bubble assistant">{b.text}</div>
+              if (b.type === 'agent') return <div key={b.id} className="bubble assistant"><Markdown text={b.text} /></div>
               const dur = (b.endedAt ?? Date.now()) - b.startedAt
               const running = !b.endedAt
+              const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
+              const stepsLabel = meaningful.length === 0
+                ? (b.activities.some((a) => a.kind === 'reasoning' && a.detail) ? 'Thought through it' : 'Generated answer')
+                : `${meaningful.length} step${meaningful.length === 1 ? '' : 's'}`
               return (
                 <div key={b.id} className={`activity-card${b.collapsed ? ' collapsed' : ''}${running ? ' running' : ''}`}>
                   <div className="activity-head" onClick={() => toggleTurn(b.turnId)}>
                     <div className="head-left">
                       <span className={`spinner${running ? ' spin' : ''}`} />
                       <span className="head-title">{running ? 'Working…' : `Worked for ${fmtDuration(dur)}`}</span>
-                      {!running && <span className="head-meta">{b.activities.length} step{b.activities.length === 1 ? '' : 's'}</span>}
+                      {!running && <span className="head-meta">· {stepsLabel}</span>}
                     </div>
                     <button className="chev" aria-label="Toggle"><IconChevron /></button>
                   </div>
@@ -414,25 +433,28 @@ export function App() {
                     <div className="activity-body">
                       {b.activities.length === 0 ? (
                         <div className="empty-act">Preparing…</div>
-                      ) : b.activities.map((a) => (
-                        <div key={a.id} className={`act act-${a.kind} act-${a.status}`}>
-                          <div className="act-icon">{actIcon(a.kind)}</div>
-                          <div className="act-meat">
-                            <div className="act-title">{a.title}</div>
-                            {a.detail && a.kind === 'reasoning' && (
-                              <div className="act-detail mono">{a.detail.slice(-600)}</div>
-                            )}
-                            {a.detail && a.kind === 'command' && (
-                              <pre className="act-detail mono">{a.detail.slice(-800)}</pre>
-                            )}
+                      ) : b.activities.map((a) => {
+                        const isPlaceholder = a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail && a.status === 'running'
+                        return (
+                          <div key={a.id} className={`act act-${a.kind} act-${a.status}`}>
+                            <div className="act-icon">{actIcon(a.kind)}</div>
+                            <div className="act-meat">
+                              <div className="act-title">{a.title}{isPlaceholder ? ' · waiting for first token' : ''}</div>
+                              {a.detail && a.kind === 'reasoning' && (
+                                <div className="act-detail">{a.detail}</div>
+                              )}
+                              {a.detail && a.kind === 'command' && (
+                                <pre className="act-detail mono">{a.detail.slice(-1200)}</pre>
+                              )}
+                            </div>
+                            <div className="act-status">
+                              {a.status === 'running' ? '· · ·' :
+                               a.status === 'failed' ? 'failed' :
+                               a.endedAt ? fmtDuration(a.endedAt - a.startedAt) : ''}
+                            </div>
                           </div>
-                          <div className="act-status">
-                            {a.status === 'running' ? '· · ·' :
-                             a.status === 'failed' ? 'failed' :
-                             a.endedAt ? fmtDuration(a.endedAt - a.startedAt) : ''}
-                          </div>
-                        </div>
-                      ))}
+                        )
+                      })}
                     </div>
                   )}
                 </div>
