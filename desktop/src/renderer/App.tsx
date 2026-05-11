@@ -58,6 +58,7 @@ const starters = [
 
 const FALLBACK_MODEL_METADATA_WARNING = 'Defaulting to fallback metadata'
 const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
+const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
 
 let nextId = 1
 const newId = () => nextId++
@@ -94,7 +95,7 @@ interface Activity {
 }
 
 type Block =
-  | { type: 'user'; id: string; text: string }
+  | { type: 'user'; id: string; text: string; turnId?: string }
   | { type: 'agent'; id: string; text: string }
   | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[]; subtitle?: string; tone?: 'normal' | 'warn' }
   | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
@@ -232,15 +233,52 @@ function basename(path: string) {
   return path.split(/[\\/]/).filter(Boolean).pop() ?? path
 }
 
+function stripInternalPromptContext(text: string) {
+  const raw = String(text ?? '')
+  const marker = raw.search(
+    /(?:^|\n\s*\n)\s*(?:Use skill:|Attached file:|Attached image:|Zspark local runtime|Hard delivery contract:|Before using @oai\/artifact-tool|Before the final answer|For PPTX\/presentation tasks|The final response must|\[Skill:)/
+  )
+  return (marker === -1 ? raw : raw.slice(0, marker)).trim()
+}
+
+function displaySkillName(name?: string) {
+  const raw = String(name ?? 'selected skill')
+  return raw.split(':').pop() || raw
+}
+
+function displayThreadPreview(thread: ThreadSummary) {
+  const label = stripInternalPromptContext(thread.preview?.trim() || thread.name || '')
+  return label || thread.id.slice(0, 8)
+}
+
 function formatUserInputContent(content: any[]) {
-  return content.map((c: any) => {
-    if (c?.type === 'text') return c.text ?? ''
-    if (c?.type === 'image') return `[Image: ${c.url?.startsWith?.('data:') ? 'attached image' : c.url ?? 'attached image'}]`
-    if (c?.type === 'localImage') return `[Image: ${basename(String(c.path ?? 'attached image'))}]`
-    if (c?.type === 'skill') return `[Skill: ${c.name ?? 'selected skill'}]`
-    if (c?.type === 'mention') return `[Mention: ${c.name ?? 'selected mention'}]`
-    return ''
-  }).filter(Boolean).join('\n')
+  const visible: string[] = []
+  const skills: string[] = []
+  for (const c of content) {
+    if (c?.type === 'text') {
+      const text = stripInternalPromptContext(c.text ?? '')
+      if (text) visible.push(text)
+      continue
+    }
+    if (c?.type === 'image') {
+      visible.push(`[Image: ${c.url?.startsWith?.('data:') ? 'attached image' : c.url ?? 'attached image'}]`)
+      continue
+    }
+    if (c?.type === 'localImage') {
+      visible.push(`[Image: ${basename(String(c.path ?? 'attached image'))}]`)
+      continue
+    }
+    if (c?.type === 'skill') {
+      skills.push(displaySkillName(c.name))
+      continue
+    }
+    if (c?.type === 'mention') {
+      visible.push(`[Mention: ${c.name ?? 'selected mention'}]`)
+    }
+  }
+  if (visible.length) return visible.join('\n')
+  if (skills.length) return `Using ${skills.join(', ')}`
+  return ''
 }
 
 function scopeLabel(scope?: string) {
@@ -360,19 +398,44 @@ function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; 
   const files: WorkspaceFile[] = []
 
   for (const turn of turns) {
+    const userBlocks: Block[] = []
+    const agentBlocks: Block[] = []
+    const trailingBlocks: Block[] = []
+    const turnId = String(turn?.id ?? `replay-turn-${blocks.length}`)
+    const startedAt = timestampToMs(turn?.startedAt)
+    let turnBlock: Extract<Block, { type: 'turn' }> | null = null
+    const ensureTurnBlock = () => {
+      if (!turnBlock) {
+        turnBlock = {
+          type: 'turn',
+          id: `replay-turn-${turnId}`,
+          turnId,
+          activities: [],
+          collapsed: false,
+          startedAt,
+          endedAt: turn?.completedAt ? timestampToMs(turn.completedAt) : undefined
+        }
+      }
+      return turnBlock
+    }
     const items = Array.isArray(turn?.items) ? turn.items : []
     for (const item of items) {
       if (item?.type === 'userMessage') {
         const txt = formatUserInputContent(item.content ?? [])
-        if (txt) blocks.push({ type: 'user', id: `replay-u-${item.id}`, text: txt })
+        if (txt) userBlocks.push({ type: 'user', id: `replay-u-${item.id}`, text: txt, turnId })
+      } else if (item?.type === 'reasoning' || item?.type === 'commandExecution' || item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall' || item?.type === 'webSearch') {
+        const activity = replayActivityFromItem(item, startedAt)
+        if (activity) ensureTurnBlock().activities.push(activity)
       } else if (item?.type === 'agentMessage') {
         const txt = item.text ?? ''
-        if (txt) blocks.push({ type: 'agent', id: `replay-a-${item.id}`, text: txt })
+        if (txt) agentBlocks.push({ type: 'agent', id: `replay-a-${item.id}`, text: txt })
       } else if (item?.type === 'fileChange') {
+        const activity = replayActivityFromItem(item, startedAt)
+        if (activity) ensureTurnBlock().activities.push(activity)
         const changed = filesFromChanges(item.changes ?? [], base, Date.now())
         if (changed.length) {
           files.push(...changed)
-          blocks.push({
+          trailingBlocks.push({
             type: 'files',
             id: `replay-files-${item.id}`,
             turnId: String(turn?.id ?? ''),
@@ -382,9 +445,184 @@ function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; 
         }
       }
     }
+    const replayTurnBlock = turnBlock as Extract<Block, { type: 'turn' }> | null
+    if (replayTurnBlock && !replayTurnBlock.endedAt && replayTurnBlock.activities.every((a) => a.status !== 'running')) {
+      replayTurnBlock.endedAt = Math.max(...replayTurnBlock.activities.map((a) => a.endedAt ?? a.startedAt), startedAt)
+    }
+    blocks.push(...userBlocks)
+    if (replayTurnBlock && replayTurnBlock.activities.length > 0) blocks.push(replayTurnBlock)
+    blocks.push(...agentBlocks, ...trailingBlocks)
   }
 
   return { blocks, files }
+}
+
+function orderBlocksForTurn(blocks: Block[], turnId: string) {
+  const groupedIndices = blocks
+    .map((block, index) => ({ block, index }))
+    .filter(({ block }) =>
+      (block.type === 'user' && block.turnId === turnId) ||
+      (block.type === 'turn' && block.turnId === turnId)
+    )
+    .map(({ index }) => index)
+  if (groupedIndices.length < 2) return blocks
+
+  const insertAt = Math.min(...groupedIndices)
+  const users = blocks.filter((block) => block.type === 'user' && block.turnId === turnId)
+  const turns = blocks.filter((block) => block.type === 'turn' && block.turnId === turnId)
+  const rest = blocks.filter((block) =>
+    !((block.type === 'user' && block.turnId === turnId) ||
+      (block.type === 'turn' && block.turnId === turnId))
+  )
+  return [...rest.slice(0, insertAt), ...users, ...turns, ...rest.slice(insertAt)]
+}
+
+function activityStorageKey(threadId: string) {
+  return `${ACTIVITY_STORAGE_PREFIX}${threadId}`
+}
+
+function activityDetailWeight(block?: Extract<Block, { type: 'turn' }>) {
+  if (!block) return 0
+  return block.activities.reduce((total, activity) => total + (activity.detail?.length ?? 0), 0)
+}
+
+function loadPersistedActivityBlocks(threadId: string): Extract<Block, { type: 'turn' }>[] {
+  try {
+    const raw = window.localStorage.getItem(activityStorageKey(threadId))
+    if (!raw) return []
+    const parsed = JSON.parse(raw)
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((block: any): block is Extract<Block, { type: 'turn' }> =>
+      block?.type === 'turn' &&
+      typeof block.turnId === 'string' &&
+      Array.isArray(block.activities)
+    )
+  } catch {
+    return []
+  }
+}
+
+function savePersistedActivityBlocks(threadId: string, blocks: Block[]) {
+  const turnBlocks = blocks.filter((block): block is Extract<Block, { type: 'turn' }> => block.type === 'turn')
+  if (!turnBlocks.length) return
+  try {
+    window.localStorage.setItem(activityStorageKey(threadId), JSON.stringify(turnBlocks.slice(-80)))
+  } catch {
+    // Best-effort UI continuity; chat correctness must not depend on storage.
+  }
+}
+
+function mergePersistedActivityBlocks(blocks: Block[], persisted: Extract<Block, { type: 'turn' }>[]) {
+  if (!persisted.length) return blocks
+  let next = [...blocks]
+  for (const persistedTurn of persisted) {
+    const existingIndex = next.findIndex((block) => block.type === 'turn' && block.turnId === persistedTurn.turnId)
+    if (existingIndex !== -1) {
+      const existing = next[existingIndex] as Extract<Block, { type: 'turn' }>
+      if (activityDetailWeight(persistedTurn) > activityDetailWeight(existing) || existing.activities.length === 0) {
+        next[existingIndex] = { ...persistedTurn, collapsed: false }
+      }
+      next = orderBlocksForTurn(next, persistedTurn.turnId)
+      continue
+    }
+
+    const userIndex = next.findIndex((block) => block.type === 'user' && block.turnId === persistedTurn.turnId)
+    if (userIndex === -1) continue
+    next = [
+      ...next.slice(0, userIndex + 1),
+      { ...persistedTurn, collapsed: false },
+      ...next.slice(userIndex + 1)
+    ]
+    next = orderBlocksForTurn(next, persistedTurn.turnId)
+  }
+  return next
+}
+
+function shortenCommand(command: string, limit = 72) {
+  const firstLine = command.replace(/^\/bin\/zsh -lc\s+/, '').split('\n')[0]?.trim() || command
+  return firstLine.length > limit ? firstLine.slice(0, limit - 1) + '…' : firstLine
+}
+
+function commandActivityTitle(item: any) {
+  const command = String(item?.command ?? '')
+  const firstAction = Array.isArray(item?.commandActions) ? item.commandActions[0] : undefined
+  if (firstAction?.type === 'read') return `Read ${firstAction.name ?? basename(String(firstAction.path ?? 'file'))}`
+  if (firstAction?.type === 'write') return `Write ${firstAction.name ?? basename(String(firstAction.path ?? 'file'))}`
+  if (/build_artifact_deck\.mjs/.test(command)) return 'Build PPTX deck'
+  if (/import\('@oai\/artifact-tool'\)/.test(command) || /artifact-tool ok/.test(command)) return 'Check presentation runtime'
+  if (/slide[-_]\d+\.mjs/.test(command) && /(cat >|tee|write)/.test(command)) return 'Write slide source'
+  if (/test -s|ls -lh/.test(command)) return 'Verify generated file'
+  if (/\b(find|ls)\b/.test(command)) return 'Inspect workspace files'
+  return shortenCommand(command)
+}
+
+function itemTimeMs(item: any, key: 'startedAtMs' | 'completedAtMs', fallback: number) {
+  return timestampToMs(item?.[key] ?? item?.[key.replace('Ms', '')], fallback)
+}
+
+function timestampToMs(value: any, fallback = Date.now()) {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return fallback
+  return n < 10000000000 ? n * 1000 : n
+}
+
+function replayActivityFromItem(item: any, fallbackStartedAt: number): Activity | undefined {
+  const id = String(item?.id ?? `replay-${Math.random()}`)
+  const startedAt = itemTimeMs(item, 'startedAtMs', fallbackStartedAt)
+  const endedAt = itemTimeMs(item, 'completedAtMs', startedAt)
+  if (item?.type === 'reasoning') {
+    const summary = Array.isArray(item.summary) ? item.summary.join('\n\n') : ''
+    const content = Array.isArray(item.content) ? item.content.join('\n\n') : ''
+    const detail = (summary + (summary && content ? '\n\n' : '') + content).trim()
+    return { id: `replay-a-${id}`, kind: 'reasoning', title: 'Thought', detail: detail || undefined, status: 'done', startedAt, endedAt }
+  }
+  if (item?.type === 'commandExecution') {
+    const status: Activity['status'] =
+      item.status === 'failed' ? 'failed' :
+      item.status === 'inProgress' ? 'running' : 'done'
+    return {
+      id: `replay-a-${id}`,
+      kind: 'command',
+      title: commandActivityTitle(item),
+      detail: item.aggregated_output ?? item.aggregatedOutput ?? undefined,
+      status,
+      startedAt,
+      endedAt: status === 'running' ? undefined : endedAt
+    }
+  }
+  if (item?.type === 'fileChange') {
+    const changes = item.changes ?? []
+    return {
+      id: `replay-a-${id}`,
+      kind: 'file',
+      title: `${changes.length} file${changes.length === 1 ? '' : 's'} changed`,
+      detail: changes.map((change: any) => `${describeChange(change.kind)} ${change.path}`).join('\n'),
+      status: 'done',
+      startedAt,
+      endedAt
+    }
+  }
+  if (item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall') {
+    return {
+      id: `replay-a-${id}`,
+      kind: 'tool',
+      title: item.tool ? `${item.tool}` : 'Tool call',
+      status: item.status === 'failed' ? 'failed' : 'done',
+      startedAt,
+      endedAt
+    }
+  }
+  if (item?.type === 'webSearch') {
+    return {
+      id: `replay-a-${id}`,
+      kind: 'web',
+      title: item.query ? `Searched "${item.query}"` : 'Web search',
+      status: 'done',
+      startedAt,
+      endedAt
+    }
+  }
+  return undefined
 }
 
 function actIcon(k: ActivityKind) {
@@ -473,6 +711,8 @@ function DesktopApp() {
   const [ready, setReady] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [clock, setClock] = useState(Date.now())
+  const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [panel, setPanel] = useState<Panel>(null)
   const [threads, setThreads] = useState<ThreadSummary[]>([])
@@ -491,6 +731,10 @@ function DesktopApp() {
   const agentForTurn = useRef<Map<string, string>>(new Map())
   // Map item id -> activity id
   const itemActivity = useRef<Map<string, string>>(new Map())
+  const seenTurnStarts = useRef<Set<string>>(new Set())
+  const appliedReasoningCompletions = useRef<Set<string>>(new Set())
+  const recentNotificationLines = useRef<Map<string, number>>(new Map())
+  const restoredActivityThreads = useRef<Set<string>>(new Set())
   const buf = useRef('')
   const streamRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -498,6 +742,8 @@ function DesktopApp() {
   const runtimeRef = useRef<RuntimeInfo>({})
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const submitInFlight = useRef(false)
+  const stickToBottom = useRef(true)
+  const programmaticScroll = useRef(false)
 
   const toast = (kind: ToastKind, text: string) => {
     const id = `t-${Date.now()}-${Math.random()}`
@@ -512,6 +758,48 @@ function DesktopApp() {
       taRef.current.style.height = 'auto'
     }
     setInput('')
+  }
+  const updateStreamScrollState = () => {
+    if (programmaticScroll.current) return
+    const el = streamRef.current
+    if (!el) return
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 96
+    stickToBottom.current = atBottom
+    setShowJumpToLatest(!atBottom && blocks.length > 0)
+  }
+  const scrollToLatest = (behavior: ScrollBehavior = 'smooth') => {
+    stickToBottom.current = true
+    setShowJumpToLatest(false)
+    programmaticScroll.current = true
+    window.requestAnimationFrame(() => {
+      const el = streamRef.current
+      if (!el) {
+        programmaticScroll.current = false
+        return
+      }
+      el.scrollTo({ top: el.scrollHeight, behavior })
+      window.setTimeout(() => {
+        programmaticScroll.current = false
+        updateStreamScrollState()
+      }, behavior === 'smooth' ? 350 : 50)
+    })
+  }
+  const pauseAutoScroll = () => {
+    const el = streamRef.current
+    if (!el || el.scrollHeight <= el.clientHeight) return
+    stickToBottom.current = false
+    setShowJumpToLatest(blocks.length > 0)
+  }
+  const handleStreamWheel = (event: React.WheelEvent<HTMLDivElement>) => {
+    if (event.deltaY < 0) pauseAutoScroll()
+  }
+  const resetLiveTurnState = () => {
+    currentTurn.current = null
+    agentForTurn.current.clear()
+    itemActivity.current.clear()
+    seenTurnStarts.current.clear()
+    appliedReasoningCompletions.current.clear()
+    recentNotificationLines.current.clear()
   }
   const refreshRuntimeHost = async () => {
     try {
@@ -635,15 +923,67 @@ function DesktopApp() {
   const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {
     setBlocks((bs) => bs.map((b) => (b.type === 'turn' && b.turnId === turnId ? fn(b) : b)))
   }
+  const upsertTurnBlock = (turnId: string, blockId: string, startedAt: number) => {
+    const thinkingId = `thinking-${turnId}`
+    itemActivity.current.set(thinkingId, thinkingId)
+    setBlocks((bs) => {
+      const activity: Activity = { id: thinkingId, kind: 'reasoning', title: 'Thinking', status: 'running', startedAt }
+      let found = false
+      const next = bs.map((b) => {
+        if (b.type !== 'turn' || b.turnId !== turnId) return b
+        found = true
+        const hasThinking = b.activities.some((a) => a.id === thinkingId)
+        return {
+          ...b,
+          id: b.id || blockId,
+          collapsed: false,
+          endedAt: undefined,
+          activities: hasThinking ? b.activities : [activity, ...b.activities]
+        }
+      })
+      if (found) return orderBlocksForTurn(next, turnId)
+      return orderBlocksForTurn([
+        ...bs,
+        {
+          type: 'turn' as const,
+          id: blockId,
+          turnId,
+          collapsed: false,
+          startedAt,
+          activities: [activity]
+        }
+      ], turnId)
+    })
+  }
+  const upsertUserBlock = (turnId: string, itemId: string, text: string) => {
+    if (!text) return
+    const id = `user-${itemId}`
+    setBlocks((bs) => {
+      let found = false
+      const next = bs.map((b) => {
+        if (b.id !== id || b.type !== 'user') return b
+        found = true
+        return { ...b, text, turnId }
+      })
+      if (found) return orderBlocksForTurn(next, turnId)
+      const block: Block = { type: 'user', id, text, turnId }
+      const turnIndex = bs.findIndex((b) => b.type === 'turn' && b.turnId === turnId)
+      const withBlock = turnIndex === -1 ? [...bs, block] : [...bs.slice(0, turnIndex), block, ...bs.slice(turnIndex)]
+      return orderBlocksForTurn(withBlock, turnId)
+    })
+  }
   const updateActivity = (turnId: string, actId: string, patch: Partial<Activity>) => {
     updateTurn(turnId, (t) => ({ ...t, activities: t.activities.map((a) => (a.id === actId ? { ...a, ...patch } : a)) }))
   }
   const ensureActivity = (turnId: string, itemId: string, init: Omit<Activity, 'id' | 'status' | 'startedAt'>) => {
     let actId = itemActivity.current.get(itemId)
     if (actId) return actId
-    actId = `a-${itemId}`
+    actId = itemId.startsWith('thinking-') ? itemId : `a-${itemId}`
     itemActivity.current.set(itemId, actId)
-    updateTurn(turnId, (t) => ({ ...t, activities: [...t.activities, { id: actId!, status: 'running', startedAt: Date.now(), ...init }] }))
+    updateTurn(turnId, (t) => {
+      if (t.activities.some((a) => a.id === actId)) return t
+      return { ...t, activities: [...t.activities, { id: actId!, status: 'running', startedAt: Date.now(), ...init }] }
+    })
     return actId
   }
   const appendActivityDetail = (turnId: string, itemId: string, delta: string) => {
@@ -652,7 +992,15 @@ function DesktopApp() {
     updateTurn(turnId, (t) => ({ ...t, activities: t.activities.map((a) => (a.id === actId ? { ...a, detail: (a.detail ?? '') + delta } : a)) }))
   }
   const appendAgentText = (turnId: string, blockId: string, delta: string) => {
-    setBlocks((bs) => bs.map((b) => (b.type === 'agent' && b.id === blockId ? { ...b, text: b.text + delta } : b)))
+    setBlocks((bs) => {
+      let found = false
+      const next = bs.map((b) => {
+        if (b.type !== 'agent' || b.id !== blockId) return b
+        found = true
+        return { ...b, text: b.text + delta }
+      })
+      return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: delta }]
+    })
     // Also link the turn block to this agent block as its final message.
     updateTurn(turnId, (t) => (t.finalMessageId ? t : { ...t, finalMessageId: blockId }))
   }
@@ -673,23 +1021,23 @@ function DesktopApp() {
           submitInFlight.current = false
           setSubmitting(false)
           setStreaming(true)
+          setClock(Date.now())
+          stickToBottom.current = true
+          setShowJumpToLatest(false)
           const turnId = turnIdFromParams(params)
           if (!turnId) return
           const blockId = `turn-${turnId}`
           const startedAt = Date.now()
           currentTurn.current = { turnId, blockId, startedAt }
-          agentForTurn.current.clear()
+          if (!seenTurnStarts.current.has(turnId)) {
+            seenTurnStarts.current.add(turnId)
+            agentForTurn.current.clear()
+            itemActivity.current.clear()
+            appliedReasoningCompletions.current.clear()
+          }
           // Pre-create a Thinking activity so users see immediate feedback
           // even when the upstream model doesn't stream reasoning deltas.
-          const thinkingId = `thinking-${turnId}`
-          itemActivity.current.set(thinkingId, thinkingId)
-          setBlocks((bs) => [
-            ...bs,
-            {
-              type: 'turn', id: blockId, turnId, collapsed: false, startedAt,
-              activities: [{ id: thinkingId, kind: 'reasoning', title: 'Thinking', status: 'running', startedAt }]
-            }
-          ])
+          upsertTurnBlock(turnId, blockId, startedAt)
           return
         }
         case 'turn/completed': {
@@ -701,7 +1049,7 @@ function DesktopApp() {
           updateTurn(turnId, (t) => {
             // Mark any still-running activities done at end of turn (incl. our placeholder Thinking)
             const acts = t.activities.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now(), title: a.kind === 'reasoning' ? 'Thought' : a.title } : a))
-            return { ...t, endedAt: Date.now(), collapsed: true, activities: acts }
+            return { ...t, endedAt: Date.now(), collapsed: false, activities: acts }
           })
           const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
           void scanTurnArtifacts(turnId, startedAt, `scan-${turnId}-completed`)
@@ -777,7 +1125,7 @@ function DesktopApp() {
             if (method === 'item/started') {
               const txt = formatUserInputContent(item.content ?? [])
               if (inputRef.current.trim() === txt.trim()) clearComposerText()
-              setBlocks((bs) => [...bs, { type: 'user', id: `user-${item.id}`, text: txt }])
+              upsertUserBlock(turnId, String(item.id ?? `user-${turnId}`), txt)
             }
             return
           }
@@ -788,15 +1136,18 @@ function DesktopApp() {
             // Always overwrite the bubble with the canonical text.
             const txt = item.text ?? (Array.isArray(item.content) ? item.content.map((c: any) => c.text ?? '').join('') : '')
             if (!txt) return
-            const existing = agentForTurn.current.get(turnId)
-            if (existing) {
-              setBlocks((bs) => bs.map((b) => (b.type === 'agent' && b.id === existing ? { ...b, text: txt } : b)))
-            } else {
-              const blockId = `agent-${turnId}-final`
-              agentForTurn.current.set(turnId, blockId)
-              setBlocks((bs) => [...bs, { type: 'agent', id: blockId, text: txt }])
-            }
-            updateTurn(turnId, (t) => ({ ...t, finalMessageId: agentForTurn.current.get(turnId) }))
+            const blockId = agentForTurn.current.get(turnId) ?? `agent-${turnId}-final`
+            agentForTurn.current.set(turnId, blockId)
+            setBlocks((bs) => {
+              let found = false
+              const next = bs.map((b) => {
+                if (b.type !== 'agent' || b.id !== blockId) return b
+                found = true
+                return { ...b, text: txt }
+              })
+              return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: txt }]
+            })
+            updateTurn(turnId, (t) => ({ ...t, finalMessageId: blockId }))
             void verifyArtifactClaims(turnId, String(item.id ?? `agent-${turnId}`), txt)
             const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
             window.setTimeout(() => void scanTurnArtifacts(turnId, startedAt, `scan-${String(item.id ?? `agent-${turnId}`)}`), 500)
@@ -806,29 +1157,34 @@ function DesktopApp() {
             // If the upstream returned reasoning as a single completed item
             // (no deltas), append the summary/content to the placeholder.
             if (method === 'item/completed') {
+              const completionKey = `${turnId}:${String(item.id ?? 'reasoning')}`
+              if (appliedReasoningCompletions.current.has(completionKey)) return
+              appliedReasoningCompletions.current.add(completionKey)
               const placeholderId = `thinking-${turnId}`
               const summary = Array.isArray(item.summary) ? item.summary.join('\n\n') : ''
               const content = Array.isArray(item.content) ? item.content.join('\n\n') : ''
               const txt = (summary + (summary && content ? '\n\n' : '') + content).trim()
+              if (txt && !itemActivity.current.has(placeholderId)) {
+                ensureActivity(turnId, placeholderId, { kind: 'reasoning', title: 'Thinking' })
+              }
               if (txt) appendActivityDetail(turnId, placeholderId, txt)
             }
             return
           }
           if (item.type === 'commandExecution') {
             const itemId = item.id as string
-            const command = item.command ?? ''
-            const short = command.length > 80 ? command.slice(0, 77) + '…' : command
+            const title = commandActivityTitle(item)
             if (method === 'item/started') {
-              ensureActivity(turnId, itemId, { kind: 'command', title: short })
+              ensureActivity(turnId, itemId, { kind: 'command', title })
             } else {
               const status: Activity['status'] =
                 item.status === 'completed' ? 'done' :
                 item.status === 'failed' ? 'failed' : 'done'
-              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'command', title: short })
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'command', title })
               updateActivity(turnId, itemActivity.current.get(itemId)!, {
                 status, endedAt: Date.now(),
                 detail: item.aggregated_output ?? item.aggregatedOutput ?? undefined,
-                title: short
+                title
               })
             }
             return
@@ -888,6 +1244,15 @@ function DesktopApp() {
             pending.delete(msg.id)
             if (msg.error && !IGNORED_RPC_ERRORS.has(msg.error.message)) toast('error', msg.error.message)
           } else if (msg.method) {
+            const now = Date.now()
+            const previous = recentNotificationLines.current.get(line)
+            if (previous && now - previous < 1000) continue
+            recentNotificationLines.current.set(line, now)
+            if (recentNotificationLines.current.size > 500) {
+              for (const [key, seenAt] of recentNotificationLines.current) {
+                if (now - seenAt > 5000) recentNotificationLines.current.delete(key)
+              }
+            }
             handle(msg.method, msg.params)
           }
         } catch { /* ignore */ }
@@ -900,6 +1265,7 @@ function DesktopApp() {
       setReady(false)
       setStreaming(false)
       setThread(null)
+      resetLiveTurnState()
       setRuntime((prev) => ({ ...prev, codexRunning: false }))
     })
 
@@ -928,7 +1294,26 @@ function DesktopApp() {
     }
   }, [])
 
-  useEffect(() => { streamRef.current?.scrollTo({ top: streamRef.current.scrollHeight, behavior: 'smooth' }) }, [blocks])
+  useEffect(() => {
+    if (stickToBottom.current) scrollToLatest('auto')
+    else setShowJumpToLatest(blocks.length > 0)
+  }, [blocks])
+  useEffect(() => {
+    if (!thread || restoredActivityThreads.current.has(thread)) return
+    const persisted = loadPersistedActivityBlocks(thread)
+    restoredActivityThreads.current.add(thread)
+    if (!persisted.length) return
+    setBlocks((bs) => (bs.length ? mergePersistedActivityBlocks(bs, persisted) : bs))
+  }, [thread])
+  useEffect(() => {
+    if (!thread) return
+    savePersistedActivityBlocks(thread, blocks)
+  }, [blocks, thread])
+  useEffect(() => {
+    if (!streaming) return
+    const timer = window.setInterval(() => setClock(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [streaming])
   useEffect(() => {
     const ta = taRef.current; if (!ta) return
     ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
@@ -955,6 +1340,9 @@ function DesktopApp() {
 
   const newChat = async () => {
     if (!ready) return
+    stickToBottom.current = true
+    setShowJumpToLatest(false)
+    resetLiveTurnState()
     setBlocks([])
     try {
       const t = await send('thread/start', {})
@@ -964,6 +1352,9 @@ function DesktopApp() {
   }
   const switchThread = async (id: string) => {
     if (!ready) return
+    stickToBottom.current = true
+    setShowJumpToLatest(false)
+    resetLiveTurnState()
     setBlocks([])
     try {
       const t = await send('thread/resume', { threadId: id })
@@ -979,10 +1370,11 @@ function DesktopApp() {
       }
       const base = t.result?.cwd ?? threadForReplay?.cwd ?? runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot
       const replay = blocksFromThreadTurns(threadForReplay?.turns ?? [], base)
+      const restoredBlocks = mergePersistedActivityBlocks(replay.blocks, loadPersistedActivityBlocks(id))
       if (replay.files.length) upsertWorkspaceFiles(replay.files)
-      if (replay.blocks.length) setBlocks(replay.blocks)
+      if (restoredBlocks.length) setBlocks(restoredBlocks)
       else {
-        const preview = threads.find((candidate) => candidate.id === id)?.preview?.trim()
+        const preview = stripInternalPromptContext(threads.find((candidate) => candidate.id === id)?.preview?.trim() ?? '')
         if (preview) setBlocks([{ type: 'user', id: `preview-${id}`, text: preview }])
       }
     } catch (e: any) { toast('error', e?.message ?? String(e)) }
@@ -996,6 +1388,9 @@ function DesktopApp() {
       await send('thread/archive', { threadId: id })
       setThreads((p) => p.filter((t) => t.id !== id))
       if (thread === id) {
+        stickToBottom.current = true
+        setShowJumpToLatest(false)
+        resetLiveTurnState()
         setBlocks([])
         setThread(null)
         const t = await send('thread/start', {})
@@ -1188,6 +1583,8 @@ function DesktopApp() {
     if ((!rawText && attachments.length === 0 && selectedSkills.length === 0) || !ready) return
     submitInFlight.current = true
     setSubmitting(true)
+    stickToBottom.current = true
+    setShowJumpToLatest(false)
     const currentAttachments = attachments
     const currentSkills = selectedSkills
     const text = rawText || (currentAttachments.length ? suggestedPromptForAttachments(currentAttachments) : '')
@@ -1307,7 +1704,7 @@ function DesktopApp() {
         {threads.slice(0, 8).map((t) => (
           <div key={t.id} className={`nav-item nav-item-thread${thread === t.id ? ' active' : ''}`} onClick={() => switchThread(t.id)}>
             <IconProject />
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{t.preview?.trim() || t.name || t.id.slice(0, 8)}</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{displayThreadPreview(t)}</span>
             <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete chat" title="Delete chat"><IconClose /></button>
           </div>
         ))}
@@ -1324,7 +1721,7 @@ function DesktopApp() {
           </div>
         </div>
 
-        <div className="chat-stream" ref={streamRef}>
+        <div className="chat-stream" ref={streamRef} onScroll={updateStreamScrollState} onWheel={handleStreamWheel} onTouchMove={() => pauseAutoScroll()}>
           {blocks.length === 0 ? (
             <div className="empty">
               <div className="h">What should we build?</div>
@@ -1340,7 +1737,7 @@ function DesktopApp() {
             </div>
           ) : (
             blocks.map((b) => {
-              if (b.type === 'user') return <div key={b.id} className="bubble user">{b.text}</div>
+              if (b.type === 'user') return <div key={b.id} className="bubble user">{stripInternalPromptContext(b.text)}</div>
               if (b.type === 'agent') return <div key={b.id} className={`bubble assistant${streaming && b.id === streamingAgentId ? ' streaming' : ''}`}><Markdown text={b.text} /></div>
               if (b.type === 'files') {
                 return (
@@ -1371,19 +1768,23 @@ function DesktopApp() {
                   </div>
                 )
               }
-              const dur = (b.endedAt ?? Date.now()) - b.startedAt
+              const dur = (b.endedAt ?? clock) - b.startedAt
               const running = !b.endedAt
               const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
               const stepsLabel = meaningful.length === 0
-                ? (b.activities.some((a) => a.kind === 'reasoning' && a.detail) ? 'Thought through it' : 'Generated answer')
+                ? (running ? 'waiting for activity' : (b.activities.some((a) => a.kind === 'reasoning' && a.detail) ? 'thought captured' : 'no tool activity'))
                 : `${meaningful.length} step${meaningful.length === 1 ? '' : 's'}`
               return (
                 <div key={b.id} className={`activity-card${b.collapsed ? ' collapsed' : ''}${running ? ' running' : ''}`}>
                   <div className="activity-head" onClick={() => toggleTurn(b.turnId)}>
                     <div className="head-left">
                       <span className={`spinner${running ? ' spin' : ''}`} />
-                      <span className="head-title">{running ? 'Working…' : `Worked for ${fmtDuration(dur)}`}</span>
-                      {!running && <span className="head-meta">· {stepsLabel}</span>}
+                      <div className="head-copy">
+                        <div className="head-line">
+                          <span className="head-title">{running ? 'Working' : 'Completed'}</span>
+                          <span className="head-meta">Activity log · {fmtDuration(dur)} · {stepsLabel}</span>
+                        </div>
+                      </div>
                     </div>
                     <button className="chev" aria-label="Toggle"><IconChevron /></button>
                   </div>
@@ -1423,6 +1824,11 @@ function DesktopApp() {
             })
           )}
         </div>
+        {showJumpToLatest && (
+          <button className="jump-latest" onClick={() => scrollToLatest()} aria-label="Jump to latest">
+            Jump to latest
+          </button>
+        )}
 
         <div className="chat-input-wrap">
           <div className={`chat-input${composerBusy ? ' busy' : ''}`}>
@@ -1503,10 +1909,10 @@ function DesktopApp() {
         <Drawer title="Search threads" onClose={() => setPanel(null)}>
           <input className="drawer-search" placeholder="Filter by preview…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
           <div className="drawer-list">
-            {threads.filter((t) => !searchQuery || (t.preview ?? '').toLowerCase().includes(searchQuery.toLowerCase())).map((t) => (
+            {threads.filter((t) => !searchQuery || displayThreadPreview(t).toLowerCase().includes(searchQuery.toLowerCase())).map((t) => (
               <div key={t.id} className="drawer-row">
                 <div style={{ flex: 1, minWidth: 0 }} onClick={() => switchThread(t.id)}>
-                  <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
+                  <div className="drawer-row-t">{displayThreadPreview(t)}</div>
                   <div className="drawer-row-d">{t.id.slice(0, 8)} · {t.updatedAt ? new Date(t.updatedAt * 1000).toLocaleString() : ''}</div>
                 </div>
                 <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete"><IconClose /></button>
@@ -1621,7 +2027,7 @@ function DesktopApp() {
             {threads.map((t) => (
               <div key={t.id} className="drawer-row">
                 <div style={{ flex: 1, minWidth: 0 }} onClick={() => switchThread(t.id)}>
-                  <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
+                  <div className="drawer-row-t">{displayThreadPreview(t)}</div>
                   <div className="drawer-row-d">{t.id.slice(0, 8)}</div>
                 </div>
                 <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete"><IconClose /></button>
