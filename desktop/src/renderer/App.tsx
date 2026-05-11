@@ -108,10 +108,13 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
     setSaving(false); onClose()
   }
   return (
-    <div className="modal-bg" onClick={onClose}>
+    <div className="modal-bg">
       <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <h2>Model provider</h2>
-        <p className="modal-hint">Standard OpenAI-compatible endpoint. Talks via Responses API or Chat Completions.</p>
+        <div className="modal-head">
+          <h2>Model provider</h2>
+          <button className="modal-x" onClick={onClose} aria-label="Close"><IconClose /></button>
+        </div>
+        <p className="modal-hint">Standard OpenAI-compatible endpoint. Talks via Responses API.</p>
         <label>Base URL<input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></label>
         <label>API Key<input type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-..." /></label>
         <label>Model<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></label>
@@ -119,7 +122,7 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
           <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as any })}>
             <option value="responses">Responses API</option>
           </select>
-          <span className="modal-hint" style={{ marginTop: 4 }}>Chat Completions (legacy) is no longer supported by the underlying engine. Use Responses-API gateway (LiteLLM, AzureChatGPT, vLLM-OpenAI, etc).</span>
+          <span className="modal-hint" style={{ marginTop: 4 }}>Chat Completions (legacy) is no longer supported by the underlying engine. Use a Responses-API gateway (LiteLLM, AzureChatGPT, vLLM-OpenAI, etc).</span>
         </label>
         <div className="modal-actions">
           <button className="ghost" onClick={onClose}>Cancel</button>
