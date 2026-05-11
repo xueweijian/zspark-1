@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron'
+import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 
 const api = {
   send: (line: string) => ipcRenderer.invoke('codex:send', line),
@@ -13,10 +13,26 @@ const api = {
   scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => ipcRenderer.invoke('artifacts:scanRecent', options),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (s: any) => ipcRenderer.invoke('settings:save', s),
-  onStdout: (cb: (s: string) => void) => ipcRenderer.on('codex:stdout', (_e, s) => cb(s)),
-  onStderr: (cb: (s: string) => void) => ipcRenderer.on('codex:stderr', (_e, s) => cb(s)),
-  onExit: (cb: (code: number | null) => void) => ipcRenderer.on('codex:exit', (_e, c) => cb(c)),
-  onSpawned: (cb: () => void) => ipcRenderer.on('codex:spawned', () => cb())
+  onStdout: (cb: (s: string) => void) => {
+    const listener = (_e: IpcRendererEvent, s: string) => cb(s)
+    ipcRenderer.on('codex:stdout', listener)
+    return () => ipcRenderer.removeListener('codex:stdout', listener)
+  },
+  onStderr: (cb: (s: string) => void) => {
+    const listener = (_e: IpcRendererEvent, s: string) => cb(s)
+    ipcRenderer.on('codex:stderr', listener)
+    return () => ipcRenderer.removeListener('codex:stderr', listener)
+  },
+  onExit: (cb: (code: number | null) => void) => {
+    const listener = (_e: IpcRendererEvent, c: number | null) => cb(c)
+    ipcRenderer.on('codex:exit', listener)
+    return () => ipcRenderer.removeListener('codex:exit', listener)
+  },
+  onSpawned: (cb: () => void) => {
+    const listener = () => cb()
+    ipcRenderer.on('codex:spawned', listener)
+    return () => ipcRenderer.removeListener('codex:spawned', listener)
+  }
 }
 
 contextBridge.exposeInMainWorld('zspark', api)

@@ -33,10 +33,10 @@ declare global {
       scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => Promise<ArtifactScanResult>
       getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
       saveSettings: (s: any) => Promise<boolean>
-      onStdout: (cb: (s: string) => void) => void
-      onStderr: (cb: (s: string) => void) => void
-      onExit: (cb: (code: number | null) => void) => void
-      onSpawned: (cb: () => void) => void
+      onStdout: (cb: (s: string) => void) => void | (() => void)
+      onStderr: (cb: (s: string) => void) => void | (() => void)
+      onExit: (cb: (code: number | null) => void) => void | (() => void)
+      onSpawned: (cb: () => void) => void | (() => void)
     }
   }
 }
@@ -449,13 +449,30 @@ function Drawer({ title, onClose, children }: { title: string; onClose: () => vo
   )
 }
 
+function BridgeMissing() {
+  return (
+    <div className="bridge-missing">
+      <div>
+        <h1>Desktop bridge unavailable</h1>
+        <p>zspark must run inside the Electron desktop shell. Reload the window if this appeared after a hot update.</p>
+      </div>
+    </div>
+  )
+}
+
 export function App() {
+  if (!window.zspark) return <BridgeMissing />
+  return <DesktopApp />
+}
+
+function DesktopApp() {
   const [blocks, setBlocks] = useState<Block[]>([])
   const [toasts, setToasts] = useState<Toast[]>([])
   const [input, setInput] = useState('')
   const [thread, setThread] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
   const [streaming, setStreaming] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [panel, setPanel] = useState<Panel>(null)
   const [threads, setThreads] = useState<ThreadSummary[]>([])
@@ -477,8 +494,10 @@ export function App() {
   const buf = useRef('')
   const streamRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const inputRef = useRef('')
   const runtimeRef = useRef<RuntimeInfo>({})
   const shownArtifactPaths = useRef<Set<string>>(new Set())
+  const submitInFlight = useRef(false)
 
   const toast = (kind: ToastKind, text: string) => {
     const id = `t-${Date.now()}-${Math.random()}`
@@ -486,6 +505,14 @@ export function App() {
     if (kind !== 'error') setTimeout(() => dismiss(id), 4000)
   }
   const dismiss = (id: string) => setToasts((p) => p.filter((t) => t.id !== id))
+  const clearComposerText = () => {
+    inputRef.current = ''
+    if (taRef.current) {
+      taRef.current.value = ''
+      taRef.current.style.height = 'auto'
+    }
+    setInput('')
+  }
   const refreshRuntimeHost = async () => {
     try {
       const info = await window.zspark.getRuntimeInfo()
@@ -631,12 +658,20 @@ export function App() {
   }
 
   useEffect(() => { runtimeRef.current = runtime }, [runtime])
+  useEffect(() => { inputRef.current = input }, [input])
+  useEffect(() => {
+    if (streaming || submitting || !input.trim()) return
+    const lastUser = [...blocks].reverse().find((b): b is Extract<Block, { type: 'user' }> => b.type === 'user')
+    if (lastUser?.text.trim() === input.trim()) clearComposerText()
+  }, [blocks])
   useEffect(() => { refreshRuntimeHost() }, [])
 
   useEffect(() => {
     function handle(method: string, params: any) {
       switch (method) {
         case 'turn/started': {
+          submitInFlight.current = false
+          setSubmitting(false)
           setStreaming(true)
           const turnId = turnIdFromParams(params)
           if (!turnId) return
@@ -658,6 +693,8 @@ export function App() {
           return
         }
         case 'turn/completed': {
+          submitInFlight.current = false
+          setSubmitting(false)
           setStreaming(false)
           const turnId = turnIdFromParams(params)
           if (!turnId) return
@@ -682,6 +719,8 @@ export function App() {
             if (wm) toast('warn', wm)
             return
           }
+          submitInFlight.current = false
+          setSubmitting(false)
           setStreaming(false)
           const cur = currentTurn.current
           if (cur) updateTurn(cur.turnId, (t) => ({ ...t, endedAt: Date.now() }))
@@ -718,6 +757,17 @@ export function App() {
           appendActivityDetail(turnId, placeholderId, params.delta ?? '')
           return
         }
+        case 'item/commandExecution/outputDelta': {
+          const turnId = params.turnId as string
+          if (!currentTurn.current || currentTurn.current.turnId !== turnId) return
+          const itemId = String(params.itemId ?? '')
+          if (!itemId) return
+          if (!itemActivity.current.has(itemId)) {
+            ensureActivity(turnId, itemId, { kind: 'command', title: 'Command output' })
+          }
+          appendActivityDetail(turnId, itemId, params.delta ?? '')
+          return
+        }
         case 'item/started':
         case 'item/completed': {
           const item = params?.item
@@ -726,6 +776,7 @@ export function App() {
           if (item.type === 'userMessage') {
             if (method === 'item/started') {
               const txt = formatUserInputContent(item.content ?? [])
+              if (inputRef.current.trim() === txt.trim()) clearComposerText()
               setBlocks((bs) => [...bs, { type: 'user', id: `user-${item.id}`, text: txt }])
             }
             return
@@ -823,7 +874,7 @@ export function App() {
       }
     }
 
-    window.zspark.onStdout((chunk) => {
+    const offStdout = window.zspark.onStdout((chunk) => {
       buf.current += chunk
       let nl: number
       while ((nl = buf.current.indexOf('\n')) !== -1) {
@@ -842,8 +893,10 @@ export function App() {
         } catch { /* ignore */ }
       }
     })
-    window.zspark.onStderr(() => {})
-    window.zspark.onExit(() => {
+    const offStderr = window.zspark.onStderr(() => {})
+    const offExit = window.zspark.onExit(() => {
+      submitInFlight.current = false
+      setSubmitting(false)
       setReady(false)
       setStreaming(false)
       setThread(null)
@@ -861,12 +914,18 @@ export function App() {
         refreshRuntimeHost()
       } catch (e: any) { toast('error', e?.message ?? String(e)) }
     }
-    window.zspark.onSpawned(() => {
+    const offSpawned = window.zspark.onSpawned(() => {
       setRuntime((prev) => ({ ...prev, codexRunning: true }))
       refreshRuntimeHost()
       handshake()
     })
     handshake()
+    return () => {
+      if (typeof offStdout === 'function') offStdout()
+      if (typeof offStderr === 'function') offStderr()
+      if (typeof offExit === 'function') offExit()
+      if (typeof offSpawned === 'function') offSpawned()
+    }
   }, [])
 
   useEffect(() => { streamRef.current?.scrollTo({ top: streamRef.current.scrollHeight, behavior: 'smooth' }) }, [blocks])
@@ -1120,13 +1179,20 @@ export function App() {
     }
   }
   const submit = async (override?: string) => {
+    const fromComposer = override === undefined
     const rawText = (override ?? input).trim()
-    if ((!rawText && attachments.length === 0 && selectedSkills.length === 0) || !ready || streaming) return
+    if (streaming || submitInFlight.current) {
+      toast('warn', 'Current turn is still running. Stop it or wait before sending another message.')
+      return
+    }
+    if ((!rawText && attachments.length === 0 && selectedSkills.length === 0) || !ready) return
+    submitInFlight.current = true
+    setSubmitting(true)
     const currentAttachments = attachments
     const currentSkills = selectedSkills
     const text = rawText || (currentAttachments.length ? suggestedPromptForAttachments(currentAttachments) : '')
-    if (!override) {
-      setInput('')
+    if (fromComposer) {
+      clearComposerText()
       setAttachments([])
       setSelectedSkills([])
     }
@@ -1151,33 +1217,56 @@ export function App() {
       const message = [text, ...contextLines].filter(Boolean).join('\n\n')
       inputItems.unshift({ type: 'text', text: message, textElements: [] })
     }
+    let accepted = false
     try {
       const res = await send('turn/start', { threadId: thread, input: inputItems })
       if (res.error) {
-        if (!override) {
+        if (fromComposer) {
           setInput(text)
           setAttachments(currentAttachments)
           setSelectedSkills(currentSkills)
         }
         toast('error', res.error.message)
+      } else {
+        accepted = true
+        const acceptedTurnId = res.result?.turn?.id
+        window.setTimeout(() => {
+          if (submitInFlight.current && currentTurn.current?.turnId !== acceptedTurnId) {
+            submitInFlight.current = false
+            setSubmitting(false)
+          }
+        }, 3000)
       }
     } catch (e: any) {
-      if (!override) {
+      if (fromComposer) {
         setInput(text)
         setAttachments(currentAttachments)
         setSelectedSkills(currentSkills)
       }
       toast('error', e?.message ?? String(e))
+    } finally {
+      // Successful turn/start hands the lock to turn/started. Failures never
+      // emit a turn boundary, so release the composer here.
+      if (!accepted) {
+        submitInFlight.current = false
+        setSubmitting(false)
+      }
     }
   }
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (streaming || submitInFlight.current) {
+      e.preventDefault()
+      toast('warn', 'Current turn is still running. Stop it or wait before sending another message.')
+      return
+    }
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
   }
   const toggleTurn = (turnId: string) =>
     updateTurn(turnId, (t) => ({ ...t, collapsed: !t.collapsed }))
 
-  const statusClass = ready ? (streaming ? 'streaming' : 'live') : 'off'
-  const statusText = ready ? (streaming ? 'streaming' : 'ready') : 'connecting'
+  const composerBusy = streaming || submitting
+  const statusClass = ready ? (composerBusy ? 'streaming' : 'live') : 'off'
+  const statusText = ready ? (streaming ? 'streaming' : submitting ? 'starting' : 'ready') : 'connecting'
   const hasComposerContent = input.trim().length > 0 || attachments.length > 0 || selectedSkills.length > 0
   const catalogSkills = useMemo(() => {
     const visiblePaths = new Set(skills.map((s) => s.path).filter(Boolean))
@@ -1336,7 +1425,7 @@ export function App() {
         </div>
 
         <div className="chat-input-wrap">
-          <div className="chat-input">
+          <div className={`chat-input${composerBusy ? ' busy' : ''}`}>
             {(attachments.length > 0 || selectedSkills.length > 0) && (
               <div className="composer-chips">
                 {selectedSkills.map((s) => (
@@ -1357,10 +1446,10 @@ export function App() {
               </div>
             )}
             <div className="composer-row">
-              <button className="attach-btn" onClick={pickAttachments} disabled={!ready || streaming} aria-label="Attach files" title="Attach files"><IconFile /></button>
-              <textarea ref={taRef} rows={1} placeholder={ready ? 'Ask zspark anything…' : 'Connecting…'}
-                value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} disabled={!ready} />
-              <button className="send-btn" onClick={() => submit()} disabled={!ready || streaming || !hasComposerContent} aria-label="Send"><IconSend /></button>
+              <button className="attach-btn" onClick={pickAttachments} disabled={!ready || composerBusy} aria-label="Attach files" title="Attach files"><IconFile /></button>
+              <textarea ref={taRef} rows={1} placeholder={composerBusy ? 'zspark is working…' : ready ? 'Ask zspark anything…' : 'Connecting…'}
+                value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} disabled={!ready || composerBusy} />
+              <button className="send-btn" onClick={() => submit()} disabled={!ready || composerBusy || !hasComposerContent} aria-label="Send"><IconSend /></button>
             </div>
           </div>
         </div>
