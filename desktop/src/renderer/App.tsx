@@ -425,16 +425,19 @@ export function App() {
     ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
   }, [input])
 
-  // Refresh thread list when ready or when a turn completes
+  // Refresh thread list when ready, and on each turn boundary (start/end)
   useEffect(() => {
     if (!ready) return
-    void (async () => {
+    let cancelled = false
+    const refresh = async () => {
       try {
         const r = await send('thread/list', { limit: 50 })
-        setThreads(r.result?.data ?? [])
+        if (!cancelled) setThreads(r.result?.data ?? [])
       } catch {}
-    })()
-  }, [ready, streaming])
+    }
+    refresh()
+    return () => { cancelled = true }
+  }, [ready, thread])
 
   const newChat = async () => {
     if (!ready) return
