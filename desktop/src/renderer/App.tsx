@@ -39,10 +39,29 @@ export function App() {
   const [input, setInput] = useState('')
   const [thread, setThread] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
+  const messages = useRef<Map<string, number>>(new Map()) // itemId -> log index
   const buf = useRef('')
   const streamRef = useRef<HTMLDivElement>(null)
 
   const append = (s: string) => setLog((p) => [...p, s])
+  const replaceAt = (idx: number, s: string) =>
+    setLog((p) => {
+      const next = [...p]
+      next[idx] = s
+      return next
+    })
+  const appendDelta = (itemId: string, delta: string) => {
+    setLog((p) => {
+      const idx = messages.current.get(itemId)
+      if (idx !== undefined) {
+        const next = [...p]
+        next[idx] = next[idx] + delta
+        return next
+      }
+      messages.current.set(itemId, p.length)
+      return [...p, delta]
+    })
+  }
 
   useEffect(() => {
     window.zspark.onStdout((chunk) => {
@@ -59,14 +78,7 @@ export function App() {
             pending.delete(msg.id)
             if (msg.error) append(`✗ rpc#${msg.id} ${msg.error.code}: ${msg.error.message}`)
           } else if (msg.method) {
-            // notification / event from server
-            if (msg.method.startsWith('thread/') || msg.method.startsWith('turn/')) {
-              const t = msg.params?.delta?.text ?? msg.params?.text ?? msg.params?.message?.content ?? ''
-              if (t) append(t)
-              else append(`[${msg.method}]`)
-            } else {
-              append(`[${msg.method}] ${JSON.stringify(msg.params).slice(0, 200)}`)
-            }
+            handleEvent(msg.method, msg.params)
           }
         } catch {
           append(line)
@@ -76,16 +88,65 @@ export function App() {
     window.zspark.onStderr((s) => append(`[stderr] ${s.trim()}`))
     window.zspark.onExit((c) => append(`\n[codex exited: ${c}]`))
 
+    function handleEvent(method: string, params: any) {
+      switch (method) {
+        case 'item/agentMessage/delta':
+          appendDelta(params.itemId, params.delta ?? '')
+          return
+        case 'item/started':
+        case 'item/completed': {
+          const item = params?.item
+          if (!item) return
+          if (item.type === 'userMessage') {
+            const txt = (item.content ?? []).map((c: any) => c.text ?? '').join('')
+            if (method === 'item/started') append(`> ${txt}`)
+            return
+          }
+          if (item.type === 'agentMessage' && method === 'item/completed') {
+            const txt = (item.content ?? item.text ?? '')
+            if (typeof txt === 'string' && txt && !messages.current.has(item.id)) {
+              messages.current.set(item.id, log.length)
+              append(txt)
+            }
+            return
+          }
+          if (item.type === 'reasoning') return // hide reasoning blobs
+          return
+        }
+        case 'turn/started':
+          return
+        case 'turn/completed':
+          append('') // blank line
+          return
+        case 'thread/status/changed':
+        case 'thread/tokenUsage/updated':
+        case 'account/rateLimits/updated':
+        case 'thread/started':
+          return
+        case 'mcpServer/startupStatus/updated':
+          if (params?.status === 'failed') append(`⚠ MCP ${params.name}: ${params.error}`)
+          return
+        case 'configWarning':
+          append(`⚠ ${params?.summary ?? ''}`)
+          return
+        default:
+          // swallow
+          return
+      }
+    }
+
     ;(async () => {
       try {
         const init = await send('initialize', {
           clientInfo: { name: 'zspark-desktop', version: '0.0.1' }
         })
-        append(`✓ initialize: ${init.error ? init.error.message : 'ok'}`)
+        if (init.error) {
+          append(`✗ initialize: ${init.error.message}`)
+          return
+        }
         const t = await send('thread/start', {})
         const tid = t.result?.thread?.id ?? null
         setThread(tid)
-        append(`✓ thread started: ${tid}`)
         setReady(true)
       } catch (e: any) {
         append(`✗ handshake failed: ${e?.message ?? e}`)
@@ -100,13 +161,13 @@ export function App() {
   const submit = async () => {
     if (!input.trim() || !ready) return
     const text = input
-    append(`> ${text}`)
     setInput('')
     try {
-      await send('turn/start', {
+      const res = await send('turn/start', {
         threadId: thread,
         input: [{ type: 'text', text, textElements: [] }]
       })
+      if (res.error) append(`✗ turn failed: ${res.error.message}`)
     } catch (e: any) {
       append(`✗ turn failed: ${e?.message ?? e}`)
     }
