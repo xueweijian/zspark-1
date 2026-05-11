@@ -71,6 +71,11 @@ interface Toast { id: string; kind: ToastKind; text: string }
 
 interface ProviderForm { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
 
+type Panel = null | 'search' | 'skills' | 'plugins' | 'automations' | 'history'
+
+interface ThreadSummary { id: string; preview?: string; createdAt?: number; updatedAt?: number; name?: string | null }
+interface SkillMeta { name: string; description?: string }
+
 function fmtDuration(ms: number) {
   const s = Math.round(ms / 1000)
   if (s < 1) return '<1s'
@@ -133,6 +138,20 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
   )
 }
 
+function Drawer({ title, onClose, children }: { title: string; onClose: () => void; children: React.ReactNode }) {
+  return (
+    <div className="drawer-bg">
+      <div className="drawer" onClick={(e) => e.stopPropagation()}>
+        <div className="drawer-head">
+          <div className="t">{title}</div>
+          <button className="modal-x" onClick={onClose} aria-label="Close"><IconClose /></button>
+        </div>
+        <div className="drawer-body">{children}</div>
+      </div>
+    </div>
+  )
+}
+
 export function App() {
   const [blocks, setBlocks] = useState<Block[]>([])
   const [toasts, setToasts] = useState<Toast[]>([])
@@ -141,6 +160,10 @@ export function App() {
   const [ready, setReady] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
+  const [panel, setPanel] = useState<Panel>(null)
+  const [threads, setThreads] = useState<ThreadSummary[]>([])
+  const [skills, setSkills] = useState<SkillMeta[]>([])
+  const [searchQuery, setSearchQuery] = useState('')
   // Track current turn block id for incoming events
   const currentTurn = useRef<{ turnId: string; blockId: string } | null>(null)
   // Map agent itemId (delta or completed) -> agent block id, scoped per turn
@@ -401,7 +424,54 @@ export function App() {
     ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
   }, [input])
 
-  const submit = async (override?: string) => {
+  const newChat = async () => {
+    if (!ready) return
+    setBlocks([])
+    try {
+      const t = await send('thread/start', {})
+      setThread(t.result?.thread?.id ?? null)
+    } catch (e: any) { toast('error', e?.message ?? String(e)) }
+  }
+  const switchThread = async (id: string) => {
+    if (!ready) return
+    setBlocks([])
+    try {
+      const t = await send('thread/resume', { threadId: id })
+      setThread(t.result?.thread?.id ?? id)
+      setPanel(null)
+      // Replay items into bubbles (best-effort: preview + saved messages)
+      const items = await send('thread/turns/items/list', { threadId: id, limit: 200 })
+      const list = items.result?.items ?? []
+      const replay: Block[] = []
+      for (const it of list) {
+        if (it?.type === 'userMessage') {
+          const txt = (it.content ?? []).map((c: any) => c.text ?? '').join('')
+          replay.push({ type: 'user', id: `replay-u-${it.id}`, text: txt })
+        } else if (it?.type === 'agentMessage') {
+          const txt = it.text ?? ''
+          if (txt) replay.push({ type: 'agent', id: `replay-a-${it.id}`, text: txt })
+        }
+      }
+      setBlocks(replay)
+    } catch (e: any) { toast('error', e?.message ?? String(e)) }
+  }
+  const openPanel = async (p: Panel) => {
+    setPanel(p)
+    if (!ready) return
+    if (p === 'history' || p === 'search') {
+      try {
+        const r = await send('thread/list', { limit: 50 })
+        setThreads(r.result?.data ?? [])
+      } catch {}
+    } else if (p === 'skills') {
+      try {
+        const r = await send('skills/list', {})
+        const all: SkillMeta[] = []
+        for (const e of r.result?.data ?? []) for (const s of e.skills ?? []) all.push({ name: s.name, description: s.description })
+        setSkills(all)
+      } catch {}
+    }
+  }
     const text = (override ?? input).trim()
     if (!text || !ready || streaming) return
     if (!override) setInput('')
@@ -423,11 +493,19 @@ export function App() {
     <div className="app">
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">z</div>zspark</div>
-        {sidebarItems.map(({ label, Icon }) => (
-          <div className={`nav-item${label === 'New chat' ? ' active' : ''}`} key={label}><Icon /><span>{label}</span></div>
+        <div className="nav-item active" onClick={newChat}><IconNewChat /><span>New chat</span></div>
+        <div className="nav-item" onClick={() => openPanel('search')}><IconSearch /><span>Search</span></div>
+        <div className="nav-item" onClick={() => openPanel('skills')}><IconSkills /><span>Skills</span></div>
+        <div className="nav-item" onClick={() => openPanel('plugins')}><IconPlugins /><span>Plugins</span></div>
+        <div className="nav-item" onClick={() => openPanel('automations')}><IconAutomations /><span>Automations</span></div>
+        <h3>Recent</h3>
+        {threads.slice(0, 8).map((t) => (
+          <div key={t.id} className={`nav-item${thread === t.id ? ' active' : ''}`} onClick={() => switchThread(t.id)}>
+            <IconProject />
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.preview?.trim() || t.name || t.id.slice(0, 8)}</span>
+          </div>
         ))}
-        <h3>Projects</h3>
-        <div className="nav-item active"><IconProject /><span>zspark</span></div>
+        {threads.length === 0 && <div className="nav-item" onClick={() => openPanel('history')} style={{ color: '#a1a1aa' }}><IconProject /><span>No chats yet</span></div>}
       </aside>
 
       <main className="chat">
@@ -531,6 +609,64 @@ export function App() {
       </aside>
 
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+
+      {panel === 'search' && (
+        <Drawer title="Search threads" onClose={() => setPanel(null)}>
+          <input className="drawer-search" placeholder="Filter by preview…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
+          <div className="drawer-list">
+            {threads.filter((t) => !searchQuery || (t.preview ?? '').toLowerCase().includes(searchQuery.toLowerCase())).map((t) => (
+              <div key={t.id} className="drawer-row" onClick={() => switchThread(t.id)}>
+                <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
+                <div className="drawer-row-d">{t.id.slice(0, 8)} · {t.updatedAt ? new Date(t.updatedAt * 1000).toLocaleString() : ''}</div>
+              </div>
+            ))}
+            {threads.length === 0 && <div className="drawer-empty">No threads yet. Start a new chat to get going.</div>}
+          </div>
+        </Drawer>
+      )}
+
+      {panel === 'skills' && (
+        <Drawer title="Skills" onClose={() => setPanel(null)}>
+          <p className="modal-hint">Skills are reusable capabilities (Office docs, search, etc.) declared by codex skills marketplace.</p>
+          <div className="drawer-list">
+            {skills.map((s, i) => (
+              <div key={s.name + i} className="drawer-row">
+                <div className="drawer-row-t">{s.name}</div>
+                <div className="drawer-row-d">{s.description ?? ''}</div>
+              </div>
+            ))}
+            {skills.length === 0 && <div className="drawer-empty">No skills installed in this workspace.</div>}
+          </div>
+        </Drawer>
+      )}
+
+      {panel === 'plugins' && (
+        <Drawer title="Plugins" onClose={() => setPanel(null)}>
+          <p className="modal-hint">Plugins extend zspark with marketplace skills, hooks, and tools. Install via codex CLI: <code>codex plugin install &lt;id&gt;</code>.</p>
+          <div className="drawer-empty">Plugin marketplace UI coming soon. For now, manage via <code>codex plugin list</code>.</div>
+        </Drawer>
+      )}
+
+      {panel === 'automations' && (
+        <Drawer title="Automations" onClose={() => setPanel(null)}>
+          <p className="modal-hint">Schedule recurring zspark tasks (daily standup digest, on-demand reports, Teams triggers).</p>
+          <div className="drawer-empty">Coming in v0.2 — backed by zspark-server cron + Teams webhook.</div>
+        </Drawer>
+      )}
+
+      {panel === 'history' && (
+        <Drawer title="Chat history" onClose={() => setPanel(null)}>
+          <div className="drawer-list">
+            {threads.map((t) => (
+              <div key={t.id} className="drawer-row" onClick={() => switchThread(t.id)}>
+                <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
+                <div className="drawer-row-d">{t.id.slice(0, 8)}</div>
+              </div>
+            ))}
+            {threads.length === 0 && <div className="drawer-empty">No history.</div>}
+          </div>
+        </Drawer>
+      )}
 
       <div className="toast-wrap">
         {toasts.map((t) => (
