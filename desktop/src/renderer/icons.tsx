@@ -104,6 +104,14 @@ export const IconFile = () => (
   </Wrap>
 )
 
+export const IconImage = () => (
+  <Wrap>
+    <rect x="3" y="5" width="18" height="14" rx="2" />
+    <circle cx="8.5" cy="10.5" r="1.5" />
+    <path d="m21 15-4.5-4.5L7 20" />
+  </Wrap>
+)
+
 export const IconTool = () => (
   <Wrap>
     <path d="M14.7 6.3a4 4 0 0 0-5.4 5.4l-6 6a1 1 0 0 0 1.4 1.4l6-6a4 4 0 0 0 5.4-5.4l-2.7 2.7-2.1-2.1z" />

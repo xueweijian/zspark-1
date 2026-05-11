@@ -4,14 +4,28 @@ import DOMPurify from 'dompurify'
 import {
   IconNewChat, IconSearch, IconSkills, IconPlugins, IconAutomations,
   IconProject, IconSend, IconClose, IconSettings, IconChevron,
-  IconBrain, IconTerminal, IconFile, IconTool, IconGlobe
+  IconBrain, IconTerminal, IconFile, IconImage, IconTool, IconGlobe
 } from './icons'
+import {
+  filterSkillCatalog,
+  inferSkillCategory,
+  recommendedSkillNamesForAttachment,
+  skillCategoryOptions,
+  suggestedPromptForAttachments,
+  type SkillCategory
+} from './skillCatalog'
+import { formatApprovalPolicy, formatSandboxPolicy, shortPath } from './runtimeDisplay'
 
 declare global {
   interface Window {
     zspark: {
       send: (line: string) => Promise<boolean>
       restart: () => Promise<boolean>
+      pickAttachments: () => Promise<PickAttachmentsResult>
+      getRuntimeInfo: () => Promise<RuntimeHostInfo>
+      discoverLocalSkills: () => Promise<DiscoverLocalSkillsResult>
+      openPath: (path: string) => Promise<{ ok: boolean; error?: string }>
+      revealPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
       saveSettings: (s: any) => Promise<boolean>
       onStdout: (cb: (s: string) => void) => void
@@ -38,6 +52,7 @@ const starters = [
 ]
 
 const FALLBACK_MODEL_METADATA_WARNING = 'Defaulting to fallback metadata'
+const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
 
 let nextId = 1
 const newId = () => nextId++
@@ -86,7 +101,83 @@ interface ProviderForm { baseUrl: string; apiKey: string; model: string; wireApi
 type Panel = null | 'search' | 'skills' | 'plugins' | 'automations' | 'history'
 
 interface ThreadSummary { id: string; preview?: string; createdAt?: number; updatedAt?: number; name?: string | null }
-interface SkillMeta { name: string; description?: string }
+interface SkillMeta {
+  name: string
+  description?: string
+  shortDescription?: string
+  displayName?: string
+  path?: string
+  scope?: string
+  enabled?: boolean
+  dependencies?: { tools?: Array<{ type?: string; value?: string; description?: string }> }
+  availability?: 'usable' | 'localOnly'
+  source?: string
+}
+
+type LocalSkillSource = 'workspace' | 'user' | 'system' | 'pluginCache'
+interface LocalSkillMeta {
+  name: string
+  description?: string
+  shortDescription?: string
+  displayName?: string
+  path: string
+  source: LocalSkillSource
+}
+
+interface DiscoverLocalSkillsResult {
+  skills: LocalSkillMeta[]
+  errors: string[]
+}
+
+interface AttachmentMeta {
+  id: string
+  name: string
+  path: string
+  mime: string
+  kind: 'image' | 'file'
+  size: number
+}
+
+interface PickAttachmentsResult {
+  attachments: Omit<AttachmentMeta, 'id'>[]
+  errors: string[]
+}
+
+interface RuntimeHostInfo {
+  workspaceRoot: string
+  attachmentDir: string
+  codexRunning: boolean
+  bridgePort: number | null
+  provider?: { baseUrl: string; model: string; wireApi: 'responses' | 'chat' }
+}
+
+interface RuntimeInfo extends Partial<RuntimeHostInfo> {
+  cwd?: string
+  model?: string
+  modelProvider?: string
+  serviceTier?: string | null
+  approvalPolicy?: unknown
+  approvalsReviewer?: unknown
+  sandbox?: unknown
+  permissionProfile?: unknown
+  activePermissionProfile?: { id?: string; modifications?: unknown[] } | null
+  reasoningEffort?: string | null
+}
+
+interface WorkspaceFile {
+  id: string
+  name: string
+  path: string
+  source: 'attachment' | 'change'
+  status: 'attached' | 'created' | 'modified' | 'deleted'
+  detail?: string
+  updatedAt: number
+}
+
+type TurnInputItem =
+  | { type: 'text'; text: string; textElements: any[] }
+  | { type: 'localImage'; path: string }
+  | { type: 'skill'; name: string; path: string }
 
 function fmtDuration(ms: number) {
   const s = Math.round(ms / 1000)
@@ -94,6 +185,81 @@ function fmtDuration(ms: number) {
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   return `${m}m ${s % 60}s`
+}
+
+function fmtBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes} B`
+  const kb = bytes / 1024
+  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`
+  const mb = kb / 1024
+  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`
+}
+
+function basename(path: string) {
+  return path.split(/[\\/]/).filter(Boolean).pop() ?? path
+}
+
+function formatUserInputContent(content: any[]) {
+  return content.map((c: any) => {
+    if (c?.type === 'text') return c.text ?? ''
+    if (c?.type === 'image') return `[Image: ${c.url?.startsWith?.('data:') ? 'attached image' : c.url ?? 'attached image'}]`
+    if (c?.type === 'localImage') return `[Image: ${basename(String(c.path ?? 'attached image'))}]`
+    if (c?.type === 'skill') return `[Skill: ${c.name ?? 'selected skill'}]`
+    if (c?.type === 'mention') return `[Mention: ${c.name ?? 'selected mention'}]`
+    return ''
+  }).filter(Boolean).join('\n')
+}
+
+function scopeLabel(scope?: string) {
+  switch (scope) {
+    case 'repo': return 'Project'
+    case 'user': return 'User'
+    case 'system': return 'System'
+    case 'admin': return 'Admin'
+    default: return 'Skill'
+  }
+}
+
+function localSkillSourceLabel(source?: string) {
+  switch (source) {
+    case 'workspace': return 'Project'
+    case 'pluginCache': return 'Plugin cache'
+    case 'system': return 'System'
+    case 'user': return 'User'
+    default: return source ?? 'Local'
+  }
+}
+
+function skillStatusLabel(skill: SkillMeta) {
+  if (skill.availability === 'localOnly') return 'Detected'
+  if (skill.enabled === false) return 'Disabled'
+  return 'Ready'
+}
+
+function skillStatusClass(skill: SkillMeta) {
+  if (skill.availability === 'localOnly') return 'local'
+  if (skill.enabled === false) return 'disabled'
+  return 'ready'
+}
+
+function isAbsolutePath(path: string) {
+  return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)
+}
+
+function resolveWorkspacePath(path: string, base?: string) {
+  if (!path || isAbsolutePath(path) || !base) return path
+  return `${base.replace(/[\\/]+$/, '')}/${path}`
+}
+
+function changeKindLabel(kind: any): WorkspaceFile['status'] {
+  if (kind?.type === 'add' || kind === 'add') return 'created'
+  if (kind?.type === 'delete' || kind === 'delete') return 'deleted'
+  return 'modified'
+}
+
+function describeChange(kind: any) {
+  if (kind?.type === 'update' && kind.movePath) return `Moved from ${kind.movePath}`
+  return changeKindLabel(kind)
 }
 
 marked.setOptions({ gfm: true, breaks: true })
@@ -176,7 +342,14 @@ export function App() {
   const [panel, setPanel] = useState<Panel>(null)
   const [threads, setThreads] = useState<ThreadSummary[]>([])
   const [skills, setSkills] = useState<SkillMeta[]>([])
+  const [localSkills, setLocalSkills] = useState<LocalSkillMeta[]>([])
   const [searchQuery, setSearchQuery] = useState('')
+  const [skillQuery, setSkillQuery] = useState('')
+  const [skillCategory, setSkillCategory] = useState<SkillCategory>('work')
+  const [attachments, setAttachments] = useState<AttachmentMeta[]>([])
+  const [selectedSkills, setSelectedSkills] = useState<SkillMeta[]>([])
+  const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([])
+  const [runtime, setRuntime] = useState<RuntimeInfo>({})
   // Track current turn block id for incoming events
   const currentTurn = useRef<{ turnId: string; blockId: string } | null>(null)
   // Map agent itemId (delta or completed) -> agent block id, scoped per turn
@@ -186,6 +359,7 @@ export function App() {
   const buf = useRef('')
   const streamRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
+  const runtimeRef = useRef<RuntimeInfo>({})
 
   const toast = (kind: ToastKind, text: string) => {
     const id = `t-${Date.now()}-${Math.random()}`
@@ -193,6 +367,52 @@ export function App() {
     if (kind !== 'error') setTimeout(() => dismiss(id), 4000)
   }
   const dismiss = (id: string) => setToasts((p) => p.filter((t) => t.id !== id))
+  const refreshRuntimeHost = async () => {
+    try {
+      const info = await window.zspark.getRuntimeInfo()
+      setRuntime((prev) => ({ ...prev, ...info }))
+    } catch {}
+  }
+  const applyThreadRuntime = (result: any) => {
+    if (!result) return
+    setRuntime((prev) => ({
+      ...prev,
+      cwd: result.cwd,
+      model: result.model,
+      modelProvider: result.modelProvider,
+      serviceTier: result.serviceTier,
+      approvalPolicy: result.approvalPolicy,
+      approvalsReviewer: result.approvalsReviewer,
+      sandbox: result.sandbox,
+      permissionProfile: result.permissionProfile,
+      activePermissionProfile: result.activePermissionProfile,
+      reasoningEffort: result.reasoningEffort
+    }))
+  }
+  const upsertWorkspaceFiles = (files: WorkspaceFile[]) => {
+    setWorkspaceFiles((prev) => {
+      const byPath = new Map(prev.map((file) => [file.path, file]))
+      for (const file of files) byPath.set(file.path, { ...byPath.get(file.path), ...file })
+      return [...byPath.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 24)
+    })
+  }
+  const recordFileChanges = (changes: any[]) => {
+    const base = runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot
+    const now = Date.now()
+    upsertWorkspaceFiles(changes.map((change, index) => {
+      const fullPath = resolveWorkspacePath(String(change.path ?? ''), base)
+      const status = changeKindLabel(change.kind)
+      return {
+        id: `chg-${now}-${index}`,
+        name: basename(fullPath),
+        path: fullPath,
+        source: 'change' as const,
+        status,
+        detail: describeChange(change.kind),
+        updatedAt: now
+      }
+    }).filter((file) => file.path))
+  }
 
   const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {
     setBlocks((bs) => bs.map((b) => (b.type === 'turn' && b.turnId === turnId ? fn(b) : b)))
@@ -218,6 +438,9 @@ export function App() {
     // Also link the turn block to this agent block as its final message.
     updateTurn(turnId, (t) => (t.finalMessageId ? t : { ...t, finalMessageId: blockId }))
   }
+
+  useEffect(() => { runtimeRef.current = runtime }, [runtime])
+  useEffect(() => { refreshRuntimeHost() }, [])
 
   useEffect(() => {
     function handle(method: string, params: any) {
@@ -306,7 +529,7 @@ export function App() {
           const turnId = params.turnId as string
           if (item.type === 'userMessage') {
             if (method === 'item/started') {
-              const txt = (item.content ?? []).map((c: any) => c.text ?? '').join('')
+              const txt = formatUserInputContent(item.content ?? [])
               setBlocks((bs) => [...bs, { type: 'user', id: `user-${item.id}`, text: txt }])
             }
             return
@@ -364,10 +587,12 @@ export function App() {
             const itemId = item.id as string
             const changes = item.changes ?? []
             const title = `${changes.length} file${changes.length === 1 ? '' : 's'} changed`
+            const detail = changes.map((change: any) => `${describeChange(change.kind)} ${change.path}`).join('\n')
             if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'file', title })
             else {
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'file', title })
-              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title })
+              recordFileChanges(changes)
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail })
             }
             return
           }
@@ -409,7 +634,7 @@ export function App() {
           if (typeof msg.id === 'number' && pending.has(msg.id)) {
             pending.get(msg.id)!.resolve(msg)
             pending.delete(msg.id)
-            if (msg.error && msg.error.message !== 'Not initialized') toast('error', msg.error.message)
+            if (msg.error && !IGNORED_RPC_ERRORS.has(msg.error.message)) toast('error', msg.error.message)
           } else if (msg.method) {
             handle(msg.method, msg.params)
           }
@@ -417,18 +642,29 @@ export function App() {
       }
     })
     window.zspark.onStderr(() => {})
-    window.zspark.onExit(() => { setReady(false); setStreaming(false); setThread(null) })
+    window.zspark.onExit(() => {
+      setReady(false)
+      setStreaming(false)
+      setThread(null)
+      setRuntime((prev) => ({ ...prev, codexRunning: false }))
+    })
 
     const handshake = async () => {
       try {
         const init = await send('initialize', { clientInfo: { name: 'zspark-desktop', version: '0.0.1' } })
-        if (init.error) { toast('error', init.error.message); return }
+        if (init.error && init.error.message !== 'Already initialized') { toast('error', init.error.message); return }
         const t = await send('thread/start', {})
         const tid = t.result?.thread?.id ?? null
+        applyThreadRuntime(t.result)
         setThread(tid); setReady(true)
+        refreshRuntimeHost()
       } catch (e: any) { toast('error', e?.message ?? String(e)) }
     }
-    window.zspark.onSpawned(() => { handshake() })
+    window.zspark.onSpawned(() => {
+      setRuntime((prev) => ({ ...prev, codexRunning: true }))
+      refreshRuntimeHost()
+      handshake()
+    })
     handshake()
   }, [])
 
@@ -452,11 +688,17 @@ export function App() {
     return () => { cancelled = true }
   }, [ready, thread])
 
+  useEffect(() => {
+    if (!ready) return
+    refreshSkills().catch(() => {})
+  }, [ready])
+
   const newChat = async () => {
     if (!ready) return
     setBlocks([])
     try {
       const t = await send('thread/start', {})
+      applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? null)
     } catch (e: any) { toast('error', e?.message ?? String(e)) }
   }
@@ -465,6 +707,7 @@ export function App() {
     setBlocks([])
     try {
       const t = await send('thread/resume', { threadId: id })
+      applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? id)
       setPanel(null)
       // Replay items into bubbles (best-effort: preview + saved messages)
@@ -473,7 +716,7 @@ export function App() {
       const replay: Block[] = []
       for (const it of list) {
         if (it?.type === 'userMessage') {
-          const txt = (it.content ?? []).map((c: any) => c.text ?? '').join('')
+          const txt = formatUserInputContent(it.content ?? [])
           replay.push({ type: 'user', id: `replay-u-${it.id}`, text: txt })
         } else if (it?.type === 'agentMessage') {
           const txt = it.text ?? ''
@@ -495,35 +738,208 @@ export function App() {
         setBlocks([])
         setThread(null)
         const t = await send('thread/start', {})
+        applyThreadRuntime(t.result)
         setThread(t.result?.thread?.id ?? null)
       }
     } catch (err: any) { toast('error', err?.message ?? String(err)) }
   }
+
+  const pickAttachments = async () => {
+    if (!ready || streaming) return
+    try {
+      const result = await window.zspark.pickAttachments()
+      if (result.errors.length) toast('warn', result.errors.join('\n'))
+      if (result.attachments.length) {
+        const picked = result.attachments.map((a) => ({ ...a, id: `att-${Date.now()}-${Math.random()}` }))
+        setAttachments((prev) => [
+          ...prev,
+          ...picked
+        ])
+        upsertWorkspaceFiles(picked.map((a) => ({
+          id: `file-${a.id}`,
+          name: a.name,
+          path: a.path,
+          source: 'attachment',
+          status: 'attached',
+          updatedAt: Date.now()
+        })))
+        addRecommendedSkillsForAttachments(picked)
+      }
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
+  }
+
+  const removeAttachment = (id: string) => setAttachments((prev) => prev.filter((a) => a.id !== id))
+
+  const useSkill = (skill: SkillMeta) => {
+    if (!skill.path) return
+    setSelectedSkills((prev) => {
+      if (prev.some((s) => s.path === skill.path)) return prev
+      return [...prev, skill]
+    })
+    setPanel(null)
+  }
+
+  const removeSkill = (path?: string) => setSelectedSkills((prev) => prev.filter((s) => s.path !== path))
+
+  const openSkillPath = async (path?: string) => {
+    if (!path) return
+    try {
+      const result = await window.zspark.openPath(path)
+      if (!result.ok) toast('error', result.error ?? 'Could not open skill file')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
+  }
+
+  const openFilePath = async (path?: string) => {
+    if (!path) return
+    try {
+      const result = await window.zspark.openPath(path)
+      if (!result.ok) toast('error', result.error ?? 'Could not open file')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
+  }
+
+  const revealFilePath = async (path?: string) => {
+    if (!path) return
+    try {
+      const result = await window.zspark.revealPath(path)
+      if (!result.ok) toast('error', result.error ?? 'Could not reveal file')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
+  }
+
+  const refreshSkills = async (forceReload = false) => {
+    const [local, visible] = await Promise.all([
+      window.zspark.discoverLocalSkills(),
+      ready ? send('skills/list', { forceReload }) : Promise.resolve({ result: { data: [] } })
+    ])
+
+    if (local.errors.length) toast('warn', local.errors.slice(0, 3).join('\n'))
+    setLocalSkills(local.skills)
+
+    const all: SkillMeta[] = []
+    for (const e of visible.result?.data ?? []) {
+      for (const s of e.skills ?? []) {
+        all.push({
+          name: s.name,
+          description: s.description,
+          shortDescription: s.shortDescription ?? s.interface?.shortDescription,
+          displayName: s.interface?.displayName,
+          path: s.path,
+          scope: s.scope,
+          enabled: s.enabled,
+          dependencies: s.dependencies,
+          availability: 'usable'
+        })
+      }
+    }
+    setSkills(all)
+  }
+
+  const setSkillEnabled = async (skill: SkillMeta, enabled: boolean) => {
+    if (!skill.path || skill.availability === 'localOnly') return
+    try {
+      await send('skills/config/write', { path: skill.path, enabled })
+      await refreshSkills(true)
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
+  }
+
+  const addRecommendedSkillsForAttachments = (picked: AttachmentMeta[]) => {
+    const usable = skills.filter((s) => s.path && s.enabled !== false)
+    const selected: SkillMeta[] = []
+    for (const attachment of picked) {
+      const names = recommendedSkillNamesForAttachment(attachment).map((name) => name.toLowerCase())
+      const skill = usable.find((s) => {
+        const display = (s.displayName ?? '').toLowerCase()
+        const name = s.name.toLowerCase()
+        return names.includes(name) || names.includes(display)
+      })
+      if (skill && !selected.some((s) => s.path === skill.path)) selected.push(skill)
+    }
+    if (selected.length) {
+      setSelectedSkills((prev) => {
+        const seen = new Set(prev.map((s) => s.path))
+        return [...prev, ...selected.filter((s) => !seen.has(s.path))]
+      })
+    }
+  }
+
   const openPanel = async (p: Panel) => {
     setPanel(p)
+    if (p === 'skills') {
+      try { await refreshSkills(true) } catch {}
+      return
+    }
+    if (p === 'plugins') {
+      try {
+        const local = await window.zspark.discoverLocalSkills()
+        setLocalSkills(local.skills)
+      } catch {}
+    }
     if (!ready) return
     if (p === 'history' || p === 'search') {
       try {
         const r = await send('thread/list', { limit: 50 })
         setThreads(r.result?.data ?? [])
       } catch {}
-    } else if (p === 'skills') {
-      try {
-        const r = await send('skills/list', {})
-        const all: SkillMeta[] = []
-        for (const e of r.result?.data ?? []) for (const s of e.skills ?? []) all.push({ name: s.name, description: s.description })
-        setSkills(all)
-      } catch {}
     }
   }
   const submit = async (override?: string) => {
-    const text = (override ?? input).trim()
-    if (!text || !ready || streaming) return
-    if (!override) setInput('')
+    const rawText = (override ?? input).trim()
+    if ((!rawText && attachments.length === 0 && selectedSkills.length === 0) || !ready || streaming) return
+    const currentAttachments = attachments
+    const currentSkills = selectedSkills
+    const text = rawText || (currentAttachments.length ? suggestedPromptForAttachments(currentAttachments) : '')
+    if (!override) {
+      setInput('')
+      setAttachments([])
+      setSelectedSkills([])
+    }
+    const inputItems: TurnInputItem[] = []
+    const contextLines: string[] = []
+    for (const skill of currentSkills) {
+      if (skill.path) {
+        inputItems.push({ type: 'skill', name: skill.name, path: skill.path })
+        contextLines.push(`Use skill: ${skill.name}`)
+      }
+    }
+    for (const attachment of currentAttachments) {
+      if (attachment.kind === 'image') {
+        inputItems.push({ type: 'localImage', path: attachment.path })
+        contextLines.push(`Attached image: ${attachment.name} (workspace copy: ${attachment.path})`)
+      } else {
+        contextLines.push(`Attached file: ${attachment.name} (writable workspace copy: ${attachment.path})`)
+      }
+    }
+    if (text || contextLines.length) {
+      const message = [text, ...contextLines].filter(Boolean).join('\n\n')
+      inputItems.unshift({ type: 'text', text: message, textElements: [] })
+    }
     try {
-      const res = await send('turn/start', { threadId: thread, input: [{ type: 'text', text, textElements: [] }] })
-      if (res.error) toast('error', res.error.message)
-    } catch (e: any) { toast('error', e?.message ?? String(e)) }
+      const res = await send('turn/start', { threadId: thread, input: inputItems })
+      if (res.error) {
+        if (!override) {
+          setInput(text)
+          setAttachments(currentAttachments)
+          setSelectedSkills(currentSkills)
+        }
+        toast('error', res.error.message)
+      }
+    } catch (e: any) {
+      if (!override) {
+        setInput(text)
+        setAttachments(currentAttachments)
+        setSelectedSkills(currentSkills)
+      }
+      toast('error', e?.message ?? String(e))
+    }
   }
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
@@ -533,6 +949,31 @@ export function App() {
 
   const statusClass = ready ? (streaming ? 'streaming' : 'live') : 'off'
   const statusText = ready ? (streaming ? 'streaming' : 'ready') : 'connecting'
+  const hasComposerContent = input.trim().length > 0 || attachments.length > 0 || selectedSkills.length > 0
+  const catalogSkills = useMemo(() => {
+    const visiblePaths = new Set(skills.map((s) => s.path).filter(Boolean))
+    const visibleNames = new Set(skills.map((s) => s.name.toLowerCase()))
+    const localOnly = localSkills
+      .filter((s) => !visiblePaths.has(s.path) && !visibleNames.has(s.name.toLowerCase()))
+      .map((s): SkillMeta => ({
+        ...s,
+        availability: 'localOnly',
+        enabled: false,
+        scope: undefined
+      }))
+    return [...skills.map((s) => ({ ...s, availability: 'usable' as const })), ...localOnly]
+  }, [skills, localSkills])
+  const visibleSkills = useMemo(
+    () => filterSkillCatalog(catalogSkills, skillCategory, skillQuery) as SkillMeta[],
+    [catalogSkills, skillCategory, skillQuery]
+  )
+  const usableSkillCount = skills.filter((s) => s.enabled !== false).length
+  const localOnlyOfficeCount = catalogSkills.filter((s) => s.availability === 'localOnly' && inferSkillCategory(s) === 'office').length
+  const pluginCacheSkills = localSkills.filter((s) => s.source === 'pluginCache')
+  const visibleSkillPaths = new Set(skills.map((s) => s.path).filter(Boolean))
+  const runtimeCwd = runtime.cwd ?? runtime.workspaceRoot
+  const runtimeProvider = runtime.provider?.model ?? runtime.model
+  const runtimeProviderName = runtime.modelProvider ?? (runtime.provider ? 'zspark' : undefined)
 
   return (
     <div className="app">
@@ -614,6 +1055,9 @@ export function App() {
                               {a.detail && a.kind === 'command' && (
                                 <pre className="act-detail mono">{a.detail.slice(-1200)}</pre>
                               )}
+                              {a.detail && a.kind === 'file' && (
+                                <div className="act-detail">{a.detail}</div>
+                              )}
                             </div>
                             <div className="act-status">
                               {a.status === 'running' ? '· · ·' :
@@ -633,9 +1077,31 @@ export function App() {
 
         <div className="chat-input-wrap">
           <div className="chat-input">
-            <textarea ref={taRef} rows={1} placeholder={ready ? 'Ask zspark anything…' : 'Connecting…'}
-              value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} disabled={!ready} />
-            <button className="send-btn" onClick={() => submit()} disabled={!ready || streaming || !input.trim()} aria-label="Send"><IconSend /></button>
+            {(attachments.length > 0 || selectedSkills.length > 0) && (
+              <div className="composer-chips">
+                {selectedSkills.map((s) => (
+                  <div key={s.path ?? s.name} className="composer-chip skill-chip" title={s.path}>
+                    <IconSkills />
+                    <span>{s.displayName ?? s.name}</span>
+                    <button onClick={() => removeSkill(s.path)} aria-label={`Remove ${s.name}`}><IconClose /></button>
+                  </div>
+                ))}
+                {attachments.map((a) => (
+                  <div key={a.id} className={`composer-chip ${a.kind === 'image' ? 'image-chip' : ''}`} title={a.path}>
+                    {a.kind === 'image' ? <IconImage /> : <IconFile />}
+                    <span>{a.name}</span>
+                    <em>{fmtBytes(a.size)}</em>
+                    <button onClick={() => removeAttachment(a.id)} aria-label={`Remove ${a.name}`}><IconClose /></button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="composer-row">
+              <button className="attach-btn" onClick={pickAttachments} disabled={!ready || streaming} aria-label="Attach files" title="Attach files"><IconFile /></button>
+              <textarea ref={taRef} rows={1} placeholder={ready ? 'Ask zspark anything…' : 'Connecting…'}
+                value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} disabled={!ready} />
+              <button className="send-btn" onClick={() => submit()} disabled={!ready || streaming || !hasComposerContent} aria-label="Send"><IconSend /></button>
+            </div>
           </div>
         </div>
       </main>
@@ -645,12 +1111,39 @@ export function App() {
           <h4>Session</h4>
           <div className="kv"><span className="k">Thread</span><span className="v">{thread ? thread.slice(0, 8) : '—'}</span></div>
           <div className="kv"><span className="k">Status</span><span className="v"><span className={`pill ${ready ? '' : 'off'}`}>{ready ? 'live' : 'offline'}</span></span></div>
+          <div className="kv"><span className="k">Skills</span><span className="v">{usableSkillCount} ready</span></div>
         </div>
         <div className="right-section">
           <h4>Runtime</h4>
-          <div className="kv"><span className="k">Sandbox</span><span className="v">Seatbelt · AppContainer</span></div>
-          <div className="kv"><span className="k">Auth</span><span className="v">Entra ID (CN)</span></div>
-          <div className="kv"><span className="k">Collab</span><span className="v">143.64.174.225</span></div>
+          <div className="kv"><span className="k">CWD</span><span className="v" title={runtimeCwd}>{shortPath(runtimeCwd)}</span></div>
+          <div className="kv"><span className="k">Model</span><span className="v">{runtimeProvider ?? '—'}</span></div>
+          <div className="kv"><span className="k">Provider</span><span className="v">{runtimeProviderName ?? '—'}</span></div>
+          <div className="kv"><span className="k">Wire API</span><span className="v">{runtime.provider?.wireApi ?? 'responses'}</span></div>
+          <div className="kv"><span className="k">Sandbox</span><span className="v">{formatSandboxPolicy(runtime.sandbox, runtime.permissionProfile)}</span></div>
+          <div className="kv"><span className="k">Approval</span><span className="v">{formatApprovalPolicy(runtime.approvalPolicy)}</span></div>
+          {runtime.activePermissionProfile?.id && <div className="kv"><span className="k">Profile</span><span className="v">{runtime.activePermissionProfile.id}</span></div>}
+        </div>
+        <div className="right-section">
+          <h4>Files</h4>
+          <div className="file-actions">
+            <button onClick={() => revealFilePath(runtime.attachmentDir)} disabled={!runtime.attachmentDir}>Attachments</button>
+            <button onClick={() => revealFilePath(runtime.workspaceRoot)} disabled={!runtime.workspaceRoot}>Workspace</button>
+          </div>
+          {workspaceFiles.length === 0 ? (
+            <div className="right-empty">No attached or changed files yet.</div>
+          ) : (
+            <div className="file-list">
+              {workspaceFiles.slice(0, 8).map((file) => (
+                <div className="file-row" key={file.path}>
+                  <div className="file-row-main">
+                    <span className={`file-status file-status-${file.status}`}>{file.status}</span>
+                    <button title={file.path} onClick={() => openFilePath(file.path)}>{file.name}</button>
+                  </div>
+                  <button className="file-reveal" onClick={() => revealFilePath(file.path)}>Reveal</button>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       </aside>
 
@@ -676,23 +1169,92 @@ export function App() {
 
       {panel === 'skills' && (
         <Drawer title="Skills" onClose={() => setPanel(null)}>
-          <p className="modal-hint">Skills are reusable capabilities (Office docs, search, etc.) declared by codex skills marketplace.</p>
-          <div className="drawer-list">
-            {skills.map((s, i) => (
-              <div key={s.name + i} className="drawer-row">
-                <div className="drawer-row-t">{s.name}</div>
-                <div className="drawer-row-d">{s.description ?? ''}</div>
+          <div className="skills-toolbar">
+            <input className="drawer-search" placeholder="Search skills…" value={skillQuery} onChange={(e) => setSkillQuery(e.target.value)} />
+            <div className="skills-count">{visibleSkills.length}/{catalogSkills.length}</div>
+          </div>
+          <div className="skill-tabs">
+            {skillCategoryOptions.map((option) => (
+              <button key={option.id} className={skillCategory === option.id ? 'active' : ''} onClick={() => setSkillCategory(option.id)}>
+                {option.label}
+              </button>
+            ))}
+          </div>
+          <div className="skill-summary">
+            <strong>{usableSkillCount} usable now</strong>
+            <span>{localSkills.length} detected locally. Only skills returned by app-server can be used in <code>turn/start</code>.</span>
+            {localOnlyOfficeCount > 0 && <em>{localOnlyOfficeCount} office skill{localOnlyOfficeCount === 1 ? '' : 's'} found in plugin cache but not visible to this runtime.</em>}
+          </div>
+          <div className="skills-list">
+            {visibleSkills.map((s, i) => (
+              <div key={(s.path ?? s.name) + i} className={`skill-card${s.enabled === false ? ' disabled' : ''}${s.availability === 'localOnly' ? ' local-only' : ''}`}>
+                <div className="skill-card-head">
+                  <div className="skill-title">
+                    <span>{s.displayName ?? s.name}</span>
+                    {s.displayName && <small>{s.name}</small>}
+                  </div>
+                  <div className="skill-badges">
+                    <span className={`skill-status ${skillStatusClass(s)}`}>{skillStatusLabel(s)}</span>
+                    <span className="skill-source">{s.availability === 'localOnly' ? localSkillSourceLabel(s.source) : scopeLabel(s.scope)}</span>
+                  </div>
+                </div>
+                <div className="skill-desc">{s.shortDescription || s.description || 'No description.'}</div>
+                <div className="skill-meta-row">
+                  <span>{inferSkillCategory(s)}</span>
+                  {s.dependencies?.tools?.length ? <span>{s.dependencies.tools.length} tool deps</span> : <span>No tool deps listed</span>}
+                </div>
+                {s.path && <div className="skill-path">{s.path}</div>}
+                <div className="skill-actions">
+                  <button className="secondary" onClick={() => openSkillPath(s.path)} disabled={!s.path}>Open</button>
+                  {s.availability === 'localOnly' ? (
+                    <button disabled title="Detected on disk, but app-server did not list it as usable for this runtime.">Not visible</button>
+                  ) : s.enabled === false ? (
+                    <button onClick={() => setSkillEnabled(s, true)} disabled={!s.path}>Enable</button>
+                  ) : (
+                    <button onClick={() => useSkill(s)} disabled={!s.path}>Use</button>
+                  )}
+                </div>
               </div>
             ))}
-            {skills.length === 0 && <div className="drawer-empty">No skills installed in this workspace.</div>}
+            {catalogSkills.length === 0 && <div className="drawer-empty">No skills found in this workspace or local Codex skill roots.</div>}
+            {catalogSkills.length > 0 && visibleSkills.length === 0 && <div className="drawer-empty">No matching skills.</div>}
           </div>
         </Drawer>
       )}
 
       {panel === 'plugins' && (
         <Drawer title="Plugins" onClose={() => setPanel(null)}>
-          <p className="modal-hint">Plugins extend zspark with marketplace skills, hooks, and tools. Install via codex CLI: <code>codex plugin install &lt;id&gt;</code>.</p>
-          <div className="drawer-empty">Plugin marketplace UI coming soon. For now, manage via <code>codex plugin list</code>.</div>
+          <p className="modal-hint">Plugin-backed skills are usable from zspark when app-server exposes them in <code>skills/list</code>. Cache-only entries are present on disk but not selectable for <code>turn/start</code>.</p>
+          <div className="skill-summary">
+            <strong>{pluginCacheSkills.length} plugin skill{pluginCacheSkills.length === 1 ? '' : 's'} detected</strong>
+            <span>{pluginCacheSkills.filter((s) => visibleSkillPaths.has(s.path)).length} are visible to this runtime.</span>
+          </div>
+          <div className="skills-list">
+            {pluginCacheSkills.map((skill) => {
+              const visible = visibleSkillPaths.has(skill.path)
+              return (
+                <div className={`skill-card${visible ? '' : ' local-only'}`} key={skill.path}>
+                  <div className="skill-card-head">
+                    <div className="skill-title">
+                      <span>{skill.displayName ?? skill.name}</span>
+                      {skill.displayName && <small>{skill.name}</small>}
+                    </div>
+                    <div className="skill-badges">
+                      <span className={`skill-status ${visible ? 'ready' : 'local'}`}>{visible ? 'Ready' : 'Cache'}</span>
+                      <span className="skill-source">Plugin cache</span>
+                    </div>
+                  </div>
+                  <div className="skill-desc">{skill.shortDescription || skill.description || 'No description.'}</div>
+                  <div className="skill-path">{skill.path}</div>
+                  <div className="skill-actions">
+                    <button className="secondary" onClick={() => openSkillPath(skill.path)}>Open</button>
+                    <button onClick={() => { setSkillCategory(inferSkillCategory(skill)); setPanel('skills') }}>View in Skills</button>
+                  </div>
+                </div>
+              )
+            })}
+            {pluginCacheSkills.length === 0 && <div className="drawer-empty">No plugin cache skills found under local Codex plugin cache.</div>}
+          </div>
         </Drawer>
       )}
 

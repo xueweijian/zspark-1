@@ -1,9 +1,11 @@
-import { app, BrowserWindow, ipcMain, shell, safeStorage } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } from 'electron'
+import type { OpenDialogOptions } from 'electron'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream } from 'node:fs'
-import { homedir } from 'node:os'
+import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
+import { discoverLocalSkills } from './localSkills'
 
 let mainWindow: BrowserWindow | null = null
 let codex: ChildProcessWithoutNullStreams | null = null
@@ -21,6 +23,20 @@ let bridgeClose: (() => void) | null = null
 const PROVIDER_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/models']
 
 const SETTINGS_PATH = join(app.getPath('userData'), 'zspark-settings.json')
+const WORKSPACE_ROOT = resolveWorkspaceRoot(process.cwd())
+const ATTACHMENTS_DIR = join(WORKSPACE_ROOT, '.zspark-attachments')
+
+function resolveWorkspaceRoot(start: string): string {
+  let dir = start
+  while (true) {
+    if (existsSync(join(dir, '.git')) && (existsSync(join(dir, 'codex-rs')) || existsSync(join(dir, '.codex')))) {
+      return dir
+    }
+    const parent = dirname(dir)
+    if (parent === dir) return start
+    dir = parent
+  }
+}
 
 function loadSettings(): { provider?: ProviderConfig } {
   try {
@@ -98,7 +114,7 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
     // Trust our own workspace so codex stops nagging about project-local
     // config every spawn. The path is whatever directory the binary
     // happens to look at; trust the parent so any subfolder counts.
-    '-c', `projects.${tomlString(homedir() + '/aml/zspark-work/zspark')}.trust_level=${tomlString('trusted')}`,
+    '-c', `projects.${tomlString(WORKSPACE_ROOT)}.trust_level=${tomlString('trusted')}`,
     // Drop the bundled MCP servers — zspark ships its own skills.
     '-c', `mcp_servers={}`
   ]
@@ -142,6 +158,7 @@ function spawnCodex() {
   logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(providerArgs)} ===\n`)
   const child = spawn(bin, [...providerArgs, 'app-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
+    cwd: WORKSPACE_ROOT,
     env: { ...process.env, ...providerEnv, RUST_LOG: process.env.RUST_LOG ?? 'codex_core::client=debug,codex_core::chat_completions=debug,info' }
   })
   codex = child
@@ -227,6 +244,55 @@ ipcMain.handle('settings:save', (_e, partial: { provider?: ProviderConfig }) => 
   codex?.kill()
   spawnCodex()
   return true
+})
+
+ipcMain.handle('attachments:pick', async () => {
+  const options: OpenDialogOptions = {
+    title: 'Attach files',
+    properties: ['openFile', 'multiSelections'],
+    filters: [
+      { name: 'Supported files', extensions: ['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif', 'pdf', 'txt', 'md', 'doc', 'docx', 'ppt', 'pptx', 'xls', 'xlsx', 'csv'] },
+      { name: 'All files', extensions: ['*'] }
+    ]
+  }
+  const picked = mainWindow
+    ? await dialog.showOpenDialog(mainWindow, options)
+    : await dialog.showOpenDialog(options)
+  if (picked.canceled || picked.filePaths.length === 0) {
+    return { attachments: [], errors: [] }
+  }
+  return importAttachmentFiles(picked.filePaths, WORKSPACE_ROOT)
+})
+
+ipcMain.handle('runtime:get', () => {
+  const settings = loadSettings()
+  return {
+    workspaceRoot: WORKSPACE_ROOT,
+    attachmentDir: ATTACHMENTS_DIR,
+    codexRunning: Boolean(codex && !codex.killed),
+    bridgePort,
+    provider: settings.provider
+      ? {
+          baseUrl: normalizeProviderBaseUrl(settings.provider.baseUrl),
+          model: settings.provider.model,
+          wireApi: settings.provider.wireApi
+        }
+      : undefined
+  }
+})
+
+ipcMain.handle('skills:localAvailability', () => discoverLocalSkills(WORKSPACE_ROOT))
+
+ipcMain.handle('path:open', async (_e, filePath: string) => {
+  if (!filePath) return { ok: false, error: 'Missing file path' }
+  const error = await shell.openPath(filePath)
+  return error ? { ok: false, error } : { ok: true }
+})
+
+ipcMain.handle('path:reveal', (_e, filePath: string) => {
+  if (!filePath) return { ok: false, error: 'Missing file path' }
+  shell.showItemInFolder(filePath)
+  return { ok: true }
 })
 
 app.whenReady().then(async () => {
