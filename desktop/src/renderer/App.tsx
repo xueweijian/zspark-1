@@ -5,6 +5,8 @@ declare global {
     zspark: {
       send: (line: string) => Promise<boolean>
       restart: () => Promise<boolean>
+      getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
+      saveSettings: (s: any) => Promise<boolean>
       onStdout: (cb: (s: string) => void) => void
       onStderr: (cb: (s: string) => void) => void
       onExit: (cb: (code: number | null) => void) => void
@@ -37,12 +39,57 @@ function send(method: string, params: any = {}) {
 type Kind = 'user' | 'assistant' | 'system' | 'warn' | 'error'
 interface Msg { id: string; kind: Kind; text: string }
 
+interface ProviderForm {
+  baseUrl: string
+  apiKey: string
+  model: string
+  wireApi: 'responses' | 'chat'
+}
+
+function SettingsModal({ onClose }: { onClose: () => void }) {
+  const [form, setForm] = useState<ProviderForm>({ baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', wireApi: 'responses' })
+  const [saving, setSaving] = useState(false)
+  useEffect(() => {
+    window.zspark.getSettings().then((s) => {
+      if (s.provider) setForm({ ...form, ...s.provider })
+    })
+  }, [])
+  const save = async () => {
+    setSaving(true)
+    await window.zspark.saveSettings({ provider: form })
+    setSaving(false)
+    onClose()
+  }
+  return (
+    <div className="modal-bg" onClick={onClose}>
+      <div className="modal" onClick={(e) => e.stopPropagation()}>
+        <h2>Model provider</h2>
+        <p className="modal-hint">Standard OpenAI-compatible endpoint. zspark talks to it via Responses API or Chat Completions.</p>
+        <label>Base URL<input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.openai.com/v1" /></label>
+        <label>API Key<input type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-..." /></label>
+        <label>Model<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} placeholder="gpt-4o-mini" /></label>
+        <label>Wire API
+          <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as 'responses' | 'chat' })}>
+            <option value="responses">Responses API (recommended)</option>
+            <option value="chat">Chat Completions</option>
+          </select>
+        </label>
+        <div className="modal-actions">
+          <button className="ghost" onClick={onClose}>Cancel</button>
+          <button onClick={save} disabled={saving || !form.apiKey || !form.baseUrl || !form.model}>{saving ? 'Saving…' : 'Save & restart codex'}</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function App() {
   const [msgs, setMsgs] = useState<Msg[]>([])
   const [input, setInput] = useState('')
   const [thread, setThread] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
   const [streaming, setStreaming] = useState(false)
+  const [showSettings, setShowSettings] = useState(false)
   // Track which agentMessage IDs we've already rendered (delta or completed)
   const seenAgent = useRef<Set<string>>(new Set())
   // turnId -> currently streaming agentMessage local id
@@ -183,7 +230,10 @@ export function App() {
       <main className="chat">
         <div className="chat-header">
           <span>Workspace</span>
-          <span className="badge">{ready ? (streaming ? 'streaming…' : 'ready') : 'connecting…'}</span>
+          <span style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
+            <button className="header-btn" onClick={() => setShowSettings(true)}>Provider</button>
+            <span className="badge">{ready ? (streaming ? 'streaming…' : 'ready') : 'connecting…'}</span>
+          </span>
         </div>
         <div className="chat-stream" ref={streamRef}>
           {msgs.length === 0 ? (
@@ -223,6 +273,7 @@ export function App() {
           <div className="row"><span className="k">Collab</span><span className="v">143.64.174.225:8787</span></div>
         </div>
       </aside>
+      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
     </div>
   )
 }
