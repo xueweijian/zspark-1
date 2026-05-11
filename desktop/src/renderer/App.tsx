@@ -83,7 +83,7 @@ export function App() {
         })
         append(`✓ initialize: ${init.error ? init.error.message : 'ok'}`)
         const t = await send('thread/start', {})
-        const tid = t.result?.threadId ?? t.result?.id ?? null
+        const tid = t.result?.thread?.id ?? null
         setThread(tid)
         append(`✓ thread started: ${tid}`)
         setReady(true)
@@ -103,7 +103,10 @@ export function App() {
     append(`> ${text}`)
     setInput('')
     try {
-      await send('turn/start', { threadId: thread, input: [{ type: 'text', text }] })
+      await send('turn/start', {
+        threadId: thread,
+        input: [{ type: 'text', text, textElements: [] }]
+      })
     } catch (e: any) {
       append(`✗ turn failed: ${e?.message ?? e}`)
     }
