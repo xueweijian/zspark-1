@@ -483,6 +483,22 @@ export function App() {
       setBlocks(replay)
     } catch (e: any) { toast('error', e?.message ?? String(e)) }
   }
+  const deleteThread = async (id: string, e?: React.MouseEvent) => {
+    e?.stopPropagation()
+    if (!ready) return
+    if (!confirm('Delete this chat? This cannot be undone.')) return
+    try {
+      // codex archives via thread/archive (soft-delete from list view)
+      await send('thread/archive', { threadId: id })
+      setThreads((p) => p.filter((t) => t.id !== id))
+      if (thread === id) {
+        setBlocks([])
+        setThread(null)
+        const t = await send('thread/start', {})
+        setThread(t.result?.thread?.id ?? null)
+      }
+    } catch (err: any) { toast('error', err?.message ?? String(err)) }
+  }
   const openPanel = async (p: Panel) => {
     setPanel(p)
     if (!ready) return
@@ -529,9 +545,10 @@ export function App() {
         <div className="nav-item" onClick={() => openPanel('automations')}><IconAutomations /><span>Automations</span></div>
         <h3>Recent</h3>
         {threads.slice(0, 8).map((t) => (
-          <div key={t.id} className={`nav-item${thread === t.id ? ' active' : ''}`} onClick={() => switchThread(t.id)}>
+          <div key={t.id} className={`nav-item nav-item-thread${thread === t.id ? ' active' : ''}`} onClick={() => switchThread(t.id)}>
             <IconProject />
-            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{t.preview?.trim() || t.name || t.id.slice(0, 8)}</span>
+            <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{t.preview?.trim() || t.name || t.id.slice(0, 8)}</span>
+            <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete chat" title="Delete chat"><IconClose /></button>
           </div>
         ))}
         {threads.length === 0 && <div className="nav-item" onClick={() => openPanel('history')} style={{ color: '#a1a1aa' }}><IconProject /><span>No chats yet</span></div>}
@@ -644,9 +661,12 @@ export function App() {
           <input className="drawer-search" placeholder="Filter by preview…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
           <div className="drawer-list">
             {threads.filter((t) => !searchQuery || (t.preview ?? '').toLowerCase().includes(searchQuery.toLowerCase())).map((t) => (
-              <div key={t.id} className="drawer-row" onClick={() => switchThread(t.id)}>
-                <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
-                <div className="drawer-row-d">{t.id.slice(0, 8)} · {t.updatedAt ? new Date(t.updatedAt * 1000).toLocaleString() : ''}</div>
+              <div key={t.id} className="drawer-row">
+                <div style={{ flex: 1, minWidth: 0 }} onClick={() => switchThread(t.id)}>
+                  <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
+                  <div className="drawer-row-d">{t.id.slice(0, 8)} · {t.updatedAt ? new Date(t.updatedAt * 1000).toLocaleString() : ''}</div>
+                </div>
+                <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete"><IconClose /></button>
               </div>
             ))}
             {threads.length === 0 && <div className="drawer-empty">No threads yet. Start a new chat to get going.</div>}
@@ -687,9 +707,12 @@ export function App() {
         <Drawer title="Chat history" onClose={() => setPanel(null)}>
           <div className="drawer-list">
             {threads.map((t) => (
-              <div key={t.id} className="drawer-row" onClick={() => switchThread(t.id)}>
-                <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
-                <div className="drawer-row-d">{t.id.slice(0, 8)}</div>
+              <div key={t.id} className="drawer-row">
+                <div style={{ flex: 1, minWidth: 0 }} onClick={() => switchThread(t.id)}>
+                  <div className="drawer-row-t">{t.preview?.trim() || t.name || '(no preview)'}</div>
+                  <div className="drawer-row-d">{t.id.slice(0, 8)}</div>
+                </div>
+                <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete"><IconClose /></button>
               </div>
             ))}
             {threads.length === 0 && <div className="drawer-empty">No history.</div>}
