@@ -37,6 +37,8 @@ const starters = [
   { t: 'Automate a workflow', d: 'Schedule a recurring task from natural language.' }
 ]
 
+const FALLBACK_MODEL_METADATA_WARNING = 'Defaulting to fallback metadata'
+
 let nextId = 1
 const newId = () => nextId++
 interface Pending { resolve: (msg: any) => void; reject: (err: any) => void }
@@ -47,6 +49,16 @@ function send(method: string, params: any = {}) {
     const id = newId()
     pending.set(id, { resolve, reject })
     window.zspark.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
+      .then((ok) => {
+        if (!ok) {
+          pending.delete(id)
+          reject(new Error('Codex process is not running'))
+        }
+      })
+      .catch((err) => {
+        pending.delete(id)
+        reject(err)
+      })
   })
 }
 
@@ -247,6 +259,7 @@ export function App() {
           // codex Responses API shape). Surface it instead of swallowing.
           if (method === 'warning') {
             const wm = params?.message ?? ''
+            if (wm.includes(FALLBACK_MODEL_METADATA_WARNING)) return
             if (wm) toast('warn', wm)
             return
           }

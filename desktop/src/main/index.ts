@@ -18,6 +18,8 @@ interface ProviderConfig {
 let bridgePort: number | null = null
 let bridgeClose: (() => void) | null = null
 
+const PROVIDER_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/models']
+
 const SETTINGS_PATH = join(app.getPath('userData'), 'zspark-settings.json')
 
 function loadSettings(): { provider?: ProviderConfig } {
@@ -53,6 +55,23 @@ function resolveCodexBinary(): string {
   return join(process.resourcesPath, 'bin', process.platform === 'win32' ? 'codex.exe' : 'codex')
 }
 
+function normalizeProviderBaseUrl(rawBaseUrl: string): string {
+  try {
+    const url = new URL(rawBaseUrl.trim())
+    let path = url.pathname.replace(/\/+$/, '')
+    for (const suffix of PROVIDER_ENDPOINT_SUFFIXES) {
+      if (path.endsWith(suffix)) {
+        path = path.slice(0, -suffix.length).replace(/\/+$/, '')
+        break
+      }
+    }
+    url.pathname = path || '/'
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    return rawBaseUrl.trim().replace(/\/+$/, '')
+  }
+}
+
 /**
  * Build `-c key=value` overrides that point codex at the user-configured
  * OpenAI-compatible endpoint, without touching ~/.codex/config.toml.
@@ -61,10 +80,12 @@ function resolveCodexBinary(): string {
  *   model = "<user model>"
  *   model_providers.zspark.name = "zspark"
  *   model_providers.zspark.base_url = "<user url>"
- *   model_providers.zspark.wire_api = "responses" | "chat"
+ *   model_providers.zspark.wire_api = "responses"
  *   model_providers.zspark.env_key = "ZSPARK_API_KEY"
  *
  * The api key itself is passed via env var, never on argv.
+ * Chat-completions providers are exposed to codex through the local
+ * Chat→Responses bridge, so codex still talks Responses on its side.
  *
  * We also disable the bundled computer-use / playwright MCP servers and
  * trust the zspark workspace so the chat doesn't get spammed by config
@@ -85,7 +106,7 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
 
   // Decide whether to point codex at the upstream directly (Responses
   // API) or at our in-process Chat→Responses bridge.
-  let effectiveBase = p.baseUrl
+  let effectiveBase = normalizeProviderBaseUrl(p.baseUrl)
   let effectiveKey = p.apiKey
   if (p.wireApi === 'chat') {
     setUpstream({ baseUrl: p.baseUrl, apiKey: p.apiKey })
@@ -119,24 +140,30 @@ function spawnCodex() {
   mkdirSync(app.getPath('userData'), { recursive: true })
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' })
   logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(providerArgs)} ===\n`)
-  codex = spawn(bin, [...providerArgs, 'app-server'], {
+  const child = spawn(bin, [...providerArgs, 'app-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, ...providerEnv, RUST_LOG: process.env.RUST_LOG ?? 'codex_core::client=debug,codex_core::chat_completions=debug,info' }
   })
-  codex.stdout.on('data', (b) => {
+  codex = child
+  child.stdout.on('data', (b) => {
+    if (codex !== child) return
     const s = b.toString()
     logStream.write(`[stdout] ${s}`)
     mainWindow?.webContents.send('codex:stdout', s)
   })
-  codex.stderr.on('data', (b) => {
+  child.stderr.on('data', (b) => {
+    if (codex !== child) return
     const s = b.toString()
     logStream.write(`[stderr] ${s}`)
     mainWindow?.webContents.send('codex:stderr', s)
   })
-  codex.on('exit', (code) => {
+  child.on('exit', (code) => {
     logStream.write(`[exit] ${code}\n`)
     logStream.end()
-    mainWindow?.webContents.send('codex:exit', code)
+    if (codex === child) {
+      codex = null
+      mainWindow?.webContents.send('codex:exit', code)
+    }
   })
   mainWindow?.webContents.send('codex:spawned')
 }
@@ -166,7 +193,7 @@ function createWindow() {
 }
 
 ipcMain.handle('codex:send', (_e, line: string) => {
-  if (!codex) return false
+  if (!codex || codex.killed || !codex.stdin.writable) return false
   codex.stdin.write(line.endsWith('\n') ? line : line + '\n')
   return true
 })
