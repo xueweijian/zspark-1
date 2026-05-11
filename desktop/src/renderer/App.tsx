@@ -484,6 +484,7 @@ export function App() {
       } catch {}
     }
   }
+  const submit = async (override?: string) => {
     const text = (override ?? input).trim()
     if (!text || !ready || streaming) return
     if (!override) setInput('')
