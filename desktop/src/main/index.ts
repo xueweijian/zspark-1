@@ -88,6 +88,8 @@ function spawnCodex() {
   codex.stdout.on('data', (b) => mainWindow?.webContents.send('codex:stdout', b.toString()))
   codex.stderr.on('data', (b) => mainWindow?.webContents.send('codex:stderr', b.toString()))
   codex.on('exit', (code) => mainWindow?.webContents.send('codex:exit', code))
+  // Tell renderer a fresh process is up so it re-runs handshake.
+  mainWindow?.webContents.send('codex:spawned')
 }
 
 function createWindow() {

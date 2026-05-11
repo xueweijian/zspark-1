@@ -7,7 +7,8 @@ const api = {
   saveSettings: (s: any) => ipcRenderer.invoke('settings:save', s),
   onStdout: (cb: (s: string) => void) => ipcRenderer.on('codex:stdout', (_e, s) => cb(s)),
   onStderr: (cb: (s: string) => void) => ipcRenderer.on('codex:stderr', (_e, s) => cb(s)),
-  onExit: (cb: (code: number | null) => void) => ipcRenderer.on('codex:exit', (_e, c) => cb(c))
+  onExit: (cb: (code: number | null) => void) => ipcRenderer.on('codex:exit', (_e, c) => cb(c)),
+  onSpawned: (cb: () => void) => ipcRenderer.on('codex:spawned', () => cb())
 }
 
 contextBridge.exposeInMainWorld('zspark', api)

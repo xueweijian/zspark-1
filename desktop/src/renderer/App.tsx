@@ -10,6 +10,7 @@ declare global {
       onStdout: (cb: (s: string) => void) => void
       onStderr: (cb: (s: string) => void) => void
       onExit: (cb: (code: number | null) => void) => void
+      onSpawned: (cb: () => void) => void
     }
   }
 }
@@ -181,19 +182,26 @@ export function App() {
       }
     })
     window.zspark.onStderr((s) => add({ id: `stderr-${Math.random()}`, kind: 'error', text: s.trim() }))
-    window.zspark.onExit((c) => add({ id: 'exit', kind: 'error', text: `codex exited: ${c}` }))
+    window.zspark.onExit((c) => {
+      setReady(false)
+      setStreaming(false)
+      setThread(null)
+      add({ id: `exit-${Date.now()}`, kind: 'error', text: `codex exited: ${c}` })
+    })
 
-    ;(async () => {
+    const handshake = async () => {
       try {
         const init = await send('initialize', { clientInfo: { name: 'zspark-desktop', version: '0.0.1' } })
-        if (init.error) { add({ id: 'init', kind: 'error', text: init.error.message }); return }
+        if (init.error) { add({ id: `init-${Date.now()}`, kind: 'error', text: init.error.message }); return }
         const t = await send('thread/start', {})
         const tid = t.result?.thread?.id ?? null
         setThread(tid); setReady(true)
       } catch (e: any) {
-        add({ id: 'init', kind: 'error', text: e?.message ?? String(e) })
+        add({ id: `init-${Date.now()}`, kind: 'error', text: e?.message ?? String(e) })
       }
-    })()
+    }
+    window.zspark.onSpawned(() => { handshake() })
+    handshake()
   }, [])
 
   useEffect(() => {
