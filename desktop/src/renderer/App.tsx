@@ -1,7 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react'
 import {
   IconNewChat, IconSearch, IconSkills, IconPlugins, IconAutomations,
-  IconProject, IconSend, IconClose, IconSettings
+  IconProject, IconSend, IconClose, IconSettings, IconChevron,
+  IconBrain, IconTerminal, IconFile, IconTool, IconGlobe
 } from './icons'
 
 declare global {
@@ -36,7 +37,6 @@ const starters = [
 
 let nextId = 1
 const newId = () => nextId++
-
 interface Pending { resolve: (msg: any) => void; reject: (err: any) => void }
 const pending = new Map<number, Pending>()
 
@@ -48,43 +48,65 @@ function send(method: string, params: any = {}) {
   })
 }
 
-type Kind = 'user' | 'assistant'
-interface Msg { id: string; kind: Kind; text: string }
+type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'web'
+interface Activity {
+  id: string
+  kind: ActivityKind
+  title: string
+  detail?: string
+  status: 'running' | 'done' | 'failed'
+  startedAt: number
+  endedAt?: number
+}
+
+type Block =
+  | { type: 'user'; id: string; text: string }
+  | { type: 'agent'; id: string; text: string }
+  | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
 
 type ToastKind = 'info' | 'warn' | 'error'
 interface Toast { id: string; kind: ToastKind; text: string }
 
-interface ProviderForm {
-  baseUrl: string
-  apiKey: string
-  model: string
-  wireApi: 'responses' | 'chat'
+interface ProviderForm { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
+
+function fmtDuration(ms: number) {
+  const s = Math.round(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  return `${m}m ${s % 60}s`
+}
+
+function actIcon(k: ActivityKind) {
+  switch (k) {
+    case 'reasoning': return <IconBrain />
+    case 'command': return <IconTerminal />
+    case 'file': return <IconFile />
+    case 'tool': return <IconTool />
+    case 'web': return <IconGlobe />
+  }
 }
 
 function SettingsModal({ onClose }: { onClose: () => void }) {
   const [form, setForm] = useState<ProviderForm>({ baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', wireApi: 'responses' })
   const [saving, setSaving] = useState(false)
   useEffect(() => {
-    window.zspark.getSettings().then((s) => {
-      if (s.provider) setForm((prev) => ({ ...prev, ...s.provider }))
-    })
+    window.zspark.getSettings().then((s) => { if (s.provider) setForm((p) => ({ ...p, ...s.provider })) })
   }, [])
   const save = async () => {
     setSaving(true)
     await window.zspark.saveSettings({ provider: form })
-    setSaving(false)
-    onClose()
+    setSaving(false); onClose()
   }
   return (
     <div className="modal-bg" onClick={onClose}>
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <h2>Model provider</h2>
-        <p className="modal-hint">Standard OpenAI-compatible endpoint. zspark talks to it via Responses API or Chat Completions.</p>
-        <label>Base URL<input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} placeholder="https://api.openai.com/v1" /></label>
+        <p className="modal-hint">Standard OpenAI-compatible endpoint. Talks via Responses API or Chat Completions.</p>
+        <label>Base URL<input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></label>
         <label>API Key<input type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-..." /></label>
-        <label>Model<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} placeholder="gpt-4o-mini" /></label>
+        <label>Model<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></label>
         <label>Wire API
-          <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as 'responses' | 'chat' })}>
+          <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as any })}>
             <option value="responses">Responses API (recommended)</option>
             <option value="chat">Chat Completions</option>
           </select>
@@ -99,21 +121,23 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
 }
 
 export function App() {
-  const [msgs, setMsgs] = useState<Msg[]>([])
+  const [blocks, setBlocks] = useState<Block[]>([])
   const [toasts, setToasts] = useState<Toast[]>([])
   const [input, setInput] = useState('')
   const [thread, setThread] = useState<string | null>(null)
   const [ready, setReady] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
-  const turnAgentMsg = useRef<Map<string, string>>(new Map())
+  // Track current turn block id for incoming events
+  const currentTurn = useRef<{ turnId: string; blockId: string } | null>(null)
+  // Map agent itemId (delta or completed) -> agent block id, scoped per turn
+  const agentForTurn = useRef<Map<string, string>>(new Map())
+  // Map item id -> activity id
+  const itemActivity = useRef<Map<string, string>>(new Map())
   const buf = useRef('')
   const streamRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
 
-  const add = (m: Msg) => setMsgs((p) => [...p, m])
-  const appendTo = (id: string, delta: string) =>
-    setMsgs((p) => p.map((m) => (m.id === id ? { ...m, text: m.text + delta } : m)))
   const toast = (kind: ToastKind, text: string) => {
     const id = `t-${Date.now()}-${Math.random()}`
     setToasts((p) => [...p, { id, kind, text }])
@@ -121,49 +145,159 @@ export function App() {
   }
   const dismiss = (id: string) => setToasts((p) => p.filter((t) => t.id !== id))
 
+  const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {
+    setBlocks((bs) => bs.map((b) => (b.type === 'turn' && b.turnId === turnId ? fn(b) : b)))
+  }
+  const updateActivity = (turnId: string, actId: string, patch: Partial<Activity>) => {
+    updateTurn(turnId, (t) => ({ ...t, activities: t.activities.map((a) => (a.id === actId ? { ...a, ...patch } : a)) }))
+  }
+  const ensureActivity = (turnId: string, itemId: string, init: Omit<Activity, 'id' | 'status' | 'startedAt'>) => {
+    let actId = itemActivity.current.get(itemId)
+    if (actId) return actId
+    actId = `a-${itemId}`
+    itemActivity.current.set(itemId, actId)
+    updateTurn(turnId, (t) => ({ ...t, activities: [...t.activities, { id: actId!, status: 'running', startedAt: Date.now(), ...init }] }))
+    return actId
+  }
+  const appendActivityDetail = (turnId: string, itemId: string, delta: string) => {
+    const actId = itemActivity.current.get(itemId)
+    if (!actId) return
+    updateTurn(turnId, (t) => ({ ...t, activities: t.activities.map((a) => (a.id === actId ? { ...a, detail: (a.detail ?? '') + delta } : a)) }))
+  }
+  const appendAgentText = (turnId: string, blockId: string, delta: string) => {
+    setBlocks((bs) => bs.map((b) => (b.type === 'agent' && b.id === blockId ? { ...b, text: b.text + delta } : b)))
+    // Also link the turn block to this agent block as its final message.
+    updateTurn(turnId, (t) => (t.finalMessageId ? t : { ...t, finalMessageId: blockId }))
+  }
+
   useEffect(() => {
     function handle(method: string, params: any) {
       switch (method) {
+        case 'turn/started': {
+          setStreaming(true)
+          const turnId = params.turnId as string
+          const blockId = `turn-${turnId}`
+          currentTurn.current = { turnId, blockId }
+          agentForTurn.current.clear()
+          setBlocks((bs) => [...bs, { type: 'turn', id: blockId, turnId, activities: [], collapsed: false, startedAt: Date.now() }])
+          return
+        }
+        case 'turn/completed': {
+          setStreaming(false)
+          const turnId = params.turnId as string
+          updateTurn(turnId, (t) => ({ ...t, endedAt: Date.now(), collapsed: true }))
+          currentTurn.current = null
+          return
+        }
         case 'item/agentMessage/delta': {
           const turnId = params.turnId as string
-          let localId = turnAgentMsg.current.get(turnId)
-          if (!localId) {
-            localId = `agent-${turnId}`
-            turnAgentMsg.current.set(turnId, localId)
-            add({ id: localId, kind: 'assistant', text: '' })
+          const cur = currentTurn.current
+          if (!cur || cur.turnId !== turnId) return
+          let agentBlockId = agentForTurn.current.get(turnId)
+          if (!agentBlockId) {
+            agentBlockId = `agent-${turnId}`
+            agentForTurn.current.set(turnId, agentBlockId)
+            setBlocks((bs) => [...bs, { type: 'agent', id: agentBlockId!, text: '' }])
           }
-          appendTo(localId, params.delta ?? '')
+          appendAgentText(turnId, agentBlockId, params.delta ?? '')
+          return
+        }
+        case 'item/reasoning/summaryTextDelta':
+        case 'item/reasoning/textDelta': {
+          const turnId = params.turnId as string
+          if (!currentTurn.current || currentTurn.current.turnId !== turnId) return
+          const itemId = params.itemId as string
+          ensureActivity(turnId, itemId, { kind: 'reasoning', title: 'Thinking' })
+          appendActivityDetail(turnId, itemId, params.delta ?? '')
           return
         }
         case 'item/started':
         case 'item/completed': {
           const item = params?.item
           if (!item) return
-          if (item.type === 'userMessage' && method === 'item/started') {
-            const txt = (item.content ?? []).map((c: any) => c.text ?? '').join('')
-            add({ id: `user-${item.id}`, kind: 'user', text: txt })
+          const turnId = params.turnId as string
+          if (item.type === 'userMessage') {
+            if (method === 'item/started') {
+              const txt = (item.content ?? []).map((c: any) => c.text ?? '').join('')
+              setBlocks((bs) => [...bs, { type: 'user', id: `user-${item.id}`, text: txt }])
+            }
             return
           }
           if (item.type === 'agentMessage' && method === 'item/completed') {
-            const turnId = params.turnId as string
-            if (turnAgentMsg.current.has(turnId)) return
-            const txt = Array.isArray(item.content)
-              ? item.content.map((c: any) => c.text ?? '').join('')
-              : (item.text ?? '')
-            if (txt) add({ id: `agent-${item.id}`, kind: 'assistant', text: txt })
+            // If we already streamed via deltas, ignore (delta path owns the text).
+            if (agentForTurn.current.has(turnId)) return
+            const txt = item.text ?? ''
+            if (txt) {
+              const blockId = `agent-${turnId}-final`
+              agentForTurn.current.set(turnId, blockId)
+              setBlocks((bs) => [...bs, { type: 'agent', id: blockId, text: txt }])
+              updateTurn(turnId, (t) => ({ ...t, finalMessageId: blockId }))
+            }
+            return
+          }
+          if (item.type === 'reasoning') {
+            // Use existing activity (created by deltas) — finalize it on completion
+            if (method === 'item/completed') {
+              const itemId = item.id as string
+              if (itemActivity.current.has(itemId)) {
+                updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title: 'Thought' })
+              }
+            }
+            return
+          }
+          if (item.type === 'commandExecution') {
+            const itemId = item.id as string
+            const command = item.command ?? ''
+            const short = command.length > 80 ? command.slice(0, 77) + '…' : command
+            if (method === 'item/started') {
+              ensureActivity(turnId, itemId, { kind: 'command', title: short })
+            } else {
+              const status: Activity['status'] =
+                item.status === 'completed' ? 'done' :
+                item.status === 'failed' ? 'failed' : 'done'
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'command', title: short })
+              updateActivity(turnId, itemActivity.current.get(itemId)!, {
+                status, endedAt: Date.now(),
+                detail: item.aggregated_output ?? item.aggregatedOutput ?? undefined,
+                title: short
+              })
+            }
+            return
+          }
+          if (item.type === 'fileChange') {
+            const itemId = item.id as string
+            const changes = item.changes ?? []
+            const title = `${changes.length} file${changes.length === 1 ? '' : 's'} changed`
+            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'file', title })
+            else {
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'file', title })
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title })
+            }
+            return
+          }
+          if (item.type === 'mcpToolCall' || item.type === 'dynamicToolCall') {
+            const itemId = item.id as string
+            const title = item.tool ? `${item.tool}` : 'tool call'
+            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'tool', title })
+            else {
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'tool', title })
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: item.status === 'failed' ? 'failed' : 'done', endedAt: Date.now() })
+            }
+            return
+          }
+          if (item.type === 'webSearch') {
+            const itemId = item.id as string
+            const title = item.query ? `Searched “${item.query}”` : 'Web search'
+            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'web', title })
+            else {
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'web', title })
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now() })
+            }
             return
           }
           return
         }
-        case 'turn/started':
-          setStreaming(true)
-          return
-        case 'turn/completed':
-          setStreaming(false)
-          for (const k of [...turnAgentMsg.current.keys()]) turnAgentMsg.current.delete(k)
-          return
-        default:
-          return
+        default: return
       }
     }
 
@@ -179,44 +313,33 @@ export function App() {
           if (typeof msg.id === 'number' && pending.has(msg.id)) {
             pending.get(msg.id)!.resolve(msg)
             pending.delete(msg.id)
-            if (msg.error && msg.error.message !== 'Not initialized') {
-              toast('error', msg.error.message)
-            }
+            if (msg.error && msg.error.message !== 'Not initialized') toast('error', msg.error.message)
           } else if (msg.method) {
             handle(msg.method, msg.params)
           }
         } catch { /* ignore */ }
       }
     })
-    window.zspark.onStderr(() => { /* swallow */ })
-    window.zspark.onExit(() => {
-      setReady(false); setStreaming(false); setThread(null)
-    })
+    window.zspark.onStderr(() => {})
+    window.zspark.onExit(() => { setReady(false); setStreaming(false); setThread(null) })
 
     const handshake = async () => {
       try {
         const init = await send('initialize', { clientInfo: { name: 'zspark-desktop', version: '0.0.1' } })
-        if (init.error) { toast('error', `Init: ${init.error.message}`); return }
+        if (init.error) { toast('error', init.error.message); return }
         const t = await send('thread/start', {})
         const tid = t.result?.thread?.id ?? null
         setThread(tid); setReady(true)
-      } catch (e: any) {
-        toast('error', e?.message ?? String(e))
-      }
+      } catch (e: any) { toast('error', e?.message ?? String(e)) }
     }
     window.zspark.onSpawned(() => { handshake() })
     handshake()
   }, [])
 
+  useEffect(() => { streamRef.current?.scrollTo({ top: streamRef.current.scrollHeight, behavior: 'smooth' }) }, [blocks])
   useEffect(() => {
-    streamRef.current?.scrollTo({ top: streamRef.current.scrollHeight, behavior: 'smooth' })
-  }, [msgs])
-
-  useEffect(() => {
-    const ta = taRef.current
-    if (!ta) return
-    ta.style.height = 'auto'
-    ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
+    const ta = taRef.current; if (!ta) return
+    ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
   }, [input])
 
   const submit = async (override?: string) => {
@@ -226,14 +349,13 @@ export function App() {
     try {
       const res = await send('turn/start', { threadId: thread, input: [{ type: 'text', text, textElements: [] }] })
       if (res.error) toast('error', res.error.message)
-    } catch (e: any) {
-      toast('error', e?.message ?? String(e))
-    }
+    } catch (e: any) { toast('error', e?.message ?? String(e)) }
   }
-
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit() }
   }
+  const toggleTurn = (turnId: string) =>
+    updateTurn(turnId, (t) => ({ ...t, collapsed: !t.collapsed }))
 
   const statusClass = ready ? (streaming ? 'streaming' : 'live') : 'off'
   const statusText = ready ? (streaming ? 'streaming' : 'ready') : 'connecting'
@@ -243,9 +365,7 @@ export function App() {
       <aside className="sidebar">
         <div className="brand"><div className="brand-mark">z</div>zspark</div>
         {sidebarItems.map(({ label, Icon }) => (
-          <div className={`nav-item${label === 'New chat' ? ' active' : ''}`} key={label}>
-            <Icon /><span>{label}</span>
-          </div>
+          <div className={`nav-item${label === 'New chat' ? ' active' : ''}`} key={label}><Icon /><span>{label}</span></div>
         ))}
         <h3>Projects</h3>
         <div className="nav-item active"><IconProject /><span>zspark</span></div>
@@ -255,18 +375,16 @@ export function App() {
         <div className="chat-header">
           <div className="left">Workspace</div>
           <div className="right">
-            <button className="header-btn" onClick={() => setShowSettings(true)}>
-              <IconSettings /> Provider
-            </button>
+            <button className="header-btn" onClick={() => setShowSettings(true)}><IconSettings /> Provider</button>
             <span className={`status-dot ${statusClass}`}>{statusText}</span>
           </div>
         </div>
 
         <div className="chat-stream" ref={streamRef}>
-          {msgs.length === 0 ? (
+          {blocks.length === 0 ? (
             <div className="empty">
               <div className="h">What should we build?</div>
-              <div className="sub">Draft, review, automate. zspark works as your daily co-worker — connected to your tools, governed by your policies.</div>
+              <div className="sub">Draft, review, automate. zspark works as your daily co-worker.</div>
               <div className="grid">
                 {starters.map((s) => (
                   <div className="card" key={s.t} onClick={() => submit(s.d)}>
@@ -277,24 +395,57 @@ export function App() {
               </div>
             </div>
           ) : (
-            msgs.map((m) => <div key={m.id} className={`bubble ${m.kind}`}>{m.text}</div>)
+            blocks.map((b) => {
+              if (b.type === 'user') return <div key={b.id} className="bubble user">{b.text}</div>
+              if (b.type === 'agent') return <div key={b.id} className="bubble assistant">{b.text}</div>
+              const dur = (b.endedAt ?? Date.now()) - b.startedAt
+              const running = !b.endedAt
+              return (
+                <div key={b.id} className={`activity-card${b.collapsed ? ' collapsed' : ''}${running ? ' running' : ''}`}>
+                  <div className="activity-head" onClick={() => toggleTurn(b.turnId)}>
+                    <div className="head-left">
+                      <span className={`spinner${running ? ' spin' : ''}`} />
+                      <span className="head-title">{running ? 'Working…' : `Worked for ${fmtDuration(dur)}`}</span>
+                      {!running && <span className="head-meta">{b.activities.length} step{b.activities.length === 1 ? '' : 's'}</span>}
+                    </div>
+                    <button className="chev" aria-label="Toggle"><IconChevron /></button>
+                  </div>
+                  {!b.collapsed && (
+                    <div className="activity-body">
+                      {b.activities.length === 0 ? (
+                        <div className="empty-act">Preparing…</div>
+                      ) : b.activities.map((a) => (
+                        <div key={a.id} className={`act act-${a.kind} act-${a.status}`}>
+                          <div className="act-icon">{actIcon(a.kind)}</div>
+                          <div className="act-meat">
+                            <div className="act-title">{a.title}</div>
+                            {a.detail && a.kind === 'reasoning' && (
+                              <div className="act-detail mono">{a.detail.slice(-600)}</div>
+                            )}
+                            {a.detail && a.kind === 'command' && (
+                              <pre className="act-detail mono">{a.detail.slice(-800)}</pre>
+                            )}
+                          </div>
+                          <div className="act-status">
+                            {a.status === 'running' ? '· · ·' :
+                             a.status === 'failed' ? 'failed' :
+                             a.endedAt ? fmtDuration(a.endedAt - a.startedAt) : ''}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )
+            })
           )}
         </div>
 
         <div className="chat-input-wrap">
           <div className="chat-input">
-            <textarea
-              ref={taRef}
-              rows={1}
-              placeholder={ready ? 'Ask zspark anything…' : 'Connecting…'}
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={onKey}
-              disabled={!ready}
-            />
-            <button className="send-btn" onClick={() => submit()} disabled={!ready || streaming || !input.trim()} aria-label="Send">
-              <IconSend />
-            </button>
+            <textarea ref={taRef} rows={1} placeholder={ready ? 'Ask zspark anything…' : 'Connecting…'}
+              value={input} onChange={(e) => setInput(e.target.value)} onKeyDown={onKey} disabled={!ready} />
+            <button className="send-btn" onClick={() => submit()} disabled={!ready || streaming || !input.trim()} aria-label="Send"><IconSend /></button>
           </div>
         </div>
       </main>

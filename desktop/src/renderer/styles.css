@@ -41,6 +41,40 @@ input,textarea,select{font:inherit}
 .bubble.user{align-self:flex-end;background:#18181b;color:#fafafa;padding:10px 15px;border-radius:14px 14px 4px 14px;max-width:78%;font-size:14px}
 .bubble.assistant{align-self:flex-start;color:#27272a;width:100%}
 
+/* Activity card (per turn) */
+.activity-card{align-self:stretch;border:1px solid #f4f4f5;border-radius:14px;background:#fafafa;overflow:hidden;transition:border-color .12s}
+.activity-card.running{border-color:#e0e7ff;background:#fafbff}
+.activity-card.collapsed{background:#fff}
+.activity-head{display:flex;justify-content:space-between;align-items:center;padding:9px 14px;cursor:pointer;user-select:none;transition:background .1s}
+.activity-head:hover{background:rgba(0,0,0,.02)}
+.head-left{display:flex;align-items:center;gap:9px;font-size:13px;color:#3f3f46}
+.head-title{font-weight:500;color:#18181b}
+.head-meta{font-size:11.5px;color:#a1a1aa;margin-left:4px}
+.spinner{width:10px;height:10px;border-radius:50%;background:#a1a1aa;flex-shrink:0}
+.spinner.spin{background:transparent;border:2px solid #c7d2fe;border-top-color:#4f46e5;animation:spin 0.85s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.chev{padding:2px;color:#a1a1aa;display:flex;align-items:center;transition:transform .15s}
+.activity-card.collapsed .chev{transform:rotate(-90deg)}
+.activity-body{padding:0 12px 10px;display:flex;flex-direction:column;gap:2px;border-top:1px solid #f4f4f5}
+.empty-act{padding:10px;color:#a1a1aa;font-size:12.5px}
+.act{display:grid;grid-template-columns:24px 1fr auto;gap:10px;padding:8px 6px;align-items:flex-start;border-radius:8px;font-size:13px;color:#3f3f46}
+.act:hover{background:rgba(0,0,0,.02)}
+.act-icon{display:flex;align-items:center;justify-content:center;width:24px;height:24px;border-radius:6px;background:#fff;border:1px solid #e4e4e7;color:#71717a;flex-shrink:0;margin-top:1px}
+.act-reasoning .act-icon{color:#7c3aed;background:#f5f3ff;border-color:#ede9fe}
+.act-command .act-icon{color:#0891b2;background:#ecfeff;border-color:#cffafe}
+.act-file .act-icon{color:#16a34a;background:#f0fdf4;border-color:#dcfce7}
+.act-tool .act-icon{color:#d97706;background:#fffbeb;border-color:#fef3c7}
+.act-web .act-icon{color:#2563eb;background:#eff6ff;border-color:#dbeafe}
+.act-failed .act-icon{color:#b91c1c;background:#fef2f2;border-color:#fecaca}
+.act-meat{min-width:0}
+.act-title{color:#18181b;font-weight:500;font-size:13px;line-height:1.45;word-break:break-word}
+.act-detail{margin-top:4px;font-size:12px;color:#71717a;line-height:1.5;max-height:120px;overflow:hidden;white-space:pre-wrap;word-break:break-word}
+.act-detail.mono{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11.5px;background:#fafafa;padding:6px 8px;border-radius:5px;border:1px solid #f4f4f5}
+.act-status{font-size:11.5px;color:#a1a1aa;font-variant-numeric:tabular-nums;padding-top:2px;flex-shrink:0}
+.act-failed .act-status{color:#b91c1c}
+
+/* Toast notifications */
+
 .empty{display:flex;flex:1;flex-direction:column;align-items:center;justify-content:center;gap:8px;padding-bottom:40px}
 .empty .h{font-size:26px;color:#18181b;font-weight:600;letter-spacing:-.02em}
 .empty .sub{font-size:14px;color:#71717a;max-width:360px;text-align:center;line-height:1.6}
