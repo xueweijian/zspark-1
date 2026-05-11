@@ -3,16 +3,20 @@ import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { join } from 'node:path'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream } from 'node:fs'
 import { homedir } from 'node:os'
+import { startBridge, setUpstream } from './bridge'
 
 let mainWindow: BrowserWindow | null = null
 let codex: ChildProcessWithoutNullStreams | null = null
 
 interface ProviderConfig {
-  baseUrl: string       // e.g. https://api.openai.com/v1
+  baseUrl: string       // upstream endpoint (chat or responses)
   apiKey: string        // sk-...
   model: string         // e.g. gpt-4o-mini, gpt-5
   wireApi: 'responses' | 'chat'
 }
+
+let bridgePort: number | null = null
+let bridgeClose: (() => void) | null = null
 
 const SETTINGS_PATH = join(app.getPath('userData'), 'zspark-settings.json')
 
@@ -78,22 +82,30 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
     '-c', `mcp_servers={}`
   ]
   if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: baseArgs, env: {} }
-  // Upstream codex-rs has dropped chat-completions support. Force responses
-  // even if the saved settings still say "chat" so we never spawn an
-  // engine that fails to boot. The Wire API selector in the UI now reflects
-  // this restriction.
-  const wireApi: 'responses' = 'responses'
+
+  // Decide whether to point codex at the upstream directly (Responses
+  // API) or at our in-process Chat→Responses bridge.
+  let effectiveBase = p.baseUrl
+  let effectiveKey = p.apiKey
+  if (p.wireApi === 'chat') {
+    setUpstream({ baseUrl: p.baseUrl, apiKey: p.apiKey })
+    effectiveBase = `http://127.0.0.1:${bridgePort ?? 0}/v1`
+    effectiveKey = 'zspark-bridge'
+  } else {
+    setUpstream(null)
+  }
+
   const args = [
     ...baseArgs,
     '-c', `model=${tomlString(p.model)}`,
     '-c', `model_provider=${tomlString('zspark')}`,
     '-c', `model_providers.zspark.name=${tomlString('zspark')}`,
-    '-c', `model_providers.zspark.base_url=${tomlString(p.baseUrl)}`,
-    '-c', `model_providers.zspark.wire_api=${tomlString(wireApi)}`,
+    '-c', `model_providers.zspark.base_url=${tomlString(effectiveBase)}`,
+    '-c', `model_providers.zspark.wire_api=${tomlString('responses')}`,
     '-c', `model_providers.zspark.env_key=${tomlString('ZSPARK_API_KEY')}`,
     '-c', `model_providers.zspark.requires_openai_auth=false`
   ]
-  return { args, env: { ZSPARK_API_KEY: p.apiKey } }
+  return { args, env: { ZSPARK_API_KEY: effectiveKey } }
 }
 
 function spawnCodex() {
