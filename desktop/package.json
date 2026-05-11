@@ -30,11 +30,33 @@
   "build": {
     "appId": "com.zspark.desktop",
     "productName": "zspark",
-    "files": ["out/**/*", "resources/**/*"],
-    "extraResources": [
-      { "from": "../codex-rs/target/release/codex", "to": "bin/codex", "filter": ["**/*"] }
+    "files": [
+      "out/**/*",
+      "resources/**/*"
     ],
-    "win": { "target": "nsis", "artifactName": "zspark-${version}-win-${arch}.${ext}" },
-    "mac": { "target": "dmg", "category": "public.app-category.productivity" }
+    "extraResources": [
+      {
+        "from": "../codex-rs/target/release/codex",
+        "to": "bin/codex",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "artifactName": "zspark-${version}-win-${arch}.${ext}"
+    },
+    "mac": {
+      "target": "dmg",
+      "category": "public.app-category.productivity"
+    }
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "electron",
+      "esbuild",
+      "leveldown"
+    ]
   }
 }

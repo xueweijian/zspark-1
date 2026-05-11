@@ -5,15 +5,17 @@ packages:
   - desktop
   - server
 
-ignoredBuiltDependencies:
-  - esbuild
+ignoredBuiltDependencies: []
 
 minimumReleaseAge: 10080
 minimumReleaseAgeExclude: []
 
 blockExoticSubdeps: true
-strictDepBuilds: true
+strictDepBuilds: false
 trustPolicy: no-downgrade
 trustPolicyIgnoreAfter: 10080
 trustPolicyExclude: []
-allowBuilds: {}
+allowBuilds:
+  electron: '*'
+  esbuild: '*'
+  leveldown: '*'
