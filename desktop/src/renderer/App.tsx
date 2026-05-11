@@ -126,8 +126,9 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
         <label>Wire API
           <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as any })}>
             <option value="responses">Responses API</option>
+            <option value="chat">Chat Completions (via local bridge)</option>
           </select>
-          <span className="modal-hint" style={{ marginTop: 4 }}>Chat Completions (legacy) is no longer supported by the underlying engine. Use a Responses-API gateway (LiteLLM, AzureChatGPT, vLLM-OpenAI, etc).</span>
+          <span className="modal-hint" style={{ marginTop: 4 }}>Chat Completions runs through zspark's in-process Chat↔Responses bridge — works with vLLM, SGLang, Ollama, AzureChatGPT, etc. Tool calls and reasoning_content are translated.</span>
         </label>
         <div className="modal-actions">
           <button className="ghost" onClick={onClose}>Cancel</button>

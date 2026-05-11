@@ -190,7 +190,10 @@ ipcMain.handle('settings:save', (_e, partial: { provider?: ProviderConfig }) => 
   return true
 })
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+  const b = await startBridge()
+  bridgePort = b.port
+  bridgeClose = b.close
   spawnCodex()
   createWindow()
   app.on('activate', () => {
@@ -200,5 +203,6 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => {
   codex?.kill()
+  bridgeClose?.()
   if (process.platform !== 'darwin') app.quit()
 })
