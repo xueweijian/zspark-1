@@ -10,6 +10,7 @@ const api = {
   revealPath: (path: string) => ipcRenderer.invoke('path:reveal', path),
   downloadPath: (path: string) => ipcRenderer.invoke('path:download', path),
   statPath: (path: string) => ipcRenderer.invoke('path:stat', path),
+  scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => ipcRenderer.invoke('artifacts:scanRecent', options),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (s: any) => ipcRenderer.invoke('settings:save', s),
   onStdout: (cb: (s: string) => void) => ipcRenderer.on('codex:stdout', (_e, s) => cb(s)),

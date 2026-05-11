@@ -30,6 +30,7 @@ declare global {
       revealPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       downloadPath: (path: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>
       statPath: (path: string) => Promise<PathStatResult>
+      scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => Promise<ArtifactScanResult>
       getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
       saveSettings: (s: any) => Promise<boolean>
       onStdout: (cb: (s: string) => void) => void
@@ -155,6 +156,16 @@ interface PathStatResult {
   size?: number
   mtimeMs?: number
   error?: string
+}
+
+interface ArtifactScanResult {
+  root: string
+  artifacts: Array<{
+    name: string
+    path: string
+    size: number
+    mtimeMs: number
+  }>
 }
 
 interface RuntimeHostInfo {
@@ -458,7 +469,7 @@ export function App() {
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([])
   const [runtime, setRuntime] = useState<RuntimeInfo>({})
   // Track current turn block id for incoming events
-  const currentTurn = useRef<{ turnId: string; blockId: string } | null>(null)
+  const currentTurn = useRef<{ turnId: string; blockId: string; startedAt: number } | null>(null)
   // Map agent itemId (delta or completed) -> agent block id, scoped per turn
   const agentForTurn = useRef<Map<string, string>>(new Map())
   // Map item id -> activity id
@@ -467,6 +478,7 @@ export function App() {
   const streamRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const runtimeRef = useRef<RuntimeInfo>({})
+  const shownArtifactPaths = useRef<Set<string>>(new Set())
 
   const toast = (kind: ToastKind, text: string) => {
     const id = `t-${Date.now()}-${Math.random()}`
@@ -512,11 +524,42 @@ export function App() {
     if (files.length === 0) return
     const id = `files-${itemId}`
     const title = options.title ?? `${files.length} file${files.length === 1 ? '' : 's'} ready`
+    for (const file of files) {
+      if (file.status !== 'missing') shownArtifactPaths.current.add(file.path)
+    }
     setBlocks((bs) => {
       const next = { type: 'files' as const, id, turnId, title, files, subtitle: options.subtitle, tone: options.tone ?? 'normal' }
       if (bs.some((b) => b.id === id)) return bs.map((b) => (b.id === id ? next : b))
       return [...bs, next]
     })
+  }
+
+  const scanTurnArtifacts = async (turnId: string, startedAt: number, itemId: string) => {
+    try {
+      const result = await window.zspark.scanRecentArtifacts({
+        sinceMs: Math.max(0, startedAt - 2000),
+        limit: 12
+      })
+      const files: WorkspaceFile[] = result.artifacts
+        .filter((artifact) => !shownArtifactPaths.current.has(artifact.path))
+        .map((artifact, index) => ({
+          id: `scan-${turnId}-${index}-${artifact.mtimeMs}`,
+          name: artifact.name,
+          path: artifact.path,
+          source: 'change' as const,
+          status: 'created' as const,
+          detail: `Discovered under outputs/ (${fmtBytes(artifact.size)})`,
+          updatedAt: artifact.mtimeMs
+        }))
+      if (!files.length) return
+      upsertWorkspaceFiles(files)
+      upsertArtifactBlock(turnId, itemId, files, {
+        title: `${files.length} generated artifact${files.length === 1 ? '' : 's'} found`,
+        subtitle: 'Discovered under outputs/ without a fileChange event'
+      })
+    } catch {
+      // Artifact scanning is a best-effort UI fallback.
+    }
   }
 
   const verifyArtifactClaims = async (turnId: string, itemId: string, text: string) => {
@@ -598,7 +641,8 @@ export function App() {
           const turnId = turnIdFromParams(params)
           if (!turnId) return
           const blockId = `turn-${turnId}`
-          currentTurn.current = { turnId, blockId }
+          const startedAt = Date.now()
+          currentTurn.current = { turnId, blockId, startedAt }
           agentForTurn.current.clear()
           // Pre-create a Thinking activity so users see immediate feedback
           // even when the upstream model doesn't stream reasoning deltas.
@@ -607,8 +651,8 @@ export function App() {
           setBlocks((bs) => [
             ...bs,
             {
-              type: 'turn', id: blockId, turnId, collapsed: false, startedAt: Date.now(),
-              activities: [{ id: thinkingId, kind: 'reasoning', title: 'Thinking', status: 'running', startedAt: Date.now() }]
+              type: 'turn', id: blockId, turnId, collapsed: false, startedAt,
+              activities: [{ id: thinkingId, kind: 'reasoning', title: 'Thinking', status: 'running', startedAt }]
             }
           ])
           return
@@ -622,6 +666,8 @@ export function App() {
             const acts = t.activities.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now(), title: a.kind === 'reasoning' ? 'Thought' : a.title } : a))
             return { ...t, endedAt: Date.now(), collapsed: true, activities: acts }
           })
+          const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
+          void scanTurnArtifacts(turnId, startedAt, `scan-${turnId}-completed`)
           currentTurn.current = null
           return
         }
@@ -701,6 +747,8 @@ export function App() {
             }
             updateTurn(turnId, (t) => ({ ...t, finalMessageId: agentForTurn.current.get(turnId) }))
             void verifyArtifactClaims(turnId, String(item.id ?? `agent-${turnId}`), txt)
+            const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
+            window.setTimeout(() => void scanTurnArtifacts(turnId, startedAt, `scan-${String(item.id ?? `agent-${turnId}`)}`), 500)
             return
           }
           if (item.type === 'reasoning') {

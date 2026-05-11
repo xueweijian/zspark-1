@@ -3,6 +3,7 @@ import type { OpenDialogOptions } from 'electron'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename, delimiter, dirname, join } from 'node:path'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync } from 'node:fs'
+import { scanRecentArtifacts } from './artifacts'
 import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
@@ -386,6 +387,14 @@ ipcMain.handle('path:stat', (_e, filePath: string) => {
     return { exists: false }
   }
 })
+
+ipcMain.handle('artifacts:scanRecent', (_e, options: { sinceMs?: number; limit?: number } = {}) => ({
+  root: join(WORKSPACE_ROOT, 'outputs'),
+  artifacts: scanRecentArtifacts(WORKSPACE_ROOT, {
+    sinceMs: options.sinceMs,
+    limit: options.limit
+  })
+}))
 
 app.whenReady().then(async () => {
   const b = await startBridge()
