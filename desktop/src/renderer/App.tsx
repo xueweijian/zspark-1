@@ -424,6 +424,17 @@ export function App() {
     ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
   }, [input])
 
+  // Refresh thread list when ready or when a turn completes
+  useEffect(() => {
+    if (!ready) return
+    void (async () => {
+      try {
+        const r = await send('thread/list', { limit: 50 })
+        setThreads(r.result?.data ?? [])
+      } catch {}
+    })()
+  }, [ready, streaming])
+
   const newChat = async () => {
     if (!ready) return
     setBlocks([])
