@@ -117,9 +117,9 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
         <label>Model<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></label>
         <label>Wire API
           <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as any })}>
-            <option value="responses">Responses API (recommended)</option>
-            <option value="chat">Chat Completions</option>
+            <option value="responses">Responses API</option>
           </select>
+          <span className="modal-hint" style={{ marginTop: 4 }}>Chat Completions (legacy) is no longer supported by the underlying engine. Use Responses-API gateway (LiteLLM, AzureChatGPT, vLLM-OpenAI, etc).</span>
         </label>
         <div className="modal-actions">
           <button className="ghost" onClick={onClose}>Cancel</button>

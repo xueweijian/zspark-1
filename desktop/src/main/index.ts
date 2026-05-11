@@ -78,13 +78,18 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
     '-c', `mcp_servers={}`
   ]
   if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: baseArgs, env: {} }
+  // Upstream codex-rs has dropped chat-completions support. Force responses
+  // even if the saved settings still say "chat" so we never spawn an
+  // engine that fails to boot. The Wire API selector in the UI now reflects
+  // this restriction.
+  const wireApi: 'responses' = 'responses'
   const args = [
     ...baseArgs,
     '-c', `model=${tomlString(p.model)}`,
     '-c', `model_provider=${tomlString('zspark')}`,
     '-c', `model_providers.zspark.name=${tomlString('zspark')}`,
     '-c', `model_providers.zspark.base_url=${tomlString(p.baseUrl)}`,
-    '-c', `model_providers.zspark.wire_api=${tomlString(p.wireApi)}`,
+    '-c', `model_providers.zspark.wire_api=${tomlString(wireApi)}`,
     '-c', `model_providers.zspark.env_key=${tomlString('ZSPARK_API_KEY')}`,
     '-c', `model_providers.zspark.requires_openai_auth=false`
   ]
