@@ -148,6 +148,9 @@ input,textarea,select{font:inherit}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 .modal{background:#fff;width:520px;max-width:92vw;border-radius:16px;padding:24px;box-shadow:0 20px 60px rgba(0,0,0,.22);display:flex;flex-direction:column;gap:14px;animation:slideIn .18s ease-out}
 .modal h2{font-size:17px;font-weight:600;color:#18181b;letter-spacing:-.01em}
+.modal-head{display:flex;justify-content:space-between;align-items:center}
+.modal-x{padding:4px;border-radius:6px;color:#a1a1aa;display:flex;align-items:center;justify-content:center;cursor:pointer}
+.modal-x:hover{background:#f4f4f5;color:#18181b}
 .modal-hint{font-size:12.5px;color:#71717a;line-height:1.5;margin-bottom:4px}
 .modal label{display:flex;flex-direction:column;gap:5px;font-size:11.5px;color:#52525b;font-weight:500;text-transform:uppercase;letter-spacing:.04em}
 .modal input,.modal select{font-size:13.5px;padding:9px 11px;border:1px solid #e4e4e7;border-radius:9px;outline:none;color:#18181b;background:#fff;text-transform:none;letter-spacing:normal}
