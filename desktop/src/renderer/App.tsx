@@ -253,15 +253,21 @@ export function App() {
             return
           }
           if (item.type === 'agentMessage' && method === 'item/completed') {
-            // If we already streamed via deltas, ignore (delta path owns the text).
-            if (agentForTurn.current.has(turnId)) return
-            const txt = item.text ?? ''
-            if (txt) {
+            // The completed event carries the authoritative full text. Some
+            // providers stream only the first chunk via deltas (or send no
+            // deltas at all) and put the rest in the final completed item.
+            // Always overwrite the bubble with the canonical text.
+            const txt = item.text ?? (Array.isArray(item.content) ? item.content.map((c: any) => c.text ?? '').join('') : '')
+            if (!txt) return
+            const existing = agentForTurn.current.get(turnId)
+            if (existing) {
+              setBlocks((bs) => bs.map((b) => (b.type === 'agent' && b.id === existing ? { ...b, text: txt } : b)))
+            } else {
               const blockId = `agent-${turnId}-final`
               agentForTurn.current.set(turnId, blockId)
               setBlocks((bs) => [...bs, { type: 'agent', id: blockId, text: txt }])
-              updateTurn(turnId, (t) => ({ ...t, finalMessageId: blockId }))
             }
+            updateTurn(turnId, (t) => ({ ...t, finalMessageId: agentForTurn.current.get(turnId) }))
             return
           }
           if (item.type === 'reasoning') {

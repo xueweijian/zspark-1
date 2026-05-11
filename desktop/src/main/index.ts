@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, shell, safeStorage } from 'electron'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { join } from 'node:path'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream } from 'node:fs'
 import { homedir } from 'node:os'
 
 let mainWindow: BrowserWindow | null = null
@@ -95,14 +95,32 @@ function spawnCodex() {
   const bin = resolveCodexBinary()
   const settings = loadSettings()
   const { args: providerArgs, env: providerEnv } = buildProviderArgs(settings.provider)
+  // Pipe a verbose, structured trace of the codex stdout/stderr stream to a
+  // user-data log file so we can diagnose model wire-protocol issues without
+  // turning on full RUST_LOG noise in the chat UI.
+  const logPath = join(app.getPath('userData'), 'codex-stream.log')
+  mkdirSync(app.getPath('userData'), { recursive: true })
+  const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' })
+  logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(providerArgs)} ===\n`)
   codex = spawn(bin, [...providerArgs, 'app-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, ...providerEnv }
+    env: { ...process.env, ...providerEnv, RUST_LOG: process.env.RUST_LOG ?? 'codex_core::client=debug,codex_core::chat_completions=debug,info' }
   })
-  codex.stdout.on('data', (b) => mainWindow?.webContents.send('codex:stdout', b.toString()))
-  codex.stderr.on('data', (b) => mainWindow?.webContents.send('codex:stderr', b.toString()))
-  codex.on('exit', (code) => mainWindow?.webContents.send('codex:exit', code))
-  // Tell renderer a fresh process is up so it re-runs handshake.
+  codex.stdout.on('data', (b) => {
+    const s = b.toString()
+    logStream.write(`[stdout] ${s}`)
+    mainWindow?.webContents.send('codex:stdout', s)
+  })
+  codex.stderr.on('data', (b) => {
+    const s = b.toString()
+    logStream.write(`[stderr] ${s}`)
+    mainWindow?.webContents.send('codex:stderr', s)
+  })
+  codex.on('exit', (code) => {
+    logStream.write(`[exit] ${code}\n`)
+    logStream.end()
+    mainWindow?.webContents.send('codex:exit', code)
+  })
   mainWindow?.webContents.send('codex:spawned')
 }
 
