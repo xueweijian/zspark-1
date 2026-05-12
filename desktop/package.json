@@ -1,6 +1,7 @@
 {
   "name": "zspark-desktop",
   "version": "0.0.1",
+  "description": "Codex-powered desktop client for local and shared agent workspaces.",
   "private": true,
   "main": "out/main/index.js",
   "scripts": {
