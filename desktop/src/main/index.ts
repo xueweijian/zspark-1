@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename, delimiter, dirname, join } from 'node:path'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync } from 'node:fs'
+import { PublicClientApplication } from '@azure/msal-node'
 import { scanRecentArtifacts } from './artifacts'
 import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
@@ -20,10 +21,37 @@ interface ProviderConfig {
   wireApi: 'responses' | 'chat'
 }
 
+interface EnterpriseConfig {
+  serverUrl: string
+  tenantId: string
+  clientId: string
+  apiScope: string
+  authority: string
+}
+
+interface EnterpriseAuth {
+  accessToken: string
+  expiresAt: number
+  username?: string
+  name?: string
+  homeAccountId?: string
+}
+
+interface AppSettings {
+  provider?: ProviderConfig
+  enterprise?: Partial<EnterpriseConfig>
+  enterpriseAuth?: EnterpriseAuth
+}
+
 let bridgePort: number | null = null
 let bridgeClose: (() => void) | null = null
 
 const PROVIDER_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/models']
+const DEFAULT_ENTRA_TENANT_ID = process.env.ZSPARK_TENANT_ID ?? 'ae266ff5-076f-4eb1-b91b-788a04d2abe0'
+const DEFAULT_ENTRA_CLIENT_ID = process.env.ZSPARK_CLIENT_ID ?? '47a35772-7d8d-4308-9730-7f1b836dc40c'
+const DEFAULT_ENTRA_API_SCOPE = process.env.ZSPARK_API_SCOPE ?? `api://${DEFAULT_ENTRA_CLIENT_ID}/access_as_user`
+const DEFAULT_ENTRA_AUTHORITY = process.env.ZSPARK_AUTHORITY ?? `https://login.partner.microsoftonline.cn/${DEFAULT_ENTRA_TENANT_ID}`
+const DEFAULT_WORKSPACE_SERVER_URL = process.env.ZSPARK_SERVER_URL ?? 'http://143.64.174.225:8787'
 
 const SETTINGS_PATH = join(app.getPath('userData'), 'zspark-settings.json')
 const WORKSPACE_ROOT = resolveWorkspaceRoot(process.cwd())
@@ -47,12 +75,16 @@ function resolveWorkspaceRoot(start: string): string {
   }
 }
 
-function loadSettings(): { provider?: ProviderConfig } {
+function loadSettings(): AppSettings {
   try {
     const raw = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
     if (raw?.provider?.encryptedApiKey && safeStorage.isEncryptionAvailable()) {
       raw.provider.apiKey = safeStorage.decryptString(Buffer.from(raw.provider.encryptedApiKey, 'base64'))
       delete raw.provider.encryptedApiKey
+    }
+    if (raw?.enterpriseAuth?.encryptedAccessToken && safeStorage.isEncryptionAvailable()) {
+      raw.enterpriseAuth.accessToken = safeStorage.decryptString(Buffer.from(raw.enterpriseAuth.encryptedAccessToken, 'base64'))
+      delete raw.enterpriseAuth.encryptedAccessToken
     }
     return raw
   } catch {
@@ -60,7 +92,7 @@ function loadSettings(): { provider?: ProviderConfig } {
   }
 }
 
-function saveSettings(s: { provider?: ProviderConfig }) {
+function saveSettings(s: AppSettings) {
   mkdirSync(app.getPath('userData'), { recursive: true })
   const out: any = { ...s }
   if (out.provider?.apiKey && safeStorage.isEncryptionAvailable()) {
@@ -70,7 +102,101 @@ function saveSettings(s: { provider?: ProviderConfig }) {
     }
     delete out.provider.apiKey
   }
+  if (out.enterpriseAuth?.accessToken && safeStorage.isEncryptionAvailable()) {
+    out.enterpriseAuth = {
+      ...out.enterpriseAuth,
+      encryptedAccessToken: safeStorage.encryptString(out.enterpriseAuth.accessToken).toString('base64')
+    }
+    delete out.enterpriseAuth.accessToken
+  }
   writeFileSync(SETTINGS_PATH, JSON.stringify(out, null, 2))
+}
+
+function defaultEnterpriseConfig(): EnterpriseConfig {
+  return {
+    serverUrl: DEFAULT_WORKSPACE_SERVER_URL,
+    tenantId: DEFAULT_ENTRA_TENANT_ID,
+    clientId: DEFAULT_ENTRA_CLIENT_ID,
+    apiScope: DEFAULT_ENTRA_API_SCOPE,
+    authority: DEFAULT_ENTRA_AUTHORITY
+  }
+}
+
+function effectiveEnterpriseConfig(settings = loadSettings()): EnterpriseConfig {
+  const defaults = defaultEnterpriseConfig()
+  return {
+    serverUrl: normalizeEnterpriseServerUrl(settings.enterprise?.serverUrl || defaults.serverUrl),
+    tenantId: settings.enterprise?.tenantId || defaults.tenantId,
+    clientId: settings.enterprise?.clientId || defaults.clientId,
+    apiScope: settings.enterprise?.apiScope || defaults.apiScope,
+    authority: (settings.enterprise?.authority || defaults.authority).replace(/\/+$/, '')
+  }
+}
+
+function normalizeEnterpriseServerUrl(rawUrl: string): string {
+  return rawUrl.trim().replace(/\/+$/, '')
+}
+
+function tokenIsUsable(auth?: EnterpriseAuth) {
+  return Boolean(auth?.accessToken && auth.expiresAt > Date.now() + 60_000)
+}
+
+function safeSettingsView(s: AppSettings) {
+  const view: AppSettings = {
+    ...s,
+    enterprise: effectiveEnterpriseConfig(s)
+  }
+  if (s.provider?.apiKey) {
+    view.provider = { ...s.provider, apiKey: s.provider.apiKey.slice(0, 4) + '••••' + s.provider.apiKey.slice(-4) }
+  }
+  delete view.enterpriseAuth
+  return view
+}
+
+function enterpriseStatus(settings = loadSettings()) {
+  const auth = settings.enterpriseAuth
+  return {
+    configured: Boolean(effectiveEnterpriseConfig(settings).serverUrl && effectiveEnterpriseConfig(settings).clientId && effectiveEnterpriseConfig(settings).tenantId),
+    signedIn: tokenIsUsable(auth),
+    account: auth
+      ? {
+          username: auth.username,
+          name: auth.name,
+          homeAccountId: auth.homeAccountId,
+          expiresAt: auth.expiresAt
+        }
+      : null,
+    config: effectiveEnterpriseConfig(settings)
+  }
+}
+
+async function enterpriseRequest(path: string, init: RequestInit = {}) {
+  const settings = loadSettings()
+  const auth = settings.enterpriseAuth
+  if (!tokenIsUsable(auth)) {
+    return { ok: false, status: 401, error: 'Sign in to shared workspaces first.' }
+  }
+  const config = effectiveEnterpriseConfig(settings)
+  const response = await fetch(`${config.serverUrl}${path}`, {
+    ...init,
+    headers: {
+      ...(init.body ? { 'content-type': 'application/json' } : {}),
+      ...init.headers,
+      authorization: `Bearer ${auth!.accessToken}`
+    }
+  })
+  const bodyText = await response.text()
+  let body: any = null
+  try {
+    body = bodyText ? JSON.parse(bodyText) : null
+  } catch {
+    body = { text: bodyText }
+  }
+  if (!response.ok) {
+    const error = [body?.error, body?.detail].filter(Boolean).join(': ')
+    return { ok: false, status: response.status, error: error || bodyText }
+  }
+  return { ok: true, status: response.status, ...body }
 }
 
 function resolveCodexBinary(): string {
@@ -300,28 +426,141 @@ ipcMain.handle('codex:restart', () => {
 
 ipcMain.handle('settings:get', () => {
   const s = loadSettings()
-  // Return a redacted view to the renderer (mask the api key).
-  if (s.provider?.apiKey) {
-    return { ...s, provider: { ...s.provider, apiKey: s.provider.apiKey.slice(0, 4) + '••••' + s.provider.apiKey.slice(-4) } }
-  }
-  return s
+  // Return a redacted view to the renderer.
+  return safeSettingsView(s)
 })
 
-ipcMain.handle('settings:save', (_e, partial: { provider?: ProviderConfig }) => {
+ipcMain.handle('settings:save', (_e, partial: AppSettings) => {
   // If the renderer sends back the masked key, keep the existing one.
   const cur = loadSettings()
-  const next: { provider?: ProviderConfig } = { ...cur, ...partial }
+  const next: AppSettings = { ...cur, ...partial }
   if (next.provider) {
     if (next.provider.apiKey?.includes('••••') && cur.provider?.apiKey) {
       next.provider.apiKey = cur.provider.apiKey
     }
   }
+  if (next.enterprise) {
+    next.enterprise = {
+      ...effectiveEnterpriseConfig(cur),
+      ...next.enterprise
+    }
+  }
   saveSettings(next)
-  // Restart codex with new provider so the change takes effect immediately.
-  codex?.kill()
-  spawnCodex()
+  if (partial.provider) {
+    // Restart codex with new provider so the change takes effect immediately.
+    codex?.kill()
+    spawnCodex()
+  }
   return true
 })
+
+ipcMain.handle('enterprise:status', () => enterpriseStatus())
+
+ipcMain.handle('enterprise:logout', () => {
+  const settings = loadSettings()
+  delete settings.enterpriseAuth
+  saveSettings(settings)
+  return enterpriseStatus(settings)
+})
+
+ipcMain.handle('enterprise:login', async () => {
+  try {
+    const settings = loadSettings()
+    const config = effectiveEnterpriseConfig(settings)
+    settings.enterprise = config
+    saveSettings(settings)
+
+    const app = new PublicClientApplication({
+      auth: {
+        clientId: config.clientId,
+        authority: config.authority,
+        knownAuthorities: ['login.partner.microsoftonline.cn']
+      }
+    })
+    const result = await app.acquireTokenByDeviceCode({
+      scopes: [config.apiScope],
+      deviceCodeCallback: (response: any) => {
+        mainWindow?.webContents.send('enterprise:deviceCode', {
+          userCode: response.userCode,
+          verificationUri: response.verificationUri,
+          expiresOn: response.expiresOn?.getTime?.() ?? null,
+          message: response.message
+        })
+        if (response.verificationUri) {
+          shell.openExternal(response.verificationUri)
+        }
+      }
+    })
+    if (!result?.accessToken) {
+      return { ok: false, error: 'Entra login did not return an access token.' }
+    }
+
+    const next = loadSettings()
+    next.enterprise = config
+    next.enterpriseAuth = {
+      accessToken: result.accessToken,
+      expiresAt: result.expiresOn?.getTime() ?? Date.now() + 3_600_000,
+      username: result.account?.username,
+      name: result.account?.name,
+      homeAccountId: result.account?.homeAccountId
+    }
+    saveSettings(next)
+    return { ok: true, status: enterpriseStatus(next) }
+  } catch (err: any) {
+    return {
+      ok: false,
+      error: formatEnterpriseLoginError(err),
+      code: err?.errorCode ?? err?.code ?? null
+    }
+  }
+})
+
+function formatEnterpriseLoginError(err: any) {
+  const raw = [err?.errorMessage, err?.message, err?.subError].filter(Boolean).join(' ')
+  if (/invalid_client|AADSTS7000218/i.test(raw)) {
+    return 'Entra rejected zspark as a public desktop client. In Azure Portal, open zspark-desktop -> Authentication -> Advanced settings -> Allow public client flows -> Yes, then try signing in again.'
+  }
+  return raw || String(err)
+}
+
+ipcMain.handle('enterprise:whoami', () => enterpriseRequest('/auth/whoami'))
+
+ipcMain.handle('enterprise:workspaces', () => enterpriseRequest('/workspaces'))
+
+ipcMain.handle('enterprise:createWorkspace', (_e, name?: string) => (
+  enterpriseRequest('/workspaces', {
+    method: 'POST',
+    body: JSON.stringify({ name })
+  })
+))
+
+ipcMain.handle('enterprise:sessions', (_e, workspaceId: string) => (
+  enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions`)
+))
+
+ipcMain.handle('enterprise:createSession', (_e, workspaceId: string, body: any = {}) => (
+  enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions`, {
+    method: 'POST',
+    body: JSON.stringify(body)
+  })
+))
+
+ipcMain.handle('enterprise:readSession', (_e, workspaceId: string, sessionId: string) => (
+  enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}`)
+))
+
+ipcMain.handle('enterprise:updateSession', (_e, workspaceId: string, sessionId: string, body: any = {}) => (
+  enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify(body)
+  })
+))
+
+ipcMain.handle('enterprise:deleteSession', (_e, workspaceId: string, sessionId: string) => (
+  enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}`, {
+    method: 'DELETE'
+  })
+))
 
 ipcMain.handle('attachments:pick', async () => {
   const options: OpenDialogOptions = {

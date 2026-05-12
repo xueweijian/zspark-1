@@ -47,8 +47,20 @@ declare global {
       statPath: (path: string) => Promise<PathStatResult>
       openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>
       scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => Promise<ArtifactScanResult>
-      getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
+      getSettings: () => Promise<AppSettingsView>
       saveSettings: (s: any) => Promise<boolean>
+      enterpriseStatus: () => Promise<EnterpriseStatus>
+      enterpriseLogin: () => Promise<{ ok: boolean; status?: EnterpriseStatus; error?: string }>
+      enterpriseLogout: () => Promise<EnterpriseStatus>
+      enterpriseWhoami: () => Promise<{ ok: boolean; principal?: string; oid?: string; tid?: string; status?: number; error?: string }>
+      enterpriseWorkspaces: () => Promise<{ ok: boolean; workspaces?: SharedWorkspace[]; status?: number; error?: string }>
+      enterpriseCreateWorkspace: (name?: string) => Promise<{ ok: boolean; workspace?: SharedWorkspace; status?: number; error?: string }>
+      enterpriseSessions: (workspaceId: string) => Promise<{ ok: boolean; sessions?: SharedSession[]; status?: number; error?: string }>
+      enterpriseCreateSession: (workspaceId: string, body?: SharedSessionMutation) => Promise<{ ok: boolean; session?: SharedSession; status?: number; error?: string }>
+      enterpriseReadSession: (workspaceId: string, sessionId: string) => Promise<{ ok: boolean; session?: SharedSession; snapshot?: SharedSessionSnapshot; status?: number; error?: string }>
+      enterpriseUpdateSession: (workspaceId: string, sessionId: string, body?: SharedSessionMutation) => Promise<{ ok: boolean; session?: SharedSession; status?: number; error?: string }>
+      enterpriseDeleteSession: (workspaceId: string, sessionId: string) => Promise<{ ok: boolean; status?: number; error?: string }>
+      onEnterpriseDeviceCode: (cb: (payload: EnterpriseDeviceCode) => void) => void | (() => void)
       onStdout: (cb: (s: string) => void) => void | (() => void)
       onStderr: (cb: (s: string) => void) => void | (() => void)
       onExit: (cb: (code: number | null) => void) => void | (() => void)
@@ -76,6 +88,18 @@ const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
 const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
 const USER_APPROVAL_REVIEWER = 'user'
 const ZSPARK_APPROVAL_POLICY = 'on-request'
+
+function errorMessage(error: any) {
+  return error?.message ? String(error.message) : String(error)
+}
+
+function isMissingRolloutError(message?: string) {
+  return /^no rollout found for thread id\b/.test(String(message ?? ''))
+}
+
+function shouldAutoToastRpcError(message?: string) {
+  return Boolean(message && !IGNORED_RPC_ERRORS.has(message) && !isMissingRolloutError(message))
+}
 
 let nextId = 1
 const newId = () => nextId++
@@ -171,10 +195,31 @@ type ToastKind = 'info' | 'warn' | 'error'
 interface Toast { id: string; kind: ToastKind; text: string }
 
 interface ProviderForm { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
+type EnterpriseForm = EnterpriseConfig
 
-type Panel = null | 'search' | 'skills' | 'plugins' | 'automations' | 'history'
+type Panel = null | 'search' | 'skills' | 'plugins' | 'automations' | 'history' | 'shared'
 
 interface ThreadSummary { id: string; preview?: string; createdAt?: number; updatedAt?: number; name?: string | null }
+interface SharedSession {
+  id: string
+  owner?: string
+  title?: string | null
+  local_thread_id?: string | null
+  created_at?: string
+  updated_at?: string
+}
+interface SharedSessionSnapshot {
+  version?: number
+  title?: string
+  localThreadId?: string | null
+  blocks?: Block[]
+  updatedAt?: number
+}
+interface SharedSessionMutation {
+  title?: string
+  localThreadId?: string | null
+  snapshot?: SharedSessionSnapshot
+}
 interface SkillMeta {
   name: string
   description?: string
@@ -234,6 +279,46 @@ interface ArtifactScanResult {
     size: number
     mtimeMs: number
   }>
+}
+
+interface AppSettingsView {
+  provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
+  enterprise?: EnterpriseConfig
+}
+
+interface EnterpriseConfig {
+  serverUrl: string
+  tenantId: string
+  clientId: string
+  apiScope: string
+  authority: string
+}
+
+interface EnterpriseStatus {
+  configured: boolean
+  signedIn: boolean
+  account: {
+    username?: string
+    name?: string
+    homeAccountId?: string
+    expiresAt?: number
+  } | null
+  config: EnterpriseConfig
+}
+
+interface EnterpriseDeviceCode {
+  userCode?: string
+  verificationUri?: string
+  message?: string
+  expiresOn?: number | null
+}
+
+interface SharedWorkspace {
+  id: string
+  name: string
+  owner_key?: string
+  created_at?: string
+  updated_at?: string
 }
 
 interface RuntimeHostInfo {
@@ -330,6 +415,35 @@ function displaySkillName(name?: string) {
 function displayThreadPreview(thread: ThreadSummary) {
   const label = stripInternalPromptContext(thread.preview?.trim() || thread.name || '')
   return label || thread.id.slice(0, 8)
+}
+
+function sharedSessionToThread(session: SharedSession): ThreadSummary {
+  const updated = session.updated_at ? Math.floor(new Date(session.updated_at).getTime() / 1000) : undefined
+  const created = session.created_at ? Math.floor(new Date(session.created_at).getTime() / 1000) : undefined
+  return {
+    id: session.id,
+    name: session.title ?? undefined,
+    preview: session.title ?? undefined,
+    createdAt: Number.isFinite(created) ? created : undefined,
+    updatedAt: Number.isFinite(updated) ? updated : undefined
+  }
+}
+
+function titleFromBlocks(blocks: Block[]) {
+  const user = blocks.find((block): block is Extract<Block, { type: 'user' }> => block.type === 'user')
+  const title = stripInternalPromptContext(user?.text ?? '').split('\n').find(Boolean)?.trim()
+  return (title || 'New shared chat').slice(0, 120)
+}
+
+function blocksFromSharedSnapshot(snapshot?: SharedSessionSnapshot | null): Block[] {
+  const blocks = Array.isArray(snapshot?.blocks) ? snapshot.blocks : []
+  return blocks.filter((block: any) => (
+    block?.type === 'user' ||
+    block?.type === 'agent' ||
+    block?.type === 'files' ||
+    block?.type === 'approval' ||
+    block?.type === 'turn'
+  ))
 }
 
 function formatUserInputContent(content: any[]) {
@@ -1422,33 +1536,58 @@ function actIcon(k: ActivityKind) {
 
 function SettingsModal({ onClose }: { onClose: () => void }) {
   const [form, setForm] = useState<ProviderForm>({ baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', wireApi: 'responses' })
+  const [enterprise, setEnterprise] = useState<EnterpriseForm>({
+    serverUrl: '',
+    tenantId: '',
+    clientId: '',
+    apiScope: '',
+    authority: ''
+  })
   const [saving, setSaving] = useState(false)
   useEffect(() => {
-    window.zspark.getSettings().then((s) => { if (s.provider) setForm((p) => ({ ...p, ...s.provider })) })
+    window.zspark.getSettings().then((s) => {
+      if (s.provider) setForm((p) => ({ ...p, ...s.provider }))
+      if (s.enterprise) setEnterprise((p) => ({ ...p, ...s.enterprise }))
+    })
   }, [])
   const save = async () => {
     setSaving(true)
-    await window.zspark.saveSettings({ provider: form })
+    await window.zspark.saveSettings({ provider: form, enterprise })
     setSaving(false); onClose()
   }
   return (
     <div className="modal-bg">
       <div className="modal" onClick={(e) => e.stopPropagation()}>
         <div className="modal-head">
-          <h2>Model provider</h2>
+          <h2>Settings</h2>
           <button className="modal-x" onClick={onClose} aria-label="Close"><IconClose /></button>
         </div>
-        <p className="modal-hint">Standard OpenAI-compatible endpoint. Talks via Responses API.</p>
-        <label>Base URL<input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></label>
-        <label>API Key<input type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-..." /></label>
-        <label>Model<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></label>
-        <label>Wire API
-          <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as any })}>
-            <option value="responses">Responses API</option>
-            <option value="chat">Chat Completions (via local bridge)</option>
-          </select>
-          <span className="modal-hint" style={{ marginTop: 4 }}>Chat Completions runs through zspark's in-process Chat↔Responses bridge — works with vLLM, SGLang, Ollama, AzureChatGPT, etc. Tool calls and reasoning_content are translated.</span>
-        </label>
+        <div className="settings-group">
+          <div>
+            <h3>Model provider</h3>
+            <p className="modal-hint">Standard OpenAI-compatible endpoint. Chat providers still run through zspark's local bridge.</p>
+          </div>
+          <label>Base URL<input value={form.baseUrl} onChange={(e) => setForm({ ...form, baseUrl: e.target.value })} /></label>
+          <label>API Key<input type="password" value={form.apiKey} onChange={(e) => setForm({ ...form, apiKey: e.target.value })} placeholder="sk-..." /></label>
+          <label>Model<input value={form.model} onChange={(e) => setForm({ ...form, model: e.target.value })} /></label>
+          <label>Wire API
+            <select value={form.wireApi} onChange={(e) => setForm({ ...form, wireApi: e.target.value as any })}>
+              <option value="responses">Responses API</option>
+              <option value="chat">Chat Completions (via local bridge)</option>
+            </select>
+          </label>
+        </div>
+        <div className="settings-group">
+          <div>
+            <h3>Shared workspaces</h3>
+            <p className="modal-hint">Entra ID only gates access to the shared workspace server. It does not provide model API keys.</p>
+          </div>
+          <label>Server URL<input value={enterprise.serverUrl} onChange={(e) => setEnterprise({ ...enterprise, serverUrl: e.target.value })} placeholder="https://zspark.your-corp.cn" /></label>
+          <label>Tenant ID<input value={enterprise.tenantId} onChange={(e) => setEnterprise({ ...enterprise, tenantId: e.target.value })} /></label>
+          <label>Client ID<input value={enterprise.clientId} onChange={(e) => setEnterprise({ ...enterprise, clientId: e.target.value })} /></label>
+          <label>API Scope<input value={enterprise.apiScope} onChange={(e) => setEnterprise({ ...enterprise, apiScope: e.target.value })} /></label>
+          <label>Authority<input value={enterprise.authority} onChange={(e) => setEnterprise({ ...enterprise, authority: e.target.value })} /></label>
+        </div>
         <div className="modal-actions">
           <button className="ghost" onClick={onClose}>Cancel</button>
           <button onClick={save} disabled={saving || !form.apiKey || !form.baseUrl || !form.model}>{saving ? 'Saving…' : 'Save & restart'}</button>
@@ -1511,6 +1650,14 @@ function DesktopApp() {
   const [selectedSkills, setSelectedSkills] = useState<SkillMeta[]>([])
   const [workspaceFiles, setWorkspaceFiles] = useState<WorkspaceFile[]>([])
   const [runtime, setRuntime] = useState<RuntimeInfo>({})
+  const [enterprise, setEnterprise] = useState<EnterpriseStatus | null>(null)
+  const [enterpriseDeviceCode, setEnterpriseDeviceCode] = useState<EnterpriseDeviceCode | null>(null)
+  const [enterpriseBusy, setEnterpriseBusy] = useState(false)
+  const [enterpriseError, setEnterpriseError] = useState<string | null>(null)
+  const [sharedWorkspaces, setSharedWorkspaces] = useState<SharedWorkspace[]>([])
+  const [activeSharedWorkspace, setActiveSharedWorkspace] = useState<string | null>(null)
+  const [sharedSessions, setSharedSessions] = useState<SharedSession[]>([])
+  const [activeSharedSession, setActiveSharedSession] = useState<string | null>(null)
   // Track current turn block id for incoming events
   const currentTurn = useRef<{ turnId: string; blockId: string; startedAt: number } | null>(null)
   // Map agent itemId (delta or completed) -> agent block id, scoped per turn
@@ -1536,6 +1683,10 @@ function DesktopApp() {
   const inputRef = useRef('')
   const runtimeRef = useRef<RuntimeInfo>({})
   const threadRef = useRef<string | null>(null)
+  const activeSharedWorkspaceRef = useRef<string | null>(null)
+  const activeSharedSessionRef = useRef<string | null>(null)
+  const lastLocalThreadRef = useRef<string | null>(null)
+  const sharedSyncTimer = useRef<number | null>(null)
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const submitInFlight = useRef(false)
   const stickToBottom = useRef(true)
@@ -1619,6 +1770,176 @@ function DesktopApp() {
       const info = await window.zspark.getRuntimeInfo()
       setRuntime((prev) => ({ ...prev, ...info }))
     } catch {}
+  }
+  const refreshEnterprise = async (showErrors = false) => {
+    try {
+      const status = await window.zspark.enterpriseStatus()
+      setEnterprise(status)
+      if (status.signedIn) {
+        const result = await window.zspark.enterpriseWorkspaces()
+        if (result.ok) {
+          setEnterpriseError(null)
+          const workspaces = result.workspaces ?? []
+          setSharedWorkspaces(workspaces)
+          if (activeSharedWorkspaceRef.current && !workspaces.some((workspace) => workspace.id === activeSharedWorkspaceRef.current)) {
+            activeSharedWorkspaceRef.current = null
+            activeSharedSessionRef.current = null
+            setActiveSharedWorkspace(null)
+            setActiveSharedSession(null)
+            setSharedSessions([])
+          }
+        } else {
+          const message = result.error ?? 'Could not load shared workspaces'
+          setEnterpriseError(message)
+          if (showErrors) toast('error', message)
+          setSharedWorkspaces([])
+        }
+      } else {
+        setEnterpriseError(null)
+        setSharedWorkspaces([])
+        setSharedSessions([])
+        activeSharedWorkspaceRef.current = null
+        activeSharedSessionRef.current = null
+        setActiveSharedWorkspace(null)
+        setActiveSharedSession(null)
+      }
+    } catch {
+      const message = 'Could not reach shared workspace server'
+      setEnterpriseError(message)
+      if (showErrors) toast('error', message)
+      setSharedWorkspaces([])
+      setSharedSessions([])
+    }
+  }
+  const refreshSharedSessions = async (workspaceId = activeSharedWorkspaceRef.current, showErrors = false) => {
+    if (!workspaceId) {
+      setSharedSessions([])
+      return
+    }
+    try {
+      const result = await window.zspark.enterpriseSessions(workspaceId)
+      if (!result.ok) {
+        const message = result.error ?? 'Could not load shared sessions'
+        setEnterpriseError(message)
+        if (showErrors) toast('error', message)
+        setSharedSessions([])
+        return
+      }
+      setEnterpriseError(null)
+      setSharedSessions(result.sessions ?? [])
+    } catch (err: any) {
+      const message = err?.message ?? 'Could not reach shared workspace server'
+      setEnterpriseError(message)
+      if (showErrors) toast('error', message)
+      setSharedSessions([])
+    }
+  }
+  const selectSharedWorkspace = async (workspaceId: string) => {
+    if (streaming || submitInFlight.current) {
+      toast('warn', 'Current turn is still running. Stop it or wait before switching workspace.')
+      return
+    }
+    if (!activeSharedWorkspaceRef.current && threadRef.current) {
+      const localThread = threadRef.current
+      const knownLocalThread = threads.some((candidate) => candidate.id === localThread)
+      const hasLocalTranscript = blocks.some((block) => (
+        block.type === 'user' || block.type === 'agent' || block.type === 'turn'
+      ))
+      lastLocalThreadRef.current = knownLocalThread || hasLocalTranscript ? localThread : null
+    }
+    switchThreadSeq.current += 1
+    resetLiveTurnState()
+    activeSharedWorkspaceRef.current = workspaceId
+    activeSharedSessionRef.current = null
+    setActiveSharedWorkspace(workspaceId)
+    setActiveSharedSession(null)
+    setThread(null)
+    setBlocks([])
+    setWorkspaceFiles([])
+    setPanel(null)
+    await refreshSharedSessions(workspaceId, true)
+  }
+  const exitSharedWorkspace = async () => {
+    if (streaming || submitInFlight.current) {
+      toast('warn', 'Current turn is still running. Stop it or wait before switching workspace.')
+      return
+    }
+    const localThread = lastLocalThreadRef.current
+    switchThreadSeq.current += 1
+    resetLiveTurnState()
+    activeSharedWorkspaceRef.current = null
+    activeSharedSessionRef.current = null
+    setActiveSharedWorkspace(null)
+    setActiveSharedSession(null)
+    setSharedSessions([])
+    setBlocks([])
+    setWorkspaceFiles([])
+    setPanel(null)
+    if (localThread) {
+      await switchLocalThread(localThread, { startNewOnMissingRollout: true })
+    } else {
+      await startLocalChat()
+    }
+  }
+  const signInEnterprise = async () => {
+    setEnterpriseBusy(true)
+    setEnterpriseError(null)
+    setEnterpriseDeviceCode(null)
+    try {
+      const result = await window.zspark.enterpriseLogin()
+      if (!result.ok) {
+        toast('error', result.error ?? 'Could not sign in to shared workspaces')
+        return
+      }
+      if (result.status) setEnterprise(result.status)
+      toast('info', 'Signed in to shared workspaces')
+      await refreshEnterprise(true)
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    } finally {
+      setEnterpriseBusy(false)
+    }
+  }
+  const signOutEnterprise = async () => {
+    setEnterpriseBusy(true)
+    try {
+      const status = await window.zspark.enterpriseLogout()
+      setEnterprise(status)
+      setEnterpriseError(null)
+      setSharedWorkspaces([])
+      setSharedSessions([])
+      activeSharedWorkspaceRef.current = null
+      activeSharedSessionRef.current = null
+      setActiveSharedWorkspace(null)
+      setActiveSharedSession(null)
+      toast('info', 'Signed out of shared workspaces')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    } finally {
+      setEnterpriseBusy(false)
+    }
+  }
+  const createSharedWorkspace = async () => {
+    const accountName = enterprise?.account?.name || enterprise?.account?.username
+    const name = `${accountName ? accountName.split('@')[0] : 'Team'} shared workspace`
+    setEnterpriseBusy(true)
+    setEnterpriseError(null)
+    try {
+      const result = await window.zspark.enterpriseCreateWorkspace(name)
+      if (!result.ok) {
+        const message = result.error ?? 'Could not create shared workspace'
+        setEnterpriseError(message)
+        toast('error', message)
+        return
+      }
+      await refreshEnterprise(true)
+      if (result.workspace?.id) await selectSharedWorkspace(result.workspace.id)
+      toast('info', 'Shared workspace created')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    } finally {
+      setEnterpriseBusy(false)
+    }
   }
   const applyThreadRuntime = (result: any) => {
     if (!result) return
@@ -2091,6 +2412,8 @@ function DesktopApp() {
 
   useEffect(() => { runtimeRef.current = runtime }, [runtime])
   useEffect(() => { threadRef.current = thread }, [thread])
+  useEffect(() => { activeSharedWorkspaceRef.current = activeSharedWorkspace }, [activeSharedWorkspace])
+  useEffect(() => { activeSharedSessionRef.current = activeSharedSession }, [activeSharedSession])
   useEffect(() => { inputRef.current = input }, [input])
   useEffect(() => {
     if (streaming || submitting || !input.trim()) return
@@ -2454,7 +2777,7 @@ function DesktopApp() {
           } else if (typeof msg.id === 'number' && pending.has(msg.id)) {
             pending.get(msg.id)!.resolve(msg)
             pending.delete(msg.id)
-            if (msg.error && !IGNORED_RPC_ERRORS.has(msg.error.message)) toast('error', msg.error.message)
+            if (msg.error && shouldAutoToastRpcError(msg.error.message)) toast('error', msg.error.message)
           } else if (msg.method) {
             const now = Date.now()
             const previous = recentNotificationLines.current.get(line)
@@ -2497,12 +2820,18 @@ function DesktopApp() {
       refreshRuntimeHost()
       handshake()
     })
+    const offEnterpriseDeviceCode = window.zspark.onEnterpriseDeviceCode((payload) => {
+      setEnterpriseDeviceCode(payload)
+      if (payload.userCode) toast('info', `Enter code ${payload.userCode} to finish Entra sign-in`)
+    })
     handshake()
+    refreshEnterprise()
     return () => {
       if (typeof offStdout === 'function') offStdout()
       if (typeof offStderr === 'function') offStderr()
       if (typeof offExit === 'function') offExit()
       if (typeof offSpawned === 'function') offSpawned()
+      if (typeof offEnterpriseDeviceCode === 'function') offEnterpriseDeviceCode()
     }
   }, [])
 
@@ -2521,6 +2850,29 @@ function DesktopApp() {
     if (!thread) return
     savePersistedActivityBlocks(thread, blocks)
   }, [blocks, thread])
+  useEffect(() => {
+    if (!activeSharedWorkspace || !activeSharedSession || !blocks.length) return
+    if (sharedSyncTimer.current) window.clearTimeout(sharedSyncTimer.current)
+    sharedSyncTimer.current = window.setTimeout(() => {
+      const title = titleFromBlocks(blocks)
+      const localThreadId = threadRef.current
+      void window.zspark.enterpriseUpdateSession(activeSharedWorkspace, activeSharedSession, {
+        title,
+        localThreadId,
+        snapshot: { version: 1, blocks, localThreadId, title, updatedAt: Date.now() }
+      }).then((result) => {
+        if (!result.ok) return
+        setSharedSessions((prev) => prev.map((session) => (
+          session.id === activeSharedSession
+            ? { ...session, ...(result.session ?? {}), title, local_thread_id: localThreadId }
+            : session
+        )))
+      })
+    }, 800)
+    return () => {
+      if (sharedSyncTimer.current) window.clearTimeout(sharedSyncTimer.current)
+    }
+  }, [blocks, activeSharedWorkspace, activeSharedSession, thread])
   useEffect(() => {
     for (const block of blocks) {
       if (block.type === 'agent') void reconcileAgentArtifactClaims(block)
@@ -2542,21 +2894,26 @@ function DesktopApp() {
     let cancelled = false
     const refresh = async () => {
       try {
+        if (activeSharedWorkspace) {
+          const result = await window.zspark.enterpriseSessions(activeSharedWorkspace)
+          if (!cancelled && result.ok) setSharedSessions(result.sessions ?? [])
+          return
+        }
         const r = await send('thread/list', { limit: 50 })
         if (!cancelled) setThreads(r.result?.data ?? [])
       } catch {}
     }
     refresh()
     return () => { cancelled = true }
-  }, [ready, thread])
+  }, [ready, thread, activeSharedWorkspace, activeSharedSession])
 
   useEffect(() => {
     if (!ready) return
     refreshSkills().catch(() => {})
   }, [ready])
 
-  const newChat = async () => {
-    if (!ready) return
+  const startLocalChat = async () => {
+    if (!ready) return false
     const seq = switchThreadSeq.current + 1
     switchThreadSeq.current = seq
     stickToBottom.current = true
@@ -2565,15 +2922,17 @@ function DesktopApp() {
     setBlocks([])
     try {
       const t = await send('thread/start', userApprovalParams())
-      if (seq !== switchThreadSeq.current) return
+      if (seq !== switchThreadSeq.current) return false
       applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? null)
+      return true
     } catch (e: any) {
-      if (seq === switchThreadSeq.current) toast('error', e?.message ?? String(e))
+      if (seq === switchThreadSeq.current) toast('error', errorMessage(e))
+      return false
     }
   }
-  const switchThread = async (id: string) => {
-    if (!ready) return
+  const switchLocalThread = async (id: string, options: { startNewOnMissingRollout?: boolean } = {}) => {
+    if (!ready) return false
     const seq = switchThreadSeq.current + 1
     switchThreadSeq.current = seq
     stickToBottom.current = true
@@ -2604,15 +2963,153 @@ function DesktopApp() {
         const preview = stripInternalPromptContext(threads.find((candidate) => candidate.id === id)?.preview?.trim() ?? '')
         if (preview) setBlocks([{ type: 'user', id: `preview-${id}`, text: preview }])
       }
+      return true
+    } catch (e: any) {
+      const message = errorMessage(e)
+      if (isMissingRolloutError(message)) {
+        if (lastLocalThreadRef.current === id) lastLocalThreadRef.current = null
+        if (options.startNewOnMissingRollout && seq === switchThreadSeq.current) {
+          await startLocalChat()
+          return false
+        }
+      }
+      if (seq === switchThreadSeq.current) toast('error', message)
+      return false
+    }
+  }
+  const createSharedSession = async () => {
+    const workspaceId = activeSharedWorkspaceRef.current
+    if (!ready || !workspaceId) return null
+    const seq = switchThreadSeq.current + 1
+    switchThreadSeq.current = seq
+    stickToBottom.current = true
+    setShowJumpToLatest(false)
+    resetLiveTurnState()
+    setBlocks([])
+    setWorkspaceFiles([])
+    try {
+      const t = await send('thread/start', userApprovalParams())
+      if (seq !== switchThreadSeq.current) return null
+      if (t.error) throw new Error(t.error.message)
+      applyThreadRuntime(t.result)
+      const localThreadId = t.result?.thread?.id ?? null
+      setThread(localThreadId)
+      const result = await window.zspark.enterpriseCreateSession(workspaceId, {
+        title: 'New shared chat',
+        localThreadId,
+        snapshot: { version: 1, blocks: [], localThreadId, title: 'New shared chat', updatedAt: Date.now() }
+      })
+      if (!result.ok || !result.session) throw new Error(result.error ?? 'Could not create shared session')
+      activeSharedSessionRef.current = result.session.id
+      setActiveSharedSession(result.session.id)
+      setSharedSessions((prev) => [result.session!, ...prev.filter((session) => session.id !== result.session!.id)])
+      return { sessionId: result.session.id, localThreadId }
+    } catch (e: any) {
+      if (seq === switchThreadSeq.current) toast('error', e?.message ?? String(e))
+      return null
+    }
+  }
+  const switchSharedSession = async (id: string) => {
+    const workspaceId = activeSharedWorkspaceRef.current
+    if (!ready || !workspaceId) return
+    const seq = switchThreadSeq.current + 1
+    switchThreadSeq.current = seq
+    stickToBottom.current = true
+    setShowJumpToLatest(false)
+    resetLiveTurnState()
+    setBlocks([])
+    setWorkspaceFiles([])
+    try {
+      const result = await window.zspark.enterpriseReadSession(workspaceId, id)
+      if (seq !== switchThreadSeq.current) return
+      if (!result.ok || !result.session) throw new Error(result.error ?? 'Could not open shared session')
+      activeSharedSessionRef.current = id
+      setActiveSharedSession(id)
+      setPanel(null)
+      const snapshotBlocks = blocksFromSharedSnapshot(result.snapshot)
+      const localThreadId = result.session.local_thread_id ?? result.snapshot?.localThreadId ?? null
+      let replayed = false
+      if (localThreadId) {
+        try {
+          const t = await send('thread/resume', { threadId: localThreadId, ...userApprovalParams() })
+          if (seq !== switchThreadSeq.current) return
+          if (t.error) throw new Error(t.error.message)
+          applyThreadRuntime(t.result)
+          setThread(t.result?.thread?.id ?? localThreadId)
+          let threadForReplay = t.result?.thread
+          if (!Array.isArray(threadForReplay?.turns) || threadForReplay.turns.length === 0) {
+            const read = await send('thread/read', { threadId: localThreadId, includeTurns: true })
+            if (seq !== switchThreadSeq.current) return
+            if (!read.error) threadForReplay = read.result?.thread ?? threadForReplay
+          }
+          const replay = blocksFromThreadTurns(threadForReplay?.turns ?? [], runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot)
+          const restoredBlocks = mergePersistedActivityBlocks(replay.blocks, loadPersistedActivityBlocks(localThreadId))
+          if (replay.files.length) upsertWorkspaceFiles(replay.files)
+          if (restoredBlocks.length) {
+            setBlocks(restoredBlocks)
+            replayed = true
+          }
+        } catch {
+          // The shared transcript can still be viewed even if this machine
+          // does not have the original local Codex thread.
+        }
+      }
+      if (!replayed) {
+        const t = await send('thread/start', userApprovalParams())
+        if (seq !== switchThreadSeq.current) return
+        if (t.error) throw new Error(t.error.message)
+        applyThreadRuntime(t.result)
+        const nextThreadId = t.result?.thread?.id ?? null
+        setThread(nextThreadId)
+        await window.zspark.enterpriseUpdateSession(workspaceId, id, {
+          localThreadId: nextThreadId,
+          snapshot: { version: 1, blocks: snapshotBlocks, localThreadId: nextThreadId, title: result.session.title ?? undefined, updatedAt: Date.now() }
+        })
+        setSharedSessions((prev) => prev.map((session) => (
+          session.id === id ? { ...session, local_thread_id: nextThreadId } : session
+        )))
+        setBlocks(snapshotBlocks)
+        if (snapshotBlocks.length) toast('info', 'Opened shared transcript with a new local runtime context.')
+      }
     } catch (e: any) {
       if (seq === switchThreadSeq.current) toast('error', e?.message ?? String(e))
     }
+  }
+  const newChat = async () => {
+    if (activeSharedWorkspaceRef.current) {
+      await createSharedSession()
+      return
+    }
+    await startLocalChat()
+  }
+  const switchThread = async (id: string) => {
+    if (activeSharedWorkspaceRef.current) {
+      await switchSharedSession(id)
+      return
+    }
+    await switchLocalThread(id)
   }
   const deleteThread = async (id: string, e?: React.MouseEvent) => {
     e?.stopPropagation()
     if (!ready) return
     if (!confirm('Delete this chat? This cannot be undone.')) return
     try {
+      if (activeSharedWorkspaceRef.current) {
+        const workspaceId = activeSharedWorkspaceRef.current
+        const result = await window.zspark.enterpriseDeleteSession(workspaceId, id)
+        if (!result.ok && result.status !== 204) throw new Error(result.error ?? 'Could not delete shared session')
+        setSharedSessions((p) => p.filter((session) => session.id !== id))
+        if (activeSharedSessionRef.current === id) {
+          switchThreadSeq.current += 1
+          resetLiveTurnState()
+          activeSharedSessionRef.current = null
+          setActiveSharedSession(null)
+          setThread(null)
+          setBlocks([])
+          setWorkspaceFiles([])
+        }
+        return
+      }
       // codex archives via thread/archive (soft-delete from list view)
       await send('thread/archive', { threadId: id })
       setThreads((p) => p.filter((t) => t.id !== id))
@@ -2797,6 +3294,10 @@ function DesktopApp() {
     if (!ready) return
     if (p === 'history' || p === 'search') {
       try {
+        if (activeSharedWorkspaceRef.current) {
+          await refreshSharedSessions(activeSharedWorkspaceRef.current, true)
+          return
+        }
         const r = await send('thread/list', { limit: 50 })
         setThreads(r.result?.data ?? [])
       } catch {}
@@ -2816,6 +3317,12 @@ function DesktopApp() {
       return
     }
     if ((!rawText && currentAttachments.length === 0 && currentSkills.length === 0 && providedInput.length === 0) || !ready) return
+    let targetThreadId = thread
+    if (activeSharedWorkspaceRef.current && !activeSharedSessionRef.current) {
+      const created = await createSharedSession()
+      if (!created?.localThreadId) return
+      targetThreadId = created.localThreadId
+    }
     submitInFlight.current = true
     setSubmitting(true)
     stickToBottom.current = true
@@ -2853,7 +3360,7 @@ function DesktopApp() {
     }
     let accepted = false
     try {
-      const res = await send('turn/start', { threadId: thread, input: inputItems, ...userApprovalParams() })
+      const res = await send('turn/start', { threadId: targetThreadId, input: inputItems, ...userApprovalParams() })
       if (res.error) {
         if (shouldClearComposer) {
           setInput(text)
@@ -3043,6 +3550,10 @@ function DesktopApp() {
   const runtimeProvider = runtime.provider?.model ?? runtime.model
   const runtimeProviderName = runtime.modelProvider ?? (runtime.provider ? 'zspark' : undefined)
   const streamingAgentId = currentTurn.current ? agentForTurn.current.get(currentTurn.current.turnId) : undefined
+  const activeSharedWorkspaceName = sharedWorkspaces.find((workspace) => workspace.id === activeSharedWorkspace)?.name
+  const activeSharedSessionTitle = sharedSessions.find((session) => session.id === activeSharedSession)?.title
+  const visibleThreads = activeSharedWorkspace ? sharedSessions.map(sharedSessionToThread) : threads
+  const activeThreadId = activeSharedWorkspace ? activeSharedSession : thread
 
   return (
     <div className="app">
@@ -3059,22 +3570,61 @@ function DesktopApp() {
         <div className="nav-item" onClick={() => openPanel('skills')}><IconSkills /><span>Skills</span></div>
         <div className="nav-item" onClick={() => openPanel('plugins')}><IconPlugins /><span>Plugins</span></div>
         <div className="nav-item" onClick={() => openPanel('automations')}><IconAutomations /><span>Automations</span></div>
-        <h3>Recent</h3>
-        {threads.slice(0, 8).map((t) => (
-          <div key={t.id} className={`nav-item nav-item-thread${thread === t.id ? ' active' : ''}`} onClick={() => switchThread(t.id)}>
+        {activeSharedWorkspace && (
+          <button className="local-workspace-btn" onClick={exitSharedWorkspace}>
+            <IconProject /><span>Local workspace</span>
+          </button>
+        )}
+        <div className="shared-sidebar">
+          <div className="shared-sidebar-head">
+            <span>Shared workspaces</span>
+            <button onClick={() => openPanel('shared')} title="Manage shared workspaces"><IconShield /></button>
+          </div>
+          {!enterprise?.signedIn ? (
+            <button className="shared-signin" onClick={signInEnterprise} disabled={enterpriseBusy}>
+              {enterpriseBusy ? 'Connecting...' : 'Sign in with Entra'}
+            </button>
+          ) : sharedWorkspaces.length === 0 ? (
+            <>
+              <button className="shared-signin" onClick={createSharedWorkspace} disabled={enterpriseBusy}>
+                {enterpriseBusy ? 'Creating...' : 'Create shared workspace'}
+              </button>
+              {enterpriseError && <div className="shared-sidebar-error">{enterpriseError}</div>}
+            </>
+          ) : (
+            <div className="shared-workspace-list">
+              {sharedWorkspaces.slice(0, 5).map((workspace) => (
+                <button
+                  key={workspace.id}
+                  className={activeSharedWorkspace === workspace.id ? 'active' : ''}
+                  onClick={() => selectSharedWorkspace(workspace.id)}
+                  title={workspace.name}
+                >
+                  <IconProject />
+                  <span>{workspace.name}</span>
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <h3>{activeSharedWorkspace ? 'Shared sessions' : 'Recent'}</h3>
+        {visibleThreads.slice(0, 8).map((t) => (
+          <div key={t.id} className={`nav-item nav-item-thread${activeThreadId === t.id ? ' active' : ''}`} onClick={() => switchThread(t.id)}>
             <IconProject />
             <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', flex: 1 }}>{displayThreadPreview(t)}</span>
             <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete chat" title="Delete chat"><IconClose /></button>
           </div>
         ))}
-        {threads.length === 0 && <div className="nav-item" onClick={() => openPanel('history')} style={{ color: '#a1a1aa' }}><IconProject /><span>No chats yet</span></div>}
+        {visibleThreads.length === 0 && <div className="nav-item" onClick={() => openPanel('history')} style={{ color: '#a1a1aa' }}><IconProject /><span>{activeSharedWorkspace ? 'No shared sessions yet' : 'No chats yet'}</span></div>}
       </aside>
 
       <main className="chat">
         <div className="chat-header">
           <div className="left workspace-title">
-            <span>Workspace</span>
-            <small title={runtimeCwd}>{shortPath(runtimeCwd)}</small>
+            <span>{activeSharedWorkspaceName ? 'Shared workspace' : 'Workspace'}</span>
+            <small title={activeSharedWorkspaceName ? enterprise?.config.serverUrl : runtimeCwd}>
+              {activeSharedWorkspaceName ? [activeSharedWorkspaceName, activeSharedSessionTitle].filter(Boolean).join(' / ') : shortPath(runtimeCwd)}
+            </small>
           </div>
           <div className="right">
             {streaming && <button className="header-btn danger" onClick={stopTurn}><IconClose /> Stop</button>}
@@ -3281,9 +3831,34 @@ function DesktopApp() {
       <aside className="right">
         <div className="right-section">
           <h4>Session</h4>
-          <div className="kv"><span className="k">Thread</span><span className="v">{thread ? thread.slice(0, 8) : '—'}</span></div>
+          <div className="kv"><span className="k">{activeSharedWorkspace ? 'Shared' : 'Thread'}</span><span className="v">{activeSharedWorkspace ? (activeSharedSession ? activeSharedSession.slice(0, 8) : '—') : (thread ? thread.slice(0, 8) : '—')}</span></div>
+          {activeSharedWorkspace && <div className="kv"><span className="k">Runtime</span><span className="v">{thread ? thread.slice(0, 8) : '—'}</span></div>}
           <div className="kv"><span className="k">Status</span><span className="v"><span className={`pill ${ready ? '' : 'off'}`}>{ready ? 'live' : 'offline'}</span></span></div>
           <div className="kv"><span className="k">Skills</span><span className="v">{usableSkillCount} ready</span></div>
+        </div>
+        <div className="right-section">
+          <h4>Enterprise</h4>
+          <div className="kv"><span className="k">Shared</span><span className="v">{enterprise?.signedIn ? 'connected' : 'not signed in'}</span></div>
+          <div className="kv"><span className="k">Account</span><span className="v" title={enterprise?.account?.username}>{enterprise?.account?.username ?? '—'}</span></div>
+          <div className="kv"><span className="k">Workspaces</span><span className="v">{sharedWorkspaces.length}</span></div>
+          {activeSharedWorkspace && <div className="kv"><span className="k">Sessions</span><span className="v">{sharedSessions.length}</span></div>}
+          <div className="file-actions">
+            {enterprise?.signedIn ? (
+              <>
+                <button onClick={() => void refreshEnterprise(true)} disabled={enterpriseBusy}>Refresh</button>
+                {activeSharedWorkspace && <button onClick={exitSharedWorkspace} disabled={enterpriseBusy}>Local</button>}
+                <button onClick={signOutEnterprise} disabled={enterpriseBusy}>Sign out</button>
+              </>
+            ) : (
+              <button onClick={signInEnterprise} disabled={enterpriseBusy}>{enterpriseBusy ? 'Connecting...' : 'Sign in'}</button>
+            )}
+          </div>
+          {enterpriseDeviceCode?.userCode && (
+            <div className="device-code">
+              <strong>{enterpriseDeviceCode.userCode}</strong>
+              <span>Use this code in the browser window to finish Entra sign-in.</span>
+            </div>
+          )}
         </div>
         <div className="right-section">
           <h4>Runtime</h4>
@@ -3323,10 +3898,10 @@ function DesktopApp() {
       {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
 
       {panel === 'search' && (
-        <Drawer title="Search threads" onClose={() => setPanel(null)}>
+        <Drawer title={activeSharedWorkspace ? 'Search shared sessions' : 'Search threads'} onClose={() => setPanel(null)}>
           <input className="drawer-search" placeholder="Filter by preview…" value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} />
           <div className="drawer-list">
-            {threads.filter((t) => !searchQuery || displayThreadPreview(t).toLowerCase().includes(searchQuery.toLowerCase())).map((t) => (
+            {visibleThreads.filter((t) => !searchQuery || displayThreadPreview(t).toLowerCase().includes(searchQuery.toLowerCase())).map((t) => (
               <div key={t.id} className="drawer-row">
                 <div style={{ flex: 1, minWidth: 0 }} onClick={() => switchThread(t.id)}>
                   <div className="drawer-row-t">{displayThreadPreview(t)}</div>
@@ -3335,7 +3910,7 @@ function DesktopApp() {
                 <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete"><IconClose /></button>
               </div>
             ))}
-            {threads.length === 0 && <div className="drawer-empty">No threads yet. Start a new chat to get going.</div>}
+            {visibleThreads.length === 0 && <div className="drawer-empty">{activeSharedWorkspace ? 'No shared sessions yet. Start a new chat in this workspace.' : 'No threads yet. Start a new chat to get going.'}</div>}
           </div>
         </Drawer>
       )}
@@ -3438,10 +4013,64 @@ function DesktopApp() {
         </Drawer>
       )}
 
+      {panel === 'shared' && (
+        <Drawer title="Shared workspaces" onClose={() => setPanel(null)}>
+          <div className="shared-panel">
+            <div className={`shared-status ${enterprise?.signedIn ? 'connected' : ''}`}>
+              <IconShield />
+              <div>
+                <strong>{enterprise?.signedIn ? 'Connected through Entra ID' : 'Not signed in'}</strong>
+                <span>{enterprise?.signedIn ? (enterprise.account?.username ?? 'Enterprise account connected') : 'Sign in to see server-side workspaces allowed by ACL.'}</span>
+              </div>
+            </div>
+            <div className="shared-actions">
+              {enterprise?.signedIn ? (
+                <>
+                  <button onClick={() => void refreshEnterprise(true)} disabled={enterpriseBusy}>Refresh</button>
+                  <button onClick={createSharedWorkspace} disabled={enterpriseBusy}>New shared workspace</button>
+                  {activeSharedWorkspace && <button className="ghost" onClick={exitSharedWorkspace} disabled={enterpriseBusy}>Back to local</button>}
+                  <button className="ghost" onClick={signOutEnterprise} disabled={enterpriseBusy}>Sign out</button>
+                </>
+              ) : (
+                <button onClick={signInEnterprise} disabled={enterpriseBusy}>{enterpriseBusy ? 'Connecting...' : 'Sign in with Entra ID'}</button>
+              )}
+            </div>
+            {enterpriseDeviceCode?.userCode && (
+              <div className="device-code large">
+                <strong>{enterpriseDeviceCode.userCode}</strong>
+                <span>{enterpriseDeviceCode.message ?? 'Enter this code in the Microsoft sign-in page.'}</span>
+              </div>
+            )}
+            {enterpriseError && <div className="enterprise-error">{enterpriseError}</div>}
+            <div className="workspace-server-card">
+              <div><span>Server</span><strong title={enterprise?.config.serverUrl}>{enterprise?.config.serverUrl ?? '—'}</strong></div>
+              <div><span>Tenant</span><strong>{enterprise?.config.tenantId ?? '—'}</strong></div>
+            </div>
+            <div className="drawer-list">
+              {sharedWorkspaces.map((workspace) => (
+                <div
+                  key={workspace.id}
+                  className={`drawer-row ${activeSharedWorkspace === workspace.id ? 'selected' : ''}`}
+                  onClick={() => selectSharedWorkspace(workspace.id)}
+                >
+                  <IconProject />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div className="drawer-row-t">{workspace.name}</div>
+                    <div className="drawer-row-d">{workspace.id}</div>
+                  </div>
+                </div>
+              ))}
+              {enterprise?.signedIn && sharedWorkspaces.length === 0 && <div className="drawer-empty">No shared workspaces available for this account yet.</div>}
+              {!enterprise?.signedIn && <div className="drawer-empty">Shared workspaces are separate from local Recent chats and require Entra access.</div>}
+            </div>
+          </div>
+        </Drawer>
+      )}
+
       {panel === 'history' && (
-        <Drawer title="Chat history" onClose={() => setPanel(null)}>
+        <Drawer title={activeSharedWorkspace ? 'Shared session history' : 'Chat history'} onClose={() => setPanel(null)}>
           <div className="drawer-list">
-            {threads.map((t) => (
+            {visibleThreads.map((t) => (
               <div key={t.id} className="drawer-row">
                 <div style={{ flex: 1, minWidth: 0 }} onClick={() => switchThread(t.id)}>
                   <div className="drawer-row-t">{displayThreadPreview(t)}</div>
@@ -3450,7 +4079,7 @@ function DesktopApp() {
                 <button className="row-x" onClick={(e) => deleteThread(t.id, e)} aria-label="Delete"><IconClose /></button>
               </div>
             ))}
-            {threads.length === 0 && <div className="drawer-empty">No history.</div>}
+            {visibleThreads.length === 0 && <div className="drawer-empty">{activeSharedWorkspace ? 'No shared sessions.' : 'No history.'}</div>}
           </div>
         </Drawer>
       )}

@@ -1,5 +1,5 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
-import { createRemoteJWKSet, jwtVerify } from 'jose'
+import { createLocalJWKSet, jwtVerify } from 'jose'
 
 interface EntraEnv {
   ZSPARK_TENANT_ID?: string
@@ -7,21 +7,35 @@ interface EntraEnv {
   ZSPARK_AUTHORITY?: string
 }
 
-let jwks: ReturnType<typeof createRemoteJWKSet> | null = null
+let jwks: ReturnType<typeof createLocalJWKSet> | null = null
+let jwksExpiresAt = 0
 
-function getJwks(env: EntraEnv) {
-  if (jwks) return jwks
-  const authority =
+async function getJwks(env: EntraEnv) {
+  if (jwks && jwksExpiresAt > Date.now()) return jwks
+  const response = await fetch(`${authorityBase(env)}/discovery/v2.0/keys`)
+  if (!response.ok) {
+    throw new Error(`JWKS fetch failed with HTTP ${response.status}`)
+  }
+  jwks = createLocalJWKSet(await response.json())
+  jwksExpiresAt = Date.now() + 12 * 60 * 60 * 1000
+  return jwks
+}
+
+function issuer(env: EntraEnv) {
+  return (
     env.ZSPARK_AUTHORITY ??
     `https://login.partner.microsoftonline.cn/${env.ZSPARK_TENANT_ID}/v2.0`
-  jwks = createRemoteJWKSet(new URL(`${authority.replace(/\/+$/, '')}/discovery/v2.0/keys`))
-  return jwks
+  ).replace(/\/+$/, '')
+}
+
+function authorityBase(env: EntraEnv) {
+  return issuer(env).replace(/\/v2\.0$/i, '')
 }
 
 /**
  * Entra ID (Azure China) bearer-token middleware.
  *
- * - Skips /healthz, /auth/* and /teams/messages (Bot Framework handles its own auth)
+ * - Skips /healthz and /teams/messages (Bot Framework handles its own auth)
  * - Verifies signature via JWKS at login.partner.microsoftonline.cn
  * - Validates `aud` against ZSPARK_CLIENT_ID and `iss` tenant
  * - Sets req.principal = upn|preferred_username|sub
@@ -35,7 +49,6 @@ export function entraAuth(env: EntraEnv) {
   return async (req: FastifyRequest, reply: FastifyReply) => {
     if (
       req.url.startsWith('/healthz') ||
-      req.url.startsWith('/auth/') ||
       req.url.startsWith('/teams/messages')
     ) {
       return
@@ -52,26 +65,56 @@ export function entraAuth(env: EntraEnv) {
     }
 
     const auth = req.headers['authorization']
-    if (!auth?.toLowerCase().startsWith('bearer ')) {
+    const urlToken = tokenFromQuery(req.url)
+    if (!auth?.toLowerCase().startsWith('bearer ') && !urlToken) {
       reply.code(401).header('WWW-Authenticate', 'Bearer').send({ error: 'missing bearer token' })
       return reply
     }
-    const token = auth.slice(7).trim()
+    const token = urlToken ?? auth!.slice(7).trim()
 
     try {
-      const { payload } = await jwtVerify(token, getJwks(env), {
-        audience: env.ZSPARK_CLIENT_ID,
-        issuer: `https://login.partner.microsoftonline.cn/${env.ZSPARK_TENANT_ID}/v2.0`
+      const { payload } = await jwtVerify(token, await getJwks(env), {
+        audience: tokenAudiences(env),
+        issuer: tokenIssuers(env)
       })
+      if (env.ZSPARK_TENANT_ID && payload['tid'] !== env.ZSPARK_TENANT_ID) {
+        throw new Error('unexpected tenant id in access token')
+      }
       ;(req as any).principal =
         (payload['upn'] as string) ??
         (payload['preferred_username'] as string) ??
         (payload.sub as string)
       ;(req as any).oid = payload['oid'] as string | undefined
       ;(req as any).tid = payload['tid'] as string | undefined
+      ;(req as any).groups = Array.isArray(payload['groups']) ? payload['groups'] : []
     } catch (err: any) {
+      req.log.warn({ detail: err?.message }, 'Entra token verification failed')
       reply.code(401).send({ error: 'token verification failed', detail: err?.message })
       return reply
     }
+  }
+}
+
+function tokenIssuers(env: EntraEnv) {
+  const issuers = new Set<string>([issuer(env)])
+  if (env.ZSPARK_TENANT_ID) {
+    issuers.add(`https://login.partner.microsoftonline.cn/${env.ZSPARK_TENANT_ID}/v2.0`)
+    issuers.add(`https://sts.chinacloudapi.cn/${env.ZSPARK_TENANT_ID}/`)
+  }
+  return [...issuers]
+}
+
+function tokenAudiences(env: EntraEnv) {
+  const clientId = env.ZSPARK_CLIENT_ID
+  if (!clientId) return []
+  return [clientId, `api://${clientId}`]
+}
+
+function tokenFromQuery(url: string) {
+  try {
+    const parsed = new URL(url, 'http://zspark.local')
+    return parsed.searchParams.get('access_token')?.trim() || undefined
+  } catch {
+    return undefined
   }
 }

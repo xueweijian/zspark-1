@@ -7,6 +7,8 @@ import { registerAuthRoutes } from './auth.js'
 import { registerTeamsRoutes } from './teams.js'
 import { initDb } from './db.js'
 import { entraAuth } from './entra.js'
+import { registerWorkspaceRoutes } from './workspaces.js'
+import { registerSessionRoutes } from './sessions.js'
 
 const Env = z.object({
   PORT: z.string().default('8787'),
@@ -32,6 +34,8 @@ async function main() {
   app.get('/healthz', async () => ({ ok: true, service: 'zspark-server' }))
 
   await registerAuthRoutes(app)
+  await registerWorkspaceRoutes(app)
+  await registerSessionRoutes(app)
   await registerCollabRoutes(app)
   await registerTeamsRoutes(app, env)
 

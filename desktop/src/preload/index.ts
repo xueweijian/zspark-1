@@ -14,6 +14,22 @@ const api = {
   scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => ipcRenderer.invoke('artifacts:scanRecent', options),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (s: any) => ipcRenderer.invoke('settings:save', s),
+  enterpriseStatus: () => ipcRenderer.invoke('enterprise:status'),
+  enterpriseLogin: () => ipcRenderer.invoke('enterprise:login'),
+  enterpriseLogout: () => ipcRenderer.invoke('enterprise:logout'),
+  enterpriseWhoami: () => ipcRenderer.invoke('enterprise:whoami'),
+  enterpriseWorkspaces: () => ipcRenderer.invoke('enterprise:workspaces'),
+  enterpriseCreateWorkspace: (name?: string) => ipcRenderer.invoke('enterprise:createWorkspace', name),
+  enterpriseSessions: (workspaceId: string) => ipcRenderer.invoke('enterprise:sessions', workspaceId),
+  enterpriseCreateSession: (workspaceId: string, body?: any) => ipcRenderer.invoke('enterprise:createSession', workspaceId, body),
+  enterpriseReadSession: (workspaceId: string, sessionId: string) => ipcRenderer.invoke('enterprise:readSession', workspaceId, sessionId),
+  enterpriseUpdateSession: (workspaceId: string, sessionId: string, body?: any) => ipcRenderer.invoke('enterprise:updateSession', workspaceId, sessionId, body),
+  enterpriseDeleteSession: (workspaceId: string, sessionId: string) => ipcRenderer.invoke('enterprise:deleteSession', workspaceId, sessionId),
+  onEnterpriseDeviceCode: (cb: (payload: { userCode?: string; verificationUri?: string; message?: string; expiresOn?: number | null }) => void) => {
+    const listener = (_e: IpcRendererEvent, payload: { userCode?: string; verificationUri?: string; message?: string; expiresOn?: number | null }) => cb(payload)
+    ipcRenderer.on('enterprise:deviceCode', listener)
+    return () => ipcRenderer.removeListener('enterprise:deviceCode', listener)
+  },
   onStdout: (cb: (s: string) => void) => {
     const listener = (_e: IpcRendererEvent, s: string) => cb(s)
     ipcRenderer.on('codex:stdout', listener)

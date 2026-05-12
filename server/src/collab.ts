@@ -1,6 +1,7 @@
 import type { FastifyInstance } from 'fastify'
 import * as Y from 'yjs'
 import { setupWSConnection } from './yws.js'
+import { canAccessWorkspace } from './workspaces.js'
 
 const docs = new Map<string, Y.Doc>()
 
@@ -16,8 +17,13 @@ export function getDoc(name: string) {
 export async function registerCollabRoutes(app: FastifyInstance) {
   app.get('/collab/rooms', async () => ({ rooms: [...docs.keys()] }))
 
-  app.get('/collab/:room', { websocket: true }, (socket, req) => {
+  app.get('/collab/:room', { websocket: true }, async (socket, req) => {
     const room = (req.params as any).room as string
+    const workspaceId = room.startsWith('workspace:') ? room.slice('workspace:'.length) : null
+    if (workspaceId && !(await canAccessWorkspace(req, workspaceId))) {
+      socket.close(1008, 'workspace access denied')
+      return
+    }
     const doc = getDoc(room)
     setupWSConnection(socket as any, req.raw, { doc, gc: true })
   })
