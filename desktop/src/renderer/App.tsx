@@ -18,6 +18,12 @@ import {
 import { normalizeMarkdownForDisplay } from './markdown'
 import { dirname, extractArtifactPathCandidates, resolveWorkspacePath } from './artifacts'
 import { formatApprovalPolicy, formatSandboxPolicy, shortPath } from './runtimeDisplay'
+import { shouldSuppressServerWarning } from './serverWarnings'
+import {
+  commandFailureNotice,
+  detectMaskedCommandFailure,
+  type CommandFailureSignal
+} from './commandSafety'
 import {
   COMPLETED_WORK_FINALIZATION_TIMEOUT_MS,
   PROVIDER_RECONNECT_AUTO_INTERRUPT_MS,
@@ -65,11 +71,10 @@ const starters = [
   { t: 'Automate a workflow', d: 'Schedule a recurring task from natural language.' }
 ]
 
-const FALLBACK_MODEL_METADATA_WARNING = 'Defaulting to fallback metadata'
 const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
 const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
 const USER_APPROVAL_REVIEWER = 'user'
-const ZSPARK_APPROVAL_POLICY = 'on-failure'
+const ZSPARK_APPROVAL_POLICY = 'on-request'
 
 let nextId = 1
 const newId = () => nextId++
@@ -311,7 +316,7 @@ function basename(path: string) {
 function stripInternalPromptContext(text: string) {
   const raw = String(text ?? '')
   const marker = raw.search(
-    /(?:^|\n\s*\n)\s*(?:Use skill:|Attached file:|Attached image:|Zspark local runtime|Hard delivery contract:|Before using @oai\/artifact-tool|Before the final answer|For PPTX\/presentation tasks|The final response must|\[Skill:)/
+    /(?:^|\n\s*\n)\s*(?:Use skill:|Attached file:|Attached image:|Zspark local runtime|Zspark execution safety:|Hard delivery contract:|Before using @oai\/artifact-tool|Before the final answer|For PPTX\/presentation tasks|The final response must|\[Skill:)/
   )
   return (marker === -1 ? raw : raw.slice(0, marker)).trim()
 }
@@ -841,6 +846,21 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
   ]
 }
 
+function executionSafetyContext(prompt: string): string[] {
+  const lower = prompt.toLowerCase()
+  const mutatesFiles = /删除|删掉|移到|移动|放到|trash|废纸篓|delete|remove|move|rename|rm\b|mv\b/.test(lower)
+  const targetsExternalPath = /桌面|desktop|downloads|documents|\/users\/|~\/|trash|废纸篓/.test(lower)
+  if (!mutatesFiles || !targetsExternalPath) return []
+  return [
+    [
+      'Zspark execution safety:',
+      '- Do not claim that a file operation completed until command output and a follow-up check prove it.',
+      '- For deleting, moving, trashing, or writing files outside the workspace, call exec_command with sandbox_permissions set to require_escalated and provide a concise justification so Zspark can show Approve/Deny.',
+      '- Use command forms that fail on permission errors; do not mask failures with a later success-looking echo.'
+    ].join('\n')
+  ]
+}
+
 function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; files: WorkspaceFile[] } {
   const blocks: Block[] = []
   const files: WorkspaceFile[] = []
@@ -1110,9 +1130,9 @@ function inferCommandInfo(command: string): ActivityInfo {
   const cleaned = cleanShellCommand(command)
   if (/build_artifact_deck\.mjs/.test(cleaned)) return { title: 'Built PPTX deck', actionKind: 'build' }
   if (/import\(['"]@oai\/artifact-tool['"]\)/.test(cleaned) || /artifact-tool ok/.test(cleaned)) return { title: 'Checked presentation runtime', actionKind: 'verify' }
-  if (/test -s|ls -lh/.test(cleaned)) return { title: 'Verified generated file', actionKind: 'verify' }
   if (/\bmkdir\b/.test(cleaned)) return { title: 'Prepared workspace', actionKind: 'write' }
-  if (/\btrash\b/.test(cleaned)) return { title: 'Move files to Trash', actionKind: 'write' }
+  if (/\btrash\b|\.Trash|~\/\.Trash|\bmv\b.+(?:Trash|\.Trash)/.test(cleaned)) return { title: 'Move files to Trash', actionKind: 'write' }
+  if (/test -s|ls -lh/.test(cleaned)) return { title: 'Verified generated file', actionKind: 'verify' }
   if (/\b(rg|grep)\b/.test(cleaned)) return { title: 'Inspected project context', actionKind: 'search' }
   if (/\b(find|ls)\b/.test(cleaned)) return { title: 'Reviewed workspace files', actionKind: 'list' }
   if (/(cat\s+>|tee\s+|apply_patch)/.test(cleaned)) return { title: 'Drafted workspace content', actionKind: 'write' }
@@ -1142,8 +1162,10 @@ function commandActivityInfo(item: any): ActivityInfo {
 
 function commandActivityDetail(item: any, info = commandActivityInfo(item)) {
   const output = String(item?.aggregated_output ?? item?.aggregatedOutput ?? '').trim()
+  const failure = detectMaskedCommandFailure(output)
   const actionDetail = info.detail || (info.target ? shortPath(info.target) : '')
   if (!output) return actionDetail || undefined
+  if (failure) return failure.detail
   if (info.actionKind === 'read' && output.length > 800) {
     return actionDetail ? `${actionDetail}\nLarge read output hidden from the activity log.` : 'Large read output hidden from the activity log.'
   }
@@ -1183,8 +1205,12 @@ function actionKindForSummary(activity: Activity): ActivityActionKind | undefine
 
 function activitySummaryLabels(activities: Activity[]) {
   const visible = activities.filter((activity) => activity.kind !== 'reasoning')
-  const counts = new Map<ActivityActionKind | 'command' | 'memory', number>()
+  const counts = new Map<ActivityActionKind | 'command' | 'memory' | 'failed', number>()
   for (const activity of visible) {
+    if (activity.status === 'failed') {
+      counts.set('failed', (counts.get('failed') ?? 0) + 1)
+      continue
+    }
     if (activity.kind === 'command') counts.set('command', (counts.get('command') ?? 0) + 1)
     if (activity.kind === 'memory') counts.set('memory', (counts.get('memory') ?? 0) + 1)
     const actionKind = actionKindForSummary(activity)
@@ -1195,6 +1221,7 @@ function activitySummaryLabels(activities: Activity[]) {
   const push = (count: number | undefined, phrase: (count: number) => string) => {
     if (count) labels.push(phrase(count))
   }
+  push(counts.get('failed'), (count) => `Blocked ${plural(count, 'step')}`)
   push(counts.get('command'), (count) => `Ran ${plural(count, 'command')}`)
   push(counts.get('tool'), (count) => `Used ${plural(count, 'tool')}`)
   push(counts.get('read'), (count) => `Read ${plural(count, 'file')}`)
@@ -1469,6 +1496,7 @@ function DesktopApp() {
   const restoredActivityThreads = useRef<Set<string>>(new Set())
   const checkedArtifactMessages = useRef<Map<string, string>>(new Map())
   const completedWorkByTurn = useRef<Map<string, Set<CompletedTurnWorkKind>>>(new Map())
+  const commandFailuresByTurn = useRef<Map<string, CommandFailureSignal>>(new Map())
   const completedWorkStallTimers = useRef<Map<string, number>>(new Map())
   const providerRetryTimers = useRef<Map<string, number>>(new Map())
   const interruptFallbackTimers = useRef<Map<string, number>>(new Map())
@@ -1554,6 +1582,7 @@ function DesktopApp() {
     appliedReasoningCompletions.current.clear()
     recentNotificationLines.current.clear()
     completedWorkByTurn.current.clear()
+    commandFailuresByTurn.current.clear()
     interruptingTurns.current.clear()
   }
   const refreshRuntimeHost = async () => {
@@ -1792,6 +1821,21 @@ function DesktopApp() {
     updateTurn(turnId, (t) => ({ ...t, activities: t.activities.map((a) => (a.id === actId ? { ...a, detail: (a.detail ?? '') + delta } : a)) }))
   }
   const appendAgentText = (turnId: string, blockId: string, delta: string) => {
+    const failure = commandFailuresByTurn.current.get(turnId)
+    if (failure) {
+      const notice = commandFailureNotice(failure)
+      setBlocks((bs) => {
+        let found = false
+        const next = bs.map((b) => {
+          if (b.type !== 'agent' || b.id !== blockId) return b
+          found = true
+          return { ...b, text: notice, turnId }
+        })
+        return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: notice, turnId }]
+      })
+      updateTurn(turnId, (t) => (t.finalMessageId ? t : { ...t, finalMessageId: blockId }))
+      return
+    }
     setBlocks((bs) => {
       let found = false
       const next = bs.map((b) => {
@@ -1803,6 +1847,13 @@ function DesktopApp() {
     })
     // Also link the turn block to this agent block as its final message.
     updateTurn(turnId, (t) => (t.finalMessageId ? t : { ...t, finalMessageId: blockId }))
+  }
+  const recordCommandFailure = (turnId: string, failure: CommandFailureSignal) => {
+    commandFailuresByTurn.current.set(turnId, failure)
+    const notice = commandFailureNotice(failure)
+    setBlocks((bs) => bs.map((b) => (
+      b.type === 'agent' && b.turnId === turnId ? { ...b, text: notice } : b
+    )))
   }
   const setApprovalStatus = (key: string, status: ApprovalStatus) => {
     const current = approvalRequests.current.get(key)
@@ -2119,7 +2170,7 @@ function DesktopApp() {
           // codex Responses API shape). Surface it instead of swallowing.
           if (method === 'warning') {
             const wm = params?.message ?? ''
-            if (wm.includes(FALLBACK_MODEL_METADATA_WARNING)) return
+            if (shouldSuppressServerWarning(wm)) return
             if (wm) toast('warn', wm)
             return
           }
@@ -2210,7 +2261,10 @@ function DesktopApp() {
             // providers stream only the first chunk via deltas (or send no
             // deltas at all) and put the rest in the final completed item.
             // Always overwrite the bubble with the canonical text.
-            const txt = item.text ?? (Array.isArray(item.content) ? item.content.map((c: any) => c.text ?? '').join('') : '')
+            const failure = commandFailuresByTurn.current.get(turnId)
+            const txt = failure
+              ? commandFailureNotice(failure)
+              : item.text ?? (Array.isArray(item.content) ? item.content.map((c: any) => c.text ?? '').join('') : '')
             if (!txt) return
             const memoryCitation = normalizeMemoryCitation(item.memoryCitation)
             const blockId = agentForTurn.current.get(turnId) ?? `agent-${turnId}-final`
@@ -2288,17 +2342,23 @@ function DesktopApp() {
             if (method === 'item/started') {
               ensureActivity(turnId, itemId, { kind: 'command', title: info.title, detail: info.detail, actionKind: info.actionKind, target: info.target })
             } else {
+              const output = String(item?.aggregated_output ?? item?.aggregatedOutput ?? '')
+              const maskedFailure = detectMaskedCommandFailure(output)
               const status: Activity['status'] =
+                maskedFailure ? 'failed' :
                 item.status === 'completed' ? 'done' :
                 item.status === 'failed' ? 'failed' : 'done'
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'command', title: info.title, actionKind: info.actionKind, target: info.target })
               updateActivity(turnId, itemActivity.current.get(itemId)!, {
                 status, endedAt: Date.now(),
                 detail: commandActivityDetail(item, info),
-                title: info.title,
+                title: maskedFailure?.title ?? info.title,
                 actionKind: info.actionKind,
                 target: info.target
               })
+              if (maskedFailure) {
+                recordCommandFailure(turnId, maskedFailure)
+              }
               if (status === 'done') {
                 noteCompletedTurnWork(turnId, 'command')
                 const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
@@ -2736,6 +2796,7 @@ function DesktopApp() {
         }
       }
       contextLines.push(...officeRuntimeContext(currentSkills, runtimeRef.current))
+      contextLines.push(...executionSafetyContext(text))
       for (const attachment of currentAttachments) {
         if (attachment.kind === 'image') {
           inputItems.push({ type: 'localImage', path: attachment.path })
@@ -3077,6 +3138,7 @@ function DesktopApp() {
               }
               const dur = (b.endedAt ?? clock) - b.startedAt
               const running = !b.endedAt
+              const failed = b.activities.some((a) => a.status === 'failed')
               const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
               const summaryLabels = activitySummaryLabels(meaningful)
               const visibleActivities = displayActivities(b.activities)
@@ -3089,10 +3151,10 @@ function DesktopApp() {
                 <div key={b.id} className={`activity-card${b.collapsed ? ' collapsed' : ''}${running ? ' running' : ''}`}>
                   <div className="activity-head" onClick={() => toggleTurn(b.turnId)}>
                     <div className="head-left">
-                      <span className={`spinner${running ? ' spin' : ''}`} />
+                      <span className={`spinner${running ? ' spin' : ''}${failed ? ' failed' : ''}`} />
                       <div className="head-copy">
                         <div className="head-line">
-                          <span className="head-title">{running ? 'Working' : 'Completed'}</span>
+                          <span className="head-title">{running ? 'Working' : failed ? 'Needs attention' : 'Completed'}</span>
                           <span className="head-meta">Activity log · {fmtDuration(dur)} · {stepsLabel}</span>
                         </div>
                       </div>

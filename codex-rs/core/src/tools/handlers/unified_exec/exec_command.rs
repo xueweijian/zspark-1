@@ -322,6 +322,18 @@ impl ToolHandler for ExecCommandHandler {
             Ok(response) => Ok(response),
             Err(UnifiedExecError::SandboxDenied { output, .. }) => {
                 let output_text = output.aggregated_output.text;
+                let output_text = if output_text.trim().is_empty() {
+                    "Command was blocked by the sandbox and did not complete.".to_string()
+                } else {
+                    format!(
+                        "Command was blocked by the sandbox and did not complete.\n\n{output_text}"
+                    )
+                };
+                let exit_code = if output.exit_code == 0 {
+                    1
+                } else {
+                    output.exit_code
+                };
                 let original_token_count = approx_token_count(&output_text);
                 Ok(ExecCommandToolOutput {
                     event_call_id: context.call_id.clone(),
@@ -332,7 +344,7 @@ impl ToolHandler for ExecCommandHandler {
                     // Sandbox denial is terminal, so there is no live
                     // process for write_stdin to resume.
                     process_id: None,
-                    exit_code: Some(output.exit_code),
+                    exit_code: Some(exit_code),
                     original_token_count: Some(original_token_count),
                     hook_command: Some(hook_command),
                 })
