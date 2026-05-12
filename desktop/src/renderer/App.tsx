@@ -4,7 +4,8 @@ import DOMPurify from 'dompurify'
 import {
   IconNewChat, IconSearch, IconSkills, IconPlugins, IconAutomations,
   IconProject, IconSend, IconClose, IconSettings, IconChevron,
-  IconBrain, IconTerminal, IconFile, IconImage, IconTool, IconGlobe
+  IconBrain, IconTerminal, IconFile, IconImage, IconTool, IconGlobe,
+  IconCopy, IconRegenerate, IconTrash
 } from './icons'
 import {
   filterSkillCatalog,
@@ -99,10 +100,11 @@ interface Activity {
 type ActivityInfo = { title: string; detail?: string; actionKind: ActivityActionKind; target?: string }
 
 type Block =
-  | { type: 'user'; id: string; text: string; turnId?: string }
-  | { type: 'agent'; id: string; text: string }
+  | { type: 'user'; id: string; text: string; turnId?: string; input?: TurnInputItem[] }
+  | { type: 'agent'; id: string; text: string; turnId?: string }
   | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[]; subtitle?: string; tone?: 'normal' | 'warn' }
   | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
+type MessageBlock = Extract<Block, { type: 'user' | 'agent' }>
 
 type ToastKind = 'info' | 'warn' | 'error'
 interface Toast { id: string; kind: ToastKind; text: string }
@@ -213,9 +215,11 @@ interface WorkspaceFile {
 }
 
 type TurnInputItem =
-  | { type: 'text'; text: string; textElements: any[] }
+  | { type: 'text'; text: string; textElements?: any[]; text_elements?: any[] }
+  | { type: 'image'; url: string }
   | { type: 'localImage'; path: string }
   | { type: 'skill'; name: string; path: string }
+  | { type: 'mention'; name: string; path: string }
 
 function fmtDuration(ms: number) {
   const s = Math.round(ms / 1000)
@@ -285,6 +289,33 @@ function formatUserInputContent(content: any[]) {
   return ''
 }
 
+function normalizeInputItemsForResubmit(content: any[]): TurnInputItem[] {
+  const items: TurnInputItem[] = []
+  for (const c of content) {
+    if (c?.type === 'text') {
+      const text = String(c.text ?? '')
+      if (text) items.push({ type: 'text', text, textElements: c.textElements ?? c.text_elements ?? [] })
+      continue
+    }
+    if (c?.type === 'image' && c.url) {
+      items.push({ type: 'image', url: String(c.url) })
+      continue
+    }
+    if (c?.type === 'localImage' && c.path) {
+      items.push({ type: 'localImage', path: String(c.path) })
+      continue
+    }
+    if (c?.type === 'skill' && c.name && c.path) {
+      items.push({ type: 'skill', name: String(c.name), path: String(c.path) })
+      continue
+    }
+    if (c?.type === 'mention' && c.name && c.path) {
+      items.push({ type: 'mention', name: String(c.name), path: String(c.path) })
+    }
+  }
+  return items
+}
+
 function scopeLabel(scope?: string) {
   switch (scope) {
     case 'repo': return 'Project'
@@ -342,6 +373,34 @@ function Markdown({ text }: { text: string }) {
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />
 }
 
+function MessageActions({
+  onCopy,
+  onDelete,
+  onRegenerate,
+  disabled,
+  copyDisabled
+}: {
+  onCopy: () => void
+  onDelete: () => void
+  onRegenerate: () => void
+  disabled?: boolean
+  copyDisabled?: boolean
+}) {
+  return (
+    <div className="message-actions" aria-label="Message actions">
+      <button className="message-action" onClick={onCopy} disabled={copyDisabled} aria-label="Copy" title="Copy">
+        <IconCopy />
+      </button>
+      <button className="message-action" onClick={onRegenerate} disabled={disabled} aria-label="Regenerate" title="Regenerate">
+        <IconRegenerate />
+      </button>
+      <button className="message-action danger" onClick={onDelete} disabled={disabled} aria-label="Delete" title="Delete">
+        <IconTrash />
+      </button>
+    </div>
+  )
+}
+
 function filesFromChanges(changes: any[], base?: string, now = Date.now()): WorkspaceFile[] {
   return changes.map((change, index) => {
     const fullPath = resolveWorkspacePath(String(change.path ?? ''), base)
@@ -389,6 +448,8 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
       'For PPTX/presentation tasks, use the installed Presentations scripts instead of hand-waving:',
       `- SKILL_DIR: ${presentationSkillDir}`,
       `- Build/export helper: "${rt.nodePath}" "${presentationSkillDir}/scripts/build_artifact_deck.mjs" --slides-dir "$SLIDES_DIR" --out "$FINAL_PPTX" --preview-dir "$PREVIEW_DIR" --layout-dir "$LAYOUT_DIR"`,
+      'Artifact-tool compose rules: write plain ESM slide modules, not raw JSX/HTML; `panel` accepts one child; use `row`/`column` with array children; `justify` values are start, center, end, or stretch.',
+      'If the build helper fails, patch the slide source and rerun it until `test -s "$FINAL_PPTX"` passes.',
       'The final response must include only a PPTX path that exists after the verification command.'
     )
   }
@@ -426,13 +487,13 @@ function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; 
     for (const item of items) {
       if (item?.type === 'userMessage') {
         const txt = formatUserInputContent(item.content ?? [])
-        if (txt) userBlocks.push({ type: 'user', id: `replay-u-${item.id}`, text: txt, turnId })
+        if (txt) userBlocks.push({ type: 'user', id: `replay-u-${item.id}`, text: txt, turnId, input: normalizeInputItemsForResubmit(item.content ?? []) })
       } else if (item?.type === 'reasoning' || item?.type === 'commandExecution' || item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall' || item?.type === 'webSearch') {
         const activity = replayActivityFromItem(item, startedAt)
         if (activity) ensureTurnBlock().activities.push(activity)
       } else if (item?.type === 'agentMessage') {
         const txt = item.text ?? ''
-        if (txt) agentBlocks.push({ type: 'agent', id: `replay-a-${item.id}`, text: txt })
+        if (txt) agentBlocks.push({ type: 'agent', id: `replay-a-${item.id}`, text: txt, turnId })
       } else if (item?.type === 'fileChange') {
         const activity = replayActivityFromItem(item, startedAt)
         if (activity) ensureTurnBlock().activities.push(activity)
@@ -628,14 +689,23 @@ function commandActionInfo(action: any): ActivityInfo | null {
   const target = action?.path ? String(action.path) : undefined
   const name = String(action?.name ?? (target ? basename(target) : '')).trim()
   const label = name || (target ? basename(target) : 'file')
+  if (target && /\/presentations\/[^/]+\/skills\/presentations\/SKILL\.md$/.test(target)) {
+    return { title: 'Loaded presentation skill', actionKind: 'read', target }
+  }
+  if (target && /\/skills\/(?:presentations|documents|spreadsheets)\//.test(target)) {
+    return { title: 'Checked Office tooling', actionKind: 'read', target }
+  }
+  if (target && /\/slides\/slide[-_]\d+\.mjs$/i.test(target)) {
+    return { title: `Drafted ${label.replace(/\.mjs$/i, '')}`, actionKind: 'write', target }
+  }
   if (actionType === 'read') {
-    return { title: `Read ${label}`, detail: target ? shortPath(target) : undefined, actionKind: 'read', target }
+    return { title: `Read ${label}`, actionKind: 'read', target }
   }
   if (actionType === 'write' || actionType === 'update') {
-    return { title: `Wrote ${label}`, detail: target ? shortPath(target) : undefined, actionKind: 'write', target }
+    return { title: `Wrote ${label}`, actionKind: 'write', target }
   }
   if (actionType === 'delete') {
-    return { title: `Deleted ${label}`, detail: target ? shortPath(target) : undefined, actionKind: 'write', target }
+    return { title: `Deleted ${label}`, actionKind: 'write', target }
   }
   if (action?.command) return inferCommandInfo(String(action.command))
   return null
@@ -646,16 +716,16 @@ function inferCommandInfo(command: string): ActivityInfo {
   if (/build_artifact_deck\.mjs/.test(cleaned)) return { title: 'Built PPTX deck', actionKind: 'build' }
   if (/import\(['"]@oai\/artifact-tool['"]\)/.test(cleaned) || /artifact-tool ok/.test(cleaned)) return { title: 'Checked presentation runtime', actionKind: 'verify' }
   if (/test -s|ls -lh/.test(cleaned)) return { title: 'Verified generated file', actionKind: 'verify' }
-  if (/\bmkdir\b/.test(cleaned)) return { title: 'Prepared workspace folders', actionKind: 'write' }
-  if (/\b(rg|grep)\b/.test(cleaned)) return { title: 'Searched workspace', detail: shortenCommand(cleaned, 96), actionKind: 'search' }
-  if (/\b(find|ls)\b/.test(cleaned)) return { title: 'Listed workspace files', detail: shortenCommand(cleaned, 96), actionKind: 'list' }
-  if (/(cat\s+>|tee\s+|apply_patch)/.test(cleaned)) return { title: 'Wrote workspace files', actionKind: 'write' }
-  if (/\b(cat|sed|head|tail)\b/.test(cleaned)) return { title: 'Read file content', detail: shortenCommand(cleaned, 96), actionKind: 'read' }
-  if (/\bnpm\s+run\s+(typecheck|test|build)\b|\b(pnpm|yarn)\s+(test|build|typecheck)\b/.test(cleaned)) return { title: 'Ran project checks', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
+  if (/\bmkdir\b/.test(cleaned)) return { title: 'Prepared workspace', actionKind: 'write' }
+  if (/\b(rg|grep)\b/.test(cleaned)) return { title: 'Inspected project context', actionKind: 'search' }
+  if (/\b(find|ls)\b/.test(cleaned)) return { title: 'Reviewed workspace files', actionKind: 'list' }
+  if (/(cat\s+>|tee\s+|apply_patch)/.test(cleaned)) return { title: 'Drafted workspace content', actionKind: 'write' }
+  if (/\b(cat|sed|head|tail)\b/.test(cleaned)) return { title: 'Read source material', actionKind: 'read' }
+  if (/\bnpm\s+run\s+(typecheck|test|build)\b|\b(pnpm|yarn)\s+(test|build|typecheck)\b/.test(cleaned)) return { title: 'Ran quality checks', actionKind: 'run' }
   if (/\bgit\s+status\b/.test(cleaned)) return { title: 'Checked git status', actionKind: 'run' }
   if (/\bgit\s+commit\b/.test(cleaned)) return { title: 'Created git commit', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
   if (/\bgit\s+push\b/.test(cleaned)) return { title: 'Pushed branch', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
-  return { title: `Ran ${shortenCommand(cleaned)}`, detail: shortenCommand(cleaned, 120), actionKind: 'run' }
+  return { title: 'Ran workspace step', actionKind: 'run' }
 }
 
 function commandActivityInfo(item: any): ActivityInfo {
@@ -667,9 +737,8 @@ function commandActivityInfo(item: any): ActivityInfo {
   if (actions.length > 1) {
     const firstKind = actions[0].actionKind
     const sameKind = actions.every((action) => action.actionKind === firstKind)
-    const targets = actions.map((action) => action.target).filter(Boolean).slice(0, 6)
-    if (sameKind && firstKind === 'read') return { title: `Read ${actions.length} files`, detail: targets.map((target) => shortPath(target)).join('\n'), actionKind: 'read' }
-    if (sameKind && firstKind === 'write') return { title: `Wrote ${actions.length} files`, detail: targets.map((target) => shortPath(target)).join('\n'), actionKind: 'write' }
+    if (sameKind && firstKind === 'read') return { title: `Read ${actions.length} files`, actionKind: 'read' }
+    if (sameKind && firstKind === 'write') return { title: `Wrote ${actions.length} files`, actionKind: 'write' }
     return { title: `Ran ${actions.length} command actions`, detail: actions.map((action) => action.title).join('\n'), actionKind: 'run' }
   }
   return inferCommandInfo(command)
@@ -738,6 +807,58 @@ function activitySummaryLabels(activities: Activity[]) {
   push(counts.get('verify'), (count) => `Verified ${plural(count, 'result')}`)
   push(counts.get('file'), (count) => `Changed ${plural(count, 'file')}`)
   return labels
+}
+
+function publicActivityTitle(activity: Activity) {
+  const title = activity.title.trim()
+  if (/^Read SKILL\.md$/i.test(title)) return 'Loaded presentation skill'
+  if (/^Read (?:build_artifact_deck|artifact_tool_utils|index)\.mjs$/i.test(title)) return 'Checked Office tooling'
+  if (/^Read slide[-_]\d+\.mjs$/i.test(title)) return 'Reviewed slide source'
+  if (/^Prepared workspace folders$/i.test(title)) return 'Prepared workspace'
+  if (/^Wrote workspace files$/i.test(title)) return 'Drafted workspace content'
+  if (/^Listed workspace files$/i.test(title)) return 'Reviewed workspace files'
+  if (/^Read file content$/i.test(title)) return 'Read source material'
+  if (/^Searched workspace$/i.test(title)) return 'Inspected project context'
+  if (/^read_mcp_resource$/i.test(title)) return 'Used MCP resource'
+  if (/^tool call$/i.test(title)) return 'Used tool'
+  if (/^Ran \d+ command actions$/i.test(title)) return 'Ran workspace step'
+  if (/^Ran (?:cd |node -e|["']?\/Users\/)/i.test(title)) return 'Ran workspace step'
+  if (/\/Users\/|\.cache\/codex-runtimes|node_modules/.test(title)) return 'Ran workspace step'
+  return title
+}
+
+function publicActivityDetail(activity: Activity) {
+  const detail = activity.detail?.trim()
+  if (!detail) return undefined
+  if (activity.kind === 'reasoning') return detail
+  return undefined
+}
+
+function displayActivities(activities: Activity[]) {
+  const visible: Array<Activity & { displayTitle: string; repeatCount: number }> = []
+  for (const activity of activities) {
+    const displayTitle = publicActivityTitle(activity)
+    const previous = visible[visible.length - 1]
+    if (
+      previous &&
+      previous.displayTitle === displayTitle &&
+      previous.status === activity.status &&
+      previous.kind === activity.kind
+    ) {
+      previous.repeatCount += 1
+      previous.endedAt = activity.endedAt ?? previous.endedAt
+      const existingDetail = previous.detail?.trim()
+      const nextDetail = activity.detail?.trim()
+      if (nextDetail && !existingDetail) {
+        previous.detail = nextDetail
+      } else if (nextDetail && existingDetail && !existingDetail.includes(nextDetail)) {
+        previous.detail = `${existingDetail}\n\n${nextDetail}`
+      }
+      continue
+    }
+    visible.push({ ...activity, displayTitle, repeatCount: 1 })
+  }
+  return visible
 }
 
 function itemTimeMs(item: any, key: 'startedAtMs' | 'completedAtMs', fallback: number) {
@@ -905,6 +1026,7 @@ function DesktopApp() {
   const [ready, setReady] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [submitting, setSubmitting] = useState(false)
+  const [messageActionBusy, setMessageActionBusy] = useState(false)
   const [clock, setClock] = useState(Date.now())
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
@@ -1149,7 +1271,7 @@ function DesktopApp() {
       ], turnId)
     })
   }
-  const upsertUserBlock = (turnId: string, itemId: string, text: string) => {
+  const upsertUserBlock = (turnId: string, itemId: string, text: string, input?: TurnInputItem[]) => {
     if (!text) return
     const id = `user-${itemId}`
     setBlocks((bs) => {
@@ -1157,10 +1279,10 @@ function DesktopApp() {
       const next = bs.map((b) => {
         if (b.id !== id || b.type !== 'user') return b
         found = true
-        return { ...b, text, turnId }
+        return { ...b, text, turnId, input }
       })
       if (found) return orderBlocksForTurn(next, turnId)
-      const block: Block = { type: 'user', id, text, turnId }
+      const block: Block = { type: 'user', id, text, turnId, input }
       const turnIndex = bs.findIndex((b) => b.type === 'turn' && b.turnId === turnId)
       const withBlock = turnIndex === -1 ? [...bs, block] : [...bs.slice(0, turnIndex), block, ...bs.slice(turnIndex)]
       return orderBlocksForTurn(withBlock, turnId)
@@ -1192,9 +1314,9 @@ function DesktopApp() {
       const next = bs.map((b) => {
         if (b.type !== 'agent' || b.id !== blockId) return b
         found = true
-        return { ...b, text: b.text + delta }
+        return { ...b, text: b.text + delta, turnId }
       })
-      return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: delta }]
+      return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: delta, turnId }]
     })
     // Also link the turn block to this agent block as its final message.
     updateTurn(turnId, (t) => (t.finalMessageId ? t : { ...t, finalMessageId: blockId }))
@@ -1290,7 +1412,7 @@ function DesktopApp() {
           if (!agentBlockId) {
             agentBlockId = `agent-${turnId}`
             agentForTurn.current.set(turnId, agentBlockId)
-            setBlocks((bs) => [...bs, { type: 'agent', id: agentBlockId!, text: '' }])
+            setBlocks((bs) => [...bs, { type: 'agent', id: agentBlockId!, text: '', turnId }])
           }
           appendAgentText(turnId, agentBlockId, params.delta ?? '')
           return
@@ -1329,7 +1451,7 @@ function DesktopApp() {
             if (method === 'item/started') {
               const txt = formatUserInputContent(item.content ?? [])
               if (inputRef.current.trim() === txt.trim()) clearComposerText()
-              upsertUserBlock(turnId, String(item.id ?? `user-${turnId}`), txt)
+              upsertUserBlock(turnId, String(item.id ?? `user-${turnId}`), txt, normalizeInputItemsForResubmit(item.content ?? []))
             }
             return
           }
@@ -1347,9 +1469,9 @@ function DesktopApp() {
               const next = bs.map((b) => {
                 if (b.type !== 'agent' || b.id !== blockId) return b
                 found = true
-                return { ...b, text: txt }
+                return { ...b, text: txt, turnId }
               })
-              return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: txt }]
+              return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: txt, turnId }]
             })
             updateTurn(turnId, (t) => ({ ...t, finalMessageId: blockId }))
             void verifyArtifactClaims(turnId, String(item.id ?? `agent-${turnId}`), txt)
@@ -1779,52 +1901,59 @@ function DesktopApp() {
       } catch {}
     }
   }
-  const submit = async (override?: string) => {
+  const submit = async (
+    override?: string,
+    options: { inputItems?: TurnInputItem[]; attachments?: AttachmentMeta[]; skills?: SkillMeta[]; clearComposer?: boolean } = {}
+  ) => {
     const fromComposer = override === undefined
+    const providedInput = options.inputItems?.filter(Boolean) ?? []
+    const currentAttachments = options.attachments ?? (fromComposer ? attachments : [])
+    const currentSkills = options.skills ?? (fromComposer ? selectedSkills : [])
     const rawText = (override ?? input).trim()
     if (streaming || submitInFlight.current) {
       toast('warn', 'Current turn is still running. Stop it or wait before sending another message.')
       return
     }
-    if ((!rawText && attachments.length === 0 && selectedSkills.length === 0) || !ready) return
+    if ((!rawText && currentAttachments.length === 0 && currentSkills.length === 0 && providedInput.length === 0) || !ready) return
     submitInFlight.current = true
     setSubmitting(true)
     stickToBottom.current = true
     setShowJumpToLatest(false)
-    const currentAttachments = attachments
-    const currentSkills = selectedSkills
     const text = rawText || (currentAttachments.length ? suggestedPromptForAttachments(currentAttachments) : '')
-    if (fromComposer) {
+    const shouldClearComposer = fromComposer || options.clearComposer === true
+    if (shouldClearComposer) {
       clearComposerText()
       setAttachments([])
       setSelectedSkills([])
     }
-    const inputItems: TurnInputItem[] = []
-    const contextLines: string[] = []
-    for (const skill of currentSkills) {
-      if (skill.path) {
-        inputItems.push({ type: 'skill', name: skill.name, path: skill.path })
-        contextLines.push(`Use skill: ${skill.name}`)
+    let inputItems: TurnInputItem[] = [...providedInput]
+    if (inputItems.length === 0) {
+      const contextLines: string[] = []
+      for (const skill of currentSkills) {
+        if (skill.path) {
+          inputItems.push({ type: 'skill', name: skill.name, path: skill.path })
+          contextLines.push(`Use skill: ${skill.name}`)
+        }
       }
-    }
-    contextLines.push(...officeRuntimeContext(currentSkills, runtimeRef.current))
-    for (const attachment of currentAttachments) {
-      if (attachment.kind === 'image') {
-        inputItems.push({ type: 'localImage', path: attachment.path })
-        contextLines.push(`Attached image: ${attachment.name} (workspace copy: ${attachment.path})`)
-      } else {
-        contextLines.push(`Attached file: ${attachment.name} (writable workspace copy: ${attachment.path})`)
+      contextLines.push(...officeRuntimeContext(currentSkills, runtimeRef.current))
+      for (const attachment of currentAttachments) {
+        if (attachment.kind === 'image') {
+          inputItems.push({ type: 'localImage', path: attachment.path })
+          contextLines.push(`Attached image: ${attachment.name} (workspace copy: ${attachment.path})`)
+        } else {
+          contextLines.push(`Attached file: ${attachment.name} (writable workspace copy: ${attachment.path})`)
+        }
       }
-    }
-    if (text || contextLines.length) {
-      const message = [text, ...contextLines].filter(Boolean).join('\n\n')
-      inputItems.unshift({ type: 'text', text: message, textElements: [] })
+      if (text || contextLines.length) {
+        const message = [text, ...contextLines].filter(Boolean).join('\n\n')
+        inputItems.unshift({ type: 'text', text: message, textElements: [] })
+      }
     }
     let accepted = false
     try {
       const res = await send('turn/start', { threadId: thread, input: inputItems })
       if (res.error) {
-        if (fromComposer) {
+        if (shouldClearComposer) {
           setInput(text)
           setAttachments(currentAttachments)
           setSelectedSkills(currentSkills)
@@ -1841,7 +1970,7 @@ function DesktopApp() {
         }, 3000)
       }
     } catch (e: any) {
-      if (fromComposer) {
+      if (shouldClearComposer) {
         setInput(text)
         setAttachments(currentAttachments)
         setSelectedSkills(currentSkills)
@@ -1856,6 +1985,122 @@ function DesktopApp() {
       }
     }
   }
+
+  const turnIdsFromBlocks = (source = blocks) => {
+    const ids: string[] = []
+    const seen = new Set<string>()
+    for (const block of source) {
+      const turnId = 'turnId' in block ? block.turnId : undefined
+      if (turnId && !seen.has(turnId)) {
+        seen.add(turnId)
+        ids.push(turnId)
+      }
+    }
+    return ids
+  }
+
+  const replaceBlocksFromThread = (threadForReplay: any) => {
+    const threadId = threadForReplay?.id ?? thread
+    const replay = blocksFromThreadTurns(threadForReplay?.turns ?? [], runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot)
+    const restoredBlocks = threadId ? mergePersistedActivityBlocks(replay.blocks, loadPersistedActivityBlocks(threadId)) : replay.blocks
+    if (replay.files.length) upsertWorkspaceFiles(replay.files)
+    setBlocks(restoredBlocks)
+  }
+
+  const rollbackFromTurn = async (turnId: string, action: 'delete' | 'regenerate') => {
+    if (!ready || !thread) return false
+    const turnIds = turnIdsFromBlocks()
+    const index = turnIds.indexOf(turnId)
+    if (index === -1) return false
+    const numTurns = turnIds.length - index
+    if (numTurns > 1) {
+      const label = action === 'regenerate' ? 'Regenerate' : 'Delete'
+      if (!confirm(`${label} this turn? This will remove this turn and ${numTurns - 1} later turn${numTurns === 2 ? '' : 's'} from model context.`)) {
+        return false
+      }
+    }
+    setMessageActionBusy(true)
+    try {
+      const res = await send('thread/rollback', { threadId: thread, numTurns })
+      if (res.error) throw new Error(res.error.message)
+      resetLiveTurnState()
+      applyThreadRuntime(res.result)
+      setThread(res.result?.thread?.id ?? thread)
+      replaceBlocksFromThread(res.result?.thread)
+      return true
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+      return false
+    } finally {
+      setMessageActionBusy(false)
+    }
+  }
+
+  const findSourceUserBlock = (block: MessageBlock) => {
+    if (block.type === 'user') return block
+    const index = blocks.findIndex((candidate) => candidate.id === block.id)
+    for (let i = index - 1; i >= 0; i -= 1) {
+      const candidate = blocks[i]
+      if (candidate?.type === 'user') return candidate
+    }
+    return undefined
+  }
+
+  const copyMessageBlock = async (block: MessageBlock) => {
+    const text = block.type === 'user' ? stripInternalPromptContext(block.text) : block.text.trim()
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      toast('info', 'Copied')
+    } catch (err: any) {
+      const textarea = document.createElement('textarea')
+      textarea.value = text
+      textarea.setAttribute('readonly', 'true')
+      textarea.style.position = 'fixed'
+      textarea.style.left = '-9999px'
+      document.body.appendChild(textarea)
+      textarea.select()
+      const copied = document.execCommand('copy')
+      document.body.removeChild(textarea)
+      if (copied) toast('info', 'Copied')
+      else toast('error', err?.message ?? 'Could not copy message')
+    }
+  }
+
+  const deleteMessageBlock = async (block: MessageBlock) => {
+    if (streaming || submitInFlight.current || messageActionBusy) {
+      toast('warn', 'Current turn is still running. Stop it or wait before editing history.')
+      return
+    }
+    const source = findSourceUserBlock(block)
+    const turnId = block.turnId ?? source?.turnId
+    if (turnId) {
+      const didRollback = await rollbackFromTurn(turnId, 'delete')
+      if (didRollback) toast('info', 'Removed from context')
+      return
+    }
+    setBlocks((bs) => bs.filter((candidate) => candidate.id !== block.id))
+    toast('info', 'Hidden locally')
+  }
+
+  const regenerateMessageBlock = async (block: MessageBlock) => {
+    if (streaming || submitInFlight.current || messageActionBusy) {
+      toast('warn', 'Current turn is still running. Stop it or wait before regenerating.')
+      return
+    }
+    const source = findSourceUserBlock(block)
+    const text = stripInternalPromptContext(source?.text ?? '')
+    if (!source || !text) {
+      toast('warn', 'No user prompt found for this response.')
+      return
+    }
+    if (source.turnId) {
+      const didRollback = await rollbackFromTurn(source.turnId, 'regenerate')
+      if (!didRollback) return
+    }
+    await submit(text, { inputItems: source.input?.length ? source.input : undefined })
+  }
+
   const onKey = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (streaming || submitInFlight.current) {
       e.preventDefault()
@@ -1943,8 +2188,36 @@ function DesktopApp() {
             </div>
           ) : (
             blocks.map((b) => {
-              if (b.type === 'user') return <div key={b.id} className="bubble user">{stripInternalPromptContext(b.text)}</div>
-              if (b.type === 'agent') return <div key={b.id} className={`bubble assistant${streaming && b.id === streamingAgentId ? ' streaming' : ''}`}><Markdown text={b.text} /></div>
+              if (b.type === 'user') {
+                const visibleText = stripInternalPromptContext(b.text)
+                return (
+                  <div key={b.id} className="message-wrap user">
+                    <div className="bubble user">{visibleText}</div>
+                    <MessageActions
+                      onCopy={() => void copyMessageBlock(b)}
+                      onDelete={() => void deleteMessageBlock(b)}
+                      onRegenerate={() => void regenerateMessageBlock(b)}
+                      disabled={composerBusy || messageActionBusy}
+                      copyDisabled={!visibleText}
+                    />
+                  </div>
+                )
+              }
+              if (b.type === 'agent') {
+                const isStreamingAgent = streaming && b.id === streamingAgentId
+                return (
+                  <div key={b.id} className="message-wrap assistant">
+                    <div className={`bubble assistant${isStreamingAgent ? ' streaming' : ''}`}><Markdown text={b.text} /></div>
+                    <MessageActions
+                      onCopy={() => void copyMessageBlock(b)}
+                      onDelete={() => void deleteMessageBlock(b)}
+                      onRegenerate={() => void regenerateMessageBlock(b)}
+                      disabled={composerBusy || messageActionBusy || isStreamingAgent}
+                      copyDisabled={!b.text.trim()}
+                    />
+                  </div>
+                )
+              }
               if (b.type === 'files') {
                 return (
                   <div key={b.id} className={`artifact-card${b.tone === 'warn' ? ' warn' : ''}`}>
@@ -1978,6 +2251,7 @@ function DesktopApp() {
               const running = !b.endedAt
               const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
               const summaryLabels = activitySummaryLabels(meaningful)
+              const visibleActivities = displayActivities(b.activities)
               const stepsLabel = summaryLabels.length
                 ? summaryLabels.slice(0, 2).join(' · ')
                 : meaningful.length === 0
@@ -2004,18 +2278,22 @@ function DesktopApp() {
                           {summaryLabels.map((label) => <span key={label} className="activity-pill">{label}</span>)}
                         </div>
                       )}
-                      {b.activities.length === 0 ? (
+                      {visibleActivities.length === 0 ? (
                         <div className="empty-act">Preparing…</div>
-                      ) : b.activities.map((a) => {
+                      ) : visibleActivities.map((a) => {
                         const isPlaceholder = a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail && a.status === 'running'
+                        const detail = publicActivityDetail(a)
                         return (
                           <div key={a.id} className={`act act-${a.kind} act-${a.status}`}>
                             <div className="act-icon">{actIcon(a.kind)}</div>
                             <div className="act-meat">
-                              <div className="act-title">{a.title}{isPlaceholder ? ' · waiting for first token' : ''}</div>
-                              {a.target && !a.detail && <div className="act-target">{shortPath(a.target)}</div>}
-                              {a.detail && a.kind === 'command' && <pre className="act-detail mono">{a.detail}</pre>}
-                              {a.detail && a.kind !== 'command' && <div className="act-detail">{a.detail}</div>}
+                              <div className="act-title">
+                                {a.displayTitle}
+                                {a.repeatCount > 1 ? ` x${a.repeatCount}` : ''}
+                                {isPlaceholder ? ' · waiting for first token' : ''}
+                              </div>
+                              {detail && <div className="act-detail">{detail}</div>}
+                              {a.status === 'failed' && <div className="act-note">Needs attention</div>}
                             </div>
                             <div className="act-status">
                               {a.status === 'running' ? '· · ·' :
