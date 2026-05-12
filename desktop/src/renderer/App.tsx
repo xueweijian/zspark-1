@@ -18,6 +18,14 @@ import {
 import { normalizeMarkdownForDisplay } from './markdown'
 import { dirname, extractArtifactPathCandidates, resolveWorkspacePath } from './artifacts'
 import { formatApprovalPolicy, formatSandboxPolicy, shortPath } from './runtimeDisplay'
+import {
+  COMPLETED_WORK_FINALIZATION_TIMEOUT_MS,
+  PROVIDER_RECONNECT_AUTO_INTERRUPT_MS,
+  TURN_INTERRUPT_FALLBACK_RELEASE_MS,
+  shouldRecoverFromCompletedWorkStall,
+  shouldRecoverFromProviderRetry,
+  type CompletedTurnWorkKind
+} from './turnRecovery'
 
 declare global {
   interface Window {
@@ -61,6 +69,7 @@ const FALLBACK_MODEL_METADATA_WARNING = 'Defaulting to fallback metadata'
 const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
 const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
 const USER_APPROVAL_REVIEWER = 'user'
+const ZSPARK_APPROVAL_POLICY = 'on-failure'
 
 let nextId = 1
 const newId = () => nextId++
@@ -94,7 +103,7 @@ function sendRpcError(id: JsonRpcId, code: number, message: string) {
   return window.zspark.send(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }))
 }
 
-type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'web'
+type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'web' | 'memory'
 type ActivityActionKind = 'read' | 'write' | 'list' | 'search' | 'run' | 'build' | 'verify' | 'tool' | 'file'
 interface Activity {
   id: string
@@ -132,9 +141,21 @@ interface ApprovalRequest {
   startedAt: number
 }
 
+interface MemoryCitationEntry {
+  path: string
+  lineStart?: number
+  lineEnd?: number
+  note?: string
+}
+
+interface MemoryCitation {
+  entries?: MemoryCitationEntry[]
+  threadIds?: string[]
+}
+
 type Block =
   | { type: 'user'; id: string; text: string; turnId?: string; input?: TurnInputItem[] }
-  | { type: 'agent'; id: string; text: string; turnId?: string }
+  | { type: 'agent'; id: string; text: string; turnId?: string; memoryCitation?: MemoryCitation | null }
   | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[]; subtitle?: string; tone?: 'normal' | 'warn' }
   | { type: 'approval'; id: string; turnId: string; request: ApprovalRequest }
   | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
@@ -492,12 +513,63 @@ function MessageActions({
   )
 }
 
+function normalizeMemoryCitation(citation: any): MemoryCitation | null {
+  if (!citation || typeof citation !== 'object') return null
+  const entries = Array.isArray(citation.entries)
+    ? citation.entries
+        .map((entry: any): MemoryCitationEntry | null => {
+          const path = String(entry?.path ?? '').trim()
+          if (!path) return null
+          return {
+            path,
+            lineStart: Number.isFinite(Number(entry?.lineStart)) ? Number(entry.lineStart) : undefined,
+            lineEnd: Number.isFinite(Number(entry?.lineEnd)) ? Number(entry.lineEnd) : undefined,
+            note: entry?.note ? String(entry.note) : undefined
+          }
+        })
+        .filter((entry: MemoryCitationEntry | null): entry is MemoryCitationEntry => Boolean(entry))
+    : []
+  const threadIds = Array.isArray(citation.threadIds)
+    ? citation.threadIds.map((id: any) => String(id)).filter(Boolean)
+    : []
+  if (!entries.length && !threadIds.length) return null
+  return { entries, threadIds }
+}
+
+function memoryCitationTitle(citation?: MemoryCitation | null) {
+  const count = citation?.entries?.length ?? 0
+  if (count > 0) return `Referenced ${count} memor${count === 1 ? 'y' : 'ies'}`
+  const threadCount = citation?.threadIds?.length ?? 0
+  return threadCount > 0 ? `Used memory from ${threadCount} thread${threadCount === 1 ? '' : 's'}` : 'Referenced memory'
+}
+
+function memoryCitationDetail(citation?: MemoryCitation | null) {
+  const entries = citation?.entries ?? []
+  if (!entries.length) return undefined
+  return entries.slice(0, 4).map((entry) => {
+    const line = entry.lineStart ? `:${entry.lineStart}` : ''
+    const note = entry.note ? ` — ${entry.note}` : ''
+    return `${basename(entry.path)}${line}${note}`
+  }).join('\n')
+}
+
+function MemoryCitationPill({ citation }: { citation?: MemoryCitation | null }) {
+  if (!citation) return null
+  const detail = memoryCitationDetail(citation)
+  return (
+    <div className="memory-citation" title={detail}>
+      <IconBrain />
+      <span>{memoryCitationTitle(citation)}</span>
+    </div>
+  )
+}
+
 function rpcKey(id: JsonRpcId) {
   return String(id)
 }
 
 function userApprovalParams() {
-  return { approvalsReviewer: USER_APPROVAL_REVIEWER }
+  return { approvalPolicy: ZSPARK_APPROVAL_POLICY, approvalsReviewer: USER_APPROVAL_REVIEWER }
 }
 
 function isApprovalRequest(method: string) {
@@ -799,12 +871,24 @@ function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; 
       if (item?.type === 'userMessage') {
         const txt = formatUserInputContent(item.content ?? [])
         if (txt) userBlocks.push({ type: 'user', id: `replay-u-${item.id}`, text: txt, turnId, input: normalizeInputItemsForResubmit(item.content ?? []) })
-      } else if (item?.type === 'reasoning' || item?.type === 'commandExecution' || item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall' || item?.type === 'webSearch') {
+      } else if (item?.type === 'reasoning' || item?.type === 'commandExecution' || item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall' || item?.type === 'webSearch' || item?.type === 'contextCompaction') {
         const activity = replayActivityFromItem(item, startedAt)
         if (activity) ensureTurnBlock().activities.push(activity)
       } else if (item?.type === 'agentMessage') {
         const txt = item.text ?? ''
-        if (txt) agentBlocks.push({ type: 'agent', id: `replay-a-${item.id}`, text: txt, turnId })
+        const memoryCitation = normalizeMemoryCitation(item.memoryCitation)
+        if (memoryCitation) {
+          ensureTurnBlock().activities.push({
+            id: `replay-memory-${item.id}`,
+            kind: 'memory',
+            title: memoryCitationTitle(memoryCitation),
+            detail: memoryCitationDetail(memoryCitation),
+            status: 'done',
+            startedAt,
+            endedAt: itemTimeMs(item, 'completedAtMs', startedAt)
+          })
+        }
+        if (txt) agentBlocks.push({ type: 'agent', id: `replay-a-${item.id}`, text: txt, turnId, memoryCitation })
       } else if (item?.type === 'fileChange') {
         const activity = replayActivityFromItem(item, startedAt)
         if (activity) ensureTurnBlock().activities.push(activity)
@@ -885,7 +969,7 @@ function truncateActivityDetail(detail?: string, limit = 1800) {
 function normalizeActivity(activity: any): Activity | null {
   if (!activity || typeof activity.id !== 'string' || typeof activity.title !== 'string') return null
   const kind: ActivityKind =
-    activity.kind === 'command' || activity.kind === 'file' || activity.kind === 'tool' || activity.kind === 'web'
+    activity.kind === 'command' || activity.kind === 'file' || activity.kind === 'tool' || activity.kind === 'web' || activity.kind === 'memory'
       ? activity.kind
       : 'reasoning'
   const status: Activity['status'] =
@@ -1090,6 +1174,7 @@ function webSearchActivityInfo(item: any) {
 
 function actionKindForSummary(activity: Activity): ActivityActionKind | undefined {
   if (activity.actionKind) return activity.actionKind
+  if (activity.kind === 'memory') return undefined
   if (activity.kind === 'tool') return 'tool'
   if (activity.kind === 'file') return 'file'
   if (activity.kind === 'web') return 'search'
@@ -1098,9 +1183,10 @@ function actionKindForSummary(activity: Activity): ActivityActionKind | undefine
 
 function activitySummaryLabels(activities: Activity[]) {
   const visible = activities.filter((activity) => activity.kind !== 'reasoning')
-  const counts = new Map<ActivityActionKind | 'command', number>()
+  const counts = new Map<ActivityActionKind | 'command' | 'memory', number>()
   for (const activity of visible) {
     if (activity.kind === 'command') counts.set('command', (counts.get('command') ?? 0) + 1)
+    if (activity.kind === 'memory') counts.set('memory', (counts.get('memory') ?? 0) + 1)
     const actionKind = actionKindForSummary(activity)
     if (actionKind) counts.set(actionKind, (counts.get(actionKind) ?? 0) + 1)
   }
@@ -1118,6 +1204,7 @@ function activitySummaryLabels(activities: Activity[]) {
   push(counts.get('build'), (count) => `Built ${plural(count, 'artifact')}`)
   push(counts.get('verify'), (count) => `Verified ${plural(count, 'result')}`)
   push(counts.get('file'), (count) => `Changed ${plural(count, 'file')}`)
+  push(counts.get('memory'), (count) => `Recorded ${plural(count, 'memory event')}`)
   return labels
 }
 
@@ -1146,7 +1233,7 @@ function publicActivityTitle(activity: Activity) {
 function publicActivityDetail(activity: Activity) {
   const detail = activity.detail?.trim()
   if (!detail) return undefined
-  if (activity.kind === 'reasoning') return detail
+  if (activity.kind === 'reasoning' || activity.kind === 'memory') return detail
   return undefined
 }
 
@@ -1253,6 +1340,17 @@ function replayActivityFromItem(item: any, fallbackStartedAt: number): Activity 
       endedAt
     }
   }
+  if (item?.type === 'contextCompaction') {
+    return {
+      id: `replay-a-${id}`,
+      kind: 'memory',
+      title: 'Compacted context',
+      detail: 'Earlier conversation context was summarized for future turns.',
+      status: 'done',
+      startedAt,
+      endedAt
+    }
+  }
   return undefined
 }
 
@@ -1263,6 +1361,7 @@ function actIcon(k: ActivityKind) {
     case 'file': return <IconFile />
     case 'tool': return <IconTool />
     case 'web': return <IconGlobe />
+    case 'memory': return <IconBrain />
   }
 }
 
@@ -1369,11 +1468,17 @@ function DesktopApp() {
   const recentNotificationLines = useRef<Map<string, number>>(new Map())
   const restoredActivityThreads = useRef<Set<string>>(new Set())
   const checkedArtifactMessages = useRef<Map<string, string>>(new Map())
+  const completedWorkByTurn = useRef<Map<string, Set<CompletedTurnWorkKind>>>(new Map())
+  const completedWorkStallTimers = useRef<Map<string, number>>(new Map())
+  const providerRetryTimers = useRef<Map<string, number>>(new Map())
+  const interruptFallbackTimers = useRef<Map<string, number>>(new Map())
+  const interruptingTurns = useRef<Set<string>>(new Set())
   const buf = useRef('')
   const streamRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
   const inputRef = useRef('')
   const runtimeRef = useRef<RuntimeInfo>({})
+  const threadRef = useRef<string | null>(null)
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const submitInFlight = useRef(false)
   const stickToBottom = useRef(true)
@@ -1427,7 +1532,20 @@ function DesktopApp() {
   const handleStreamWheel = (event: React.WheelEvent<HTMLDivElement>) => {
     if (event.deltaY < 0) pauseAutoScroll()
   }
+  const clearTurnRecoveryTimers = (turnId?: string) => {
+    const clear = (timers: { current: Map<string, number> }) => {
+      for (const [id, timer] of timers.current) {
+        if (turnId && id !== turnId) continue
+        window.clearTimeout(timer)
+        timers.current.delete(id)
+      }
+    }
+    clear(completedWorkStallTimers)
+    clear(providerRetryTimers)
+    clear(interruptFallbackTimers)
+  }
   const resetLiveTurnState = () => {
+    clearTurnRecoveryTimers()
     currentTurn.current = null
     agentForTurn.current.clear()
     itemActivity.current.clear()
@@ -1435,6 +1553,8 @@ function DesktopApp() {
     seenTurnStarts.current.clear()
     appliedReasoningCompletions.current.clear()
     recentNotificationLines.current.clear()
+    completedWorkByTurn.current.clear()
+    interruptingTurns.current.clear()
   }
   const refreshRuntimeHost = async () => {
     try {
@@ -1760,7 +1880,137 @@ function DesktopApp() {
     }
   }
 
+  const noteCompletedTurnWork = (turnId: string, kind: CompletedTurnWorkKind) => {
+    if (!turnId) return
+    const current = completedWorkByTurn.current.get(turnId) ?? new Set<CompletedTurnWorkKind>()
+    current.add(kind)
+    completedWorkByTurn.current.set(turnId, current)
+    scheduleCompletedWorkFinalizationRecovery(turnId)
+  }
+
+  const settleTurnRecovery = (turnId: string) => {
+    clearTurnRecoveryTimers(turnId)
+    completedWorkByTurn.current.delete(turnId)
+    interruptingTurns.current.delete(turnId)
+  }
+
+  const releaseTurnLocally = (turnId: string, detail: string) => {
+    const active = currentTurn.current
+    if (!active || active.turnId !== turnId) return
+    submitInFlight.current = false
+    setSubmitting(false)
+    setStreaming(false)
+    const providerRetryActivityId = itemActivity.current.get(`provider-retry-${turnId}`)
+    updateTurn(turnId, (t) => ({
+      ...t,
+      endedAt: Date.now(),
+      collapsed: false,
+      activities: t.activities.map((a) => {
+        if (a.id === providerRetryActivityId) {
+          return {
+            ...a,
+            status: 'done' as const,
+            endedAt: Date.now(),
+            title: 'Provider reconnect stopped',
+            detail: `${a.detail ?? ''}${detail}`.trim()
+          }
+        }
+        if (a.status === 'running') return { ...a, status: 'done' as const, endedAt: Date.now() }
+        return a
+      })
+    }))
+    void scanTurnArtifacts(turnId, active.startedAt, `scan-${turnId}-released`)
+    currentTurn.current = null
+    settleTurnRecovery(turnId)
+  }
+
+  const interruptProviderRetryTurn = (
+    turnId: string,
+    detail = 'Completed work was already recorded; stopping the stalled final response.',
+    title = 'Stopping stalled finalization'
+  ) => {
+    const active = currentTurn.current
+    const currentThread = threadRef.current
+    if (!active || active.turnId !== turnId || !currentThread || interruptingTurns.current.has(turnId)) return
+    interruptingTurns.current.add(turnId)
+    clearTurnRecoveryTimers(turnId)
+    const itemId = `provider-retry-${turnId}`
+    const actId = ensureActivity(turnId, itemId, {
+      kind: 'tool',
+      title,
+      detail,
+      actionKind: 'tool'
+    })
+    updateActivity(turnId, actId, {
+      title,
+      detail
+    })
+    const fallback = window.setTimeout(() => {
+      releaseTurnLocally(turnId, '\nStop request is still pending; released the chat locally so the user can continue.')
+      toast('warn', 'Provider reconnect was stuck; completed work was kept and the chat was released.')
+    }, TURN_INTERRUPT_FALLBACK_RELEASE_MS)
+    interruptFallbackTimers.current.set(turnId, fallback)
+    void send('turn/interrupt', { threadId: currentThread, turnId })
+      .then((result) => {
+        if (result.error) throw new Error(result.error.message)
+        if (currentTurn.current?.turnId === turnId) {
+          releaseTurnLocally(turnId, '\nStopped stalled provider reconnect after completed work.')
+        }
+      })
+      .catch((err: any) => {
+        releaseTurnLocally(turnId, `\nStop request failed: ${err?.message ?? String(err)}`)
+        toast('warn', 'Provider reconnect was stuck; completed work was kept and the chat was released.')
+      })
+  }
+
+  const scheduleProviderRetryRecovery = (turnId: string) => {
+    const completedWorkCount = completedWorkByTurn.current.get(turnId)?.size ?? 0
+    if (!shouldRecoverFromProviderRetry({
+      willRetry: true,
+      completedWorkCount,
+      alreadyInterrupting: interruptingTurns.current.has(turnId)
+    })) return
+    if (providerRetryTimers.current.has(turnId)) return
+    const itemId = `provider-retry-${turnId}`
+    const actId = ensureActivity(turnId, itemId, {
+      kind: 'tool',
+      title: 'Provider reconnecting',
+      actionKind: 'tool'
+    })
+    updateActivity(turnId, actId, {
+      title: 'Provider reconnecting'
+    })
+    appendActivityDetail(turnId, itemId, 'Provider is reconnecting after completed work. zspark will stop the stalled final response if it does not recover shortly.\n')
+    const timer = window.setTimeout(() => {
+      providerRetryTimers.current.delete(turnId)
+      interruptProviderRetryTurn(
+        turnId,
+        'Completed work was already recorded; stopping the stalled final response.',
+        'Stopping stalled reconnect'
+      )
+    }, PROVIDER_RECONNECT_AUTO_INTERRUPT_MS)
+    providerRetryTimers.current.set(turnId, timer)
+  }
+
+  const scheduleCompletedWorkFinalizationRecovery = (turnId: string) => {
+    const completedWorkCount = completedWorkByTurn.current.get(turnId)?.size ?? 0
+    if (!shouldRecoverFromCompletedWorkStall({
+      completedWorkCount,
+      alreadyInterrupting: interruptingTurns.current.has(turnId)
+    })) return
+    if (completedWorkStallTimers.current.has(turnId)) return
+    const timer = window.setTimeout(() => {
+      completedWorkStallTimers.current.delete(turnId)
+      interruptProviderRetryTurn(
+        turnId,
+        'Completed work was already recorded, but the provider did not finish the final response.'
+      )
+    }, COMPLETED_WORK_FINALIZATION_TIMEOUT_MS)
+    completedWorkStallTimers.current.set(turnId, timer)
+  }
+
   useEffect(() => { runtimeRef.current = runtime }, [runtime])
+  useEffect(() => { threadRef.current = thread }, [thread])
   useEffect(() => { inputRef.current = input }, [input])
   useEffect(() => {
     if (streaming || submitting || !input.trim()) return
@@ -1784,6 +2034,7 @@ function DesktopApp() {
           const blockId = `turn-${turnId}`
           const startedAt = Date.now()
           currentTurn.current = { turnId, blockId, startedAt }
+          settleTurnRecovery(turnId)
           if (!seenTurnStarts.current.has(turnId)) {
             seenTurnStarts.current.add(turnId)
             agentForTurn.current.clear()
@@ -1809,10 +2060,56 @@ function DesktopApp() {
           const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
           void scanTurnArtifacts(turnId, startedAt, `scan-${turnId}-completed`)
           currentTurn.current = null
+          settleTurnRecovery(turnId)
+          return
+        }
+        case 'thread/status/changed': {
+          const eventThreadId = String(params?.threadId ?? '')
+          if (eventThreadId && threadRef.current && eventThreadId !== threadRef.current) return
+          const statusType = params?.status?.type
+          if (!statusType || statusType === 'active') return
+          const cur = currentTurn.current
+          submitInFlight.current = false
+          setSubmitting(false)
+          setStreaming(false)
+          if (cur) {
+            updateTurn(cur.turnId, (t) => ({
+              ...t,
+              endedAt: Date.now(),
+              activities: t.activities.map((a) => (
+                a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now() } : a
+              ))
+            }))
+            void scanTurnArtifacts(cur.turnId, cur.startedAt, `scan-${cur.turnId}-idle`)
+            settleTurnRecovery(cur.turnId)
+            currentTurn.current = null
+          }
           return
         }
         case 'serverRequest/resolved': {
           if (params?.requestId !== undefined) resolveApprovalRequest(params.requestId)
+          return
+        }
+        case 'thread/compacted': {
+          const turnId = turnIdFromParams(params)
+          if (!turnId) return
+          const itemId = `context-compacted-${turnId}`
+          upsertTurnBlock(turnId, `turn-${turnId}`, Date.now())
+          const actId = ensureActivity(turnId, itemId, {
+            kind: 'memory',
+            title: 'Compacted context',
+            detail: 'Earlier conversation context was summarized for future turns.'
+          })
+          updateActivity(turnId, actId, { status: 'done', endedAt: Date.now() })
+          updateTurn(turnId, (t) => ({
+            ...t,
+            endedAt: t.endedAt ?? Date.now(),
+            activities: t.activities.map((a) => (
+              a.kind === 'reasoning' && a.status === 'running'
+                ? { ...a, status: 'done' as const, endedAt: Date.now(), title: 'Context prepared' }
+                : a
+            ))
+          }))
           return
         }
         case 'error':
@@ -1834,6 +2131,7 @@ function DesktopApp() {
               const itemId = `provider-retry-${cur.turnId}`
               ensureActivity(cur.turnId, itemId, { kind: 'tool', title: 'Provider reconnecting', actionKind: 'tool' })
               appendActivityDetail(cur.turnId, itemId, `${msg}\n`)
+              scheduleProviderRetryRecovery(cur.turnId)
             }
             return
           }
@@ -1841,7 +2139,17 @@ function DesktopApp() {
           setSubmitting(false)
           setStreaming(false)
           const cur = currentTurn.current
-          if (cur) updateTurn(cur.turnId, (t) => ({ ...t, endedAt: Date.now() }))
+          if (cur) {
+            updateTurn(cur.turnId, (t) => ({
+              ...t,
+              endedAt: Date.now(),
+              activities: t.activities.map((a) => (
+                a.status === 'running' ? { ...a, status: 'failed' as const, endedAt: Date.now() } : a
+              ))
+            }))
+            settleTurnRecovery(cur.turnId)
+            currentTurn.current = null
+          }
           if (msg.length > 500) msg = msg.slice(0, 500) + '…'
           toast('error', msg)
           return
@@ -1904,6 +2212,7 @@ function DesktopApp() {
             // Always overwrite the bubble with the canonical text.
             const txt = item.text ?? (Array.isArray(item.content) ? item.content.map((c: any) => c.text ?? '').join('') : '')
             if (!txt) return
+            const memoryCitation = normalizeMemoryCitation(item.memoryCitation)
             const blockId = agentForTurn.current.get(turnId) ?? `agent-${turnId}-final`
             agentForTurn.current.set(turnId, blockId)
             setBlocks((bs) => {
@@ -1911,10 +2220,19 @@ function DesktopApp() {
               const next = bs.map((b) => {
                 if (b.type !== 'agent' || b.id !== blockId) return b
                 found = true
-                return { ...b, text: txt, turnId }
+                return { ...b, text: txt, turnId, memoryCitation }
               })
-              return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: txt, turnId }]
+              return found ? next : [...bs, { type: 'agent' as const, id: blockId, text: txt, turnId, memoryCitation }]
             })
+            if (memoryCitation) {
+              const memoryItemId = `memory-${String(item.id ?? blockId)}`
+              const actId = ensureActivity(turnId, memoryItemId, {
+                kind: 'memory',
+                title: memoryCitationTitle(memoryCitation),
+                detail: memoryCitationDetail(memoryCitation)
+              })
+              updateActivity(turnId, actId, { status: 'done', endedAt: Date.now() })
+            }
             updateTurn(turnId, (t) => ({ ...t, finalMessageId: blockId }))
             void verifyArtifactClaims(turnId, String(item.id ?? `agent-${turnId}`), txt)
             const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
@@ -1939,6 +2257,31 @@ function DesktopApp() {
             }
             return
           }
+          if (item.type === 'contextCompaction') {
+            const itemId = String(item.id ?? `context-compaction-${turnId}`)
+            if (method === 'item/started') {
+              ensureActivity(turnId, itemId, {
+                kind: 'memory',
+                title: 'Compacting context',
+                detail: 'Summarizing earlier conversation context for future turns.'
+              })
+            } else {
+              if (!itemActivity.current.has(itemId)) {
+                ensureActivity(turnId, itemId, {
+                  kind: 'memory',
+                  title: 'Compacting context',
+                  detail: 'Summarizing earlier conversation context for future turns.'
+                })
+              }
+              updateActivity(turnId, itemActivity.current.get(itemId)!, {
+                status: 'done',
+                endedAt: Date.now(),
+                title: 'Compacted context',
+                detail: 'Earlier conversation context was summarized for future turns.'
+              })
+            }
+            return
+          }
           if (item.type === 'commandExecution') {
             const itemId = item.id as string
             const info = commandActivityInfo(item)
@@ -1956,6 +2299,11 @@ function DesktopApp() {
                 actionKind: info.actionKind,
                 target: info.target
               })
+              if (status === 'done') {
+                noteCompletedTurnWork(turnId, 'command')
+                const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
+                window.setTimeout(() => void scanTurnArtifacts(turnId, startedAt, `scan-${itemId}-command`), 500)
+              }
             }
             return
           }
@@ -1971,6 +2319,7 @@ function DesktopApp() {
               upsertWorkspaceFiles(files)
               upsertArtifactBlock(turnId, itemId, files)
               updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail, actionKind: 'file' })
+              noteCompletedTurnWork(turnId, 'file')
             }
             return
           }
@@ -1981,6 +2330,7 @@ function DesktopApp() {
             else {
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'tool', title: info.title, actionKind: info.actionKind })
               updateActivity(turnId, itemActivity.current.get(itemId)!, { status: item.status === 'failed' ? 'failed' : 'done', endedAt: Date.now(), title: info.title, detail: info.detail, actionKind: info.actionKind })
+              if (item.status !== 'failed') noteCompletedTurnWork(turnId, 'tool')
             }
             return
           }
@@ -1991,6 +2341,7 @@ function DesktopApp() {
             else {
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'web', title: info.title, actionKind: info.actionKind })
               updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title: info.title, detail: info.detail, actionKind: info.actionKind })
+              noteCompletedTurnWork(turnId, 'web')
             }
             return
           }
@@ -2594,7 +2945,13 @@ function DesktopApp() {
   return (
     <div className="app">
       <aside className="sidebar">
-        <div className="brand"><div className="brand-mark">z</div>zspark</div>
+        <div className="brand">
+          <div className="brand-mark">z</div>
+          <div className="brand-copy">
+            <strong>zspark</strong>
+            <span>agent workspace</span>
+          </div>
+        </div>
         <div className="nav-item active" onClick={newChat}><IconNewChat /><span>New chat</span></div>
         <div className="nav-item" onClick={() => openPanel('search')}><IconSearch /><span>Search</span></div>
         <div className="nav-item" onClick={() => openPanel('skills')}><IconSkills /><span>Skills</span></div>
@@ -2613,7 +2970,10 @@ function DesktopApp() {
 
       <main className="chat">
         <div className="chat-header">
-          <div className="left">Workspace</div>
+          <div className="left workspace-title">
+            <span>Workspace</span>
+            <small title={runtimeCwd}>{shortPath(runtimeCwd)}</small>
+          </div>
           <div className="right">
             {streaming && <button className="header-btn danger" onClick={stopTurn}><IconClose /> Stop</button>}
             <button className="header-btn" onClick={() => setShowSettings(true)}><IconSettings /> Provider</button>
@@ -2659,6 +3019,7 @@ function DesktopApp() {
                   <div key={b.id} className="message-wrap assistant">
                     <div className={`bubble assistant${isStreamingAgent ? ' streaming' : ''}`}>
                       <Markdown text={b.text} />
+                      <MemoryCitationPill citation={b.memoryCitation} />
                       <MessageArtifactButtons
                         candidates={artifactCandidates}
                         runtime={runtime}

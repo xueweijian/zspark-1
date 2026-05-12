@@ -784,7 +784,7 @@ pub(crate) fn is_likely_sandbox_denied(
     sandbox_type: SandboxType,
     exec_output: &ExecToolCallOutput,
 ) -> bool {
-    if sandbox_type == SandboxType::None || exec_output.exit_code == 0 {
+    if sandbox_type == SandboxType::None {
         return false;
     }
 
@@ -802,13 +802,46 @@ pub(crate) fn is_likely_sandbox_denied(
         "failed to write file",
     ];
 
-    let has_sandbox_keyword = [
+    let output_sections = [
         &exec_output.stderr.text,
         &exec_output.stdout.text,
         &exec_output.aggregated_output.text,
-    ]
-    .into_iter()
-    .any(|section| {
+    ];
+
+    if exec_output.exit_code == 0 {
+        const STRONG_DENIED_KEYWORDS: [&str; 4] = [
+            "operation not permitted",
+            "permission denied",
+            "read-only file system",
+            "failed to write file",
+        ];
+        const FILE_OPERATION_ERROR_MARKERS: [&str; 12] = [
+            "bash:",
+            "cp:",
+            "ln:",
+            "mkdir:",
+            "mv:",
+            "osascript",
+            "rm:",
+            "rmdir:",
+            "sh:",
+            "touch:",
+            "trash:",
+            "zsh:",
+        ];
+
+        return output_sections.into_iter().any(|section| {
+            let lower = section.to_lowercase();
+            STRONG_DENIED_KEYWORDS
+                .iter()
+                .any(|needle| lower.contains(needle))
+                && FILE_OPERATION_ERROR_MARKERS
+                    .iter()
+                    .any(|marker| lower.contains(marker))
+        });
+    }
+
+    let has_sandbox_keyword = output_sections.into_iter().any(|section| {
         let lower = section.to_lowercase();
         SANDBOX_DENIED_KEYWORDS
             .iter()

@@ -10,6 +10,7 @@ describe('runtime display helpers', () => {
 
   test('formats approval policy and short paths', () => {
     expect(formatApprovalPolicy('on-request')).toBe('On request')
+    expect(formatApprovalPolicy('on-failure')).toBe('On failure')
     expect(shortPath('/Users/example/projects/zspark/desktop', 24)).toBe('…/zspark/desktop')
   })
 })

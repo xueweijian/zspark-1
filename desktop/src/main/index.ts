@@ -166,7 +166,9 @@ function formatCodexLogChunk(channel: 'stdout' | 'stderr', chunk: string): strin
  * We also disable the bundled computer-use / playwright MCP servers and
  * trust the zspark workspace so the chat doesn't get spammed by config
  * warnings or MCP startup failures (those bundled MCPs need optional
- * platform binaries that aren't relevant inside zspark).
+ * platform binaries that aren't relevant inside zspark). zspark opts into
+ * Codex's native memory feature so persisted memory generation/use works
+ * even though the upstream feature flag is experimental and off by default.
  */
 function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<string, string> } {
   const tomlString = (s: string) => `"${s.replace(/"/g, '\\"')}"`
@@ -176,7 +178,10 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
     // happens to look at; trust the parent so any subfolder counts.
     '-c', `projects.${tomlString(WORKSPACE_ROOT)}.trust_level=${tomlString('trusted')}`,
     // Drop the bundled MCP servers — zspark ships its own skills.
-    '-c', `mcp_servers={}`
+    '-c', `mcp_servers={}`,
+    // Keep Codex native memories available in zspark. This only enables the
+    // feature gate; [memories] use/generate settings still come from config.
+    '-c', `features.memories=true`
   ]
   if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: baseArgs, env: {} }
 

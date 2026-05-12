@@ -42,6 +42,36 @@ fn sandbox_detection_identifies_keyword_in_stderr() {
 }
 
 #[test]
+fn sandbox_detection_identifies_masked_file_operation_denial() {
+    let output = make_exec_output(
+        /*exit_code*/ 0,
+        "",
+        "",
+        "mv: rename /Users/test/Desktop/a.jpg to /Users/test/.Trash/a.jpg: Operation not permitted\nmove failed\n",
+    );
+
+    assert!(is_likely_sandbox_denied(
+        SandboxType::MacosSeatbelt,
+        &output
+    ));
+}
+
+#[test]
+fn sandbox_detection_ignores_zero_exit_denial_text_without_file_operation_marker() {
+    let output = make_exec_output(
+        /*exit_code*/ 0,
+        "",
+        "",
+        "log fixture: Operation not permitted",
+    );
+
+    assert!(!is_likely_sandbox_denied(
+        SandboxType::MacosSeatbelt,
+        &output
+    ));
+}
+
+#[test]
 fn sandbox_detection_respects_quick_reject_exit_codes() {
     let output = make_exec_output(/*exit_code*/ 127, "", "command not found", "");
     assert!(!is_likely_sandbox_denied(

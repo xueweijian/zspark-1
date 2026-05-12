@@ -1135,7 +1135,10 @@ async fn run_sampling_request(
                 )
                 .await;
             }
-            tokio::time::sleep(delay).await;
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                () = cancellation_token.cancelled() => return Err(CodexErr::TurnAborted),
+            }
         } else {
             return Err(err);
         }
