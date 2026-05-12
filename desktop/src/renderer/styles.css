@@ -60,6 +60,16 @@ input,textarea,select{font:inherit}
 .message-action.danger:hover:not(:disabled){background:#fef2f2;border-color:#fecaca;color:#b91c1c}
 .message-action:disabled{opacity:.4;cursor:not-allowed;transform:none}
 @media (hover:none){.message-actions{position:static;margin-top:0;opacity:1;pointer-events:auto;transform:none}}
+.message-artifacts{display:flex;flex-direction:column;gap:7px;margin-top:12px;width:min(560px,100%)}
+.message-artifact{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;border:1px solid #dbeafe;border-radius:10px;background:#eff6ff;padding:8px 9px}
+.message-artifact-file{display:flex;align-items:center;gap:8px;min-width:0;color:#1e3a8a;font-size:12.5px;font-weight:600}
+.message-artifact-file svg{flex-shrink:0;color:#2563eb}
+.message-artifact-file span{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.message-artifact-actions{display:flex;gap:6px;align-items:center}
+.message-artifact-actions button{font-size:12px;font-weight:600;border:1px solid #bfdbfe;border-radius:7px;background:#fff;color:#1d4ed8;padding:5px 9px;transition:background .12s,border-color .12s,color .12s}
+.message-artifact-actions button:hover{background:#dbeafe;border-color:#93c5fd}
+.message-artifact-actions .message-download{background:#2563eb;border-color:#2563eb;color:#fff;box-shadow:0 6px 16px rgba(37,99,235,.18)}
+.message-artifact-actions .message-download:hover{background:#1d4ed8;border-color:#1d4ed8;color:#fff}
 @keyframes cursorBlink{50%{opacity:.18}}
 
 /* Activity card (per turn) */
@@ -149,8 +159,8 @@ input,textarea,select{font:inherit}
 .artifact-actions{display:flex;gap:6px}
 .artifact-actions button{font-size:12px;font-weight:500;border:1px solid #d4d4d8;border-radius:7px;background:#fff;color:#18181b;padding:5px 9px;transition:background .12s,border-color .12s}
 .artifact-actions button:hover{background:#f4f4f5;border-color:#a1a1aa}
-.artifact-actions button.primary{background:#18181b;border-color:#18181b;color:#fafafa}
-.artifact-actions button.primary:hover{background:#27272a;border-color:#27272a}
+.artifact-actions button.primary{background:#2563eb;border-color:#2563eb;color:#fff;box-shadow:0 6px 16px rgba(37,99,235,.18)}
+.artifact-actions button.primary:hover{background:#1d4ed8;border-color:#1d4ed8}
 .artifact-actions button:disabled,.artifact-actions button.primary:disabled{cursor:not-allowed;background:#f4f4f5;border-color:#e4e4e7;color:#a1a1aa}
 
 /* Toast notifications */

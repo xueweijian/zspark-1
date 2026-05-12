@@ -204,6 +204,18 @@ interface RuntimeInfo extends Partial<RuntimeHostInfo> {
   reasoningEffort?: string | null
 }
 
+function candidateWorkspacePaths(path: string, runtime: RuntimeInfo) {
+  if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) return [path]
+  const bases = [runtime.cwd, runtime.workspaceRoot].filter((base): base is string => Boolean(base))
+  const seen = new Set<string>()
+  const paths = bases.length ? bases.map((base) => resolveWorkspacePath(path, base)) : [path]
+  return paths.filter((candidate) => {
+    if (seen.has(candidate)) return false
+    seen.add(candidate)
+    return true
+  })
+}
+
 interface WorkspaceFile {
   id: string
   name: string
@@ -371,6 +383,51 @@ function Markdown({ text }: { text: string }) {
     return DOMPurify.sanitize(marked.parse(normalized, { async: false }) as string)
   }, [text])
   return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />
+}
+
+function artifactDownloadLabel(path: string) {
+  const ext = basename(path).split('.').pop()?.toUpperCase()
+  return ext ? `Download ${ext}` : 'Download'
+}
+
+function MessageArtifactButtons({
+  candidates,
+  runtime,
+  onDownload,
+  onOpen
+}: {
+  candidates: string[]
+  runtime: RuntimeInfo
+  onDownload: (path: string) => void
+  onOpen: (path: string) => void
+}) {
+  const artifacts = useMemo(() => {
+    const seen = new Set<string>()
+    return candidates.flatMap((candidate) => {
+      const path = candidateWorkspacePaths(candidate, runtime)[0] ?? candidate
+      if (!path || seen.has(path)) return []
+      seen.add(path)
+      return [{ path, name: basename(path) }]
+    }).slice(0, 4)
+  }, [candidates, runtime.cwd, runtime.workspaceRoot])
+
+  if (!artifacts.length) return null
+  return (
+    <div className="message-artifacts" aria-label="Detected files">
+      {artifacts.map((artifact) => (
+        <div className="message-artifact" key={artifact.path}>
+          <div className="message-artifact-file" title={artifact.path}>
+            <IconFile />
+            <span>{artifact.name}</span>
+          </div>
+          <div className="message-artifact-actions">
+            <button className="message-download" onClick={() => onDownload(artifact.path)}>{artifactDownloadLabel(artifact.path)}</button>
+            <button onClick={() => onOpen(artifact.path)}>Open</button>
+          </div>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function MessageActions({
@@ -1051,6 +1108,7 @@ function DesktopApp() {
   const appliedReasoningCompletions = useRef<Set<string>>(new Set())
   const recentNotificationLines = useRef<Map<string, number>>(new Map())
   const restoredActivityThreads = useRef<Set<string>>(new Set())
+  const checkedArtifactMessages = useRef<Map<string, string>>(new Map())
   const buf = useRef('')
   const streamRef = useRef<HTMLDivElement>(null)
   const taRef = useRef<HTMLTextAreaElement>(null)
@@ -1194,17 +1252,25 @@ function DesktopApp() {
   }
 
   const verifyArtifactClaims = async (turnId: string, itemId: string, text: string) => {
-    const base = runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot
-    const candidates = extractArtifactPathCandidates(text)
-      .map((candidate) => resolveWorkspacePath(candidate, base))
-      .slice(0, 8)
+    const candidates = extractArtifactPathCandidates(text).slice(0, 8)
     if (!candidates.length) return
 
     const existing: WorkspaceFile[] = []
     const missing: WorkspaceFile[] = []
     const now = Date.now()
-    await Promise.all(candidates.map(async (path, index) => {
-      const stat = await window.zspark.statPath(path)
+    await Promise.all(candidates.map(async (candidate, index) => {
+      const paths = candidateWorkspacePaths(candidate, runtimeRef.current)
+      let path = paths[0] ?? candidate
+      let stat: PathStatResult = { exists: false }
+      for (const possiblePath of paths) {
+        const possibleStat = await window.zspark.statPath(possiblePath)
+        if (possibleStat.exists && possibleStat.isFile) {
+          path = possiblePath
+          stat = possibleStat
+          break
+        }
+        stat = possibleStat
+      }
       const file: WorkspaceFile = {
         id: `claim-${now}-${index}`,
         name: basename(path),
@@ -1234,6 +1300,42 @@ function DesktopApp() {
       })
       toast('error', `Artifact missing: ${missing.map((file) => file.name).join(', ')}`)
     }
+  }
+
+  const reconcileAgentArtifactClaims = async (agentBlock: Extract<Block, { type: 'agent' }>) => {
+    const runtimeSignature = `${runtimeRef.current.cwd ?? ''}|${runtimeRef.current.workspaceRoot ?? ''}`
+    const signature = `${runtimeSignature}|${agentBlock.text}`
+    if (checkedArtifactMessages.current.get(agentBlock.id) === signature) return
+
+    const candidates = extractArtifactPathCandidates(agentBlock.text).slice(0, 8)
+    if (!candidates.length) return
+
+    const files: WorkspaceFile[] = []
+    const now = Date.now()
+    for (const candidate of candidates) {
+      for (const path of candidateWorkspacePaths(candidate, runtimeRef.current)) {
+        const stat = await window.zspark.statPath(path)
+        if (!stat.exists || !stat.isFile) continue
+        files.push({
+          id: `inline-${agentBlock.id}-${files.length}-${now}`,
+          name: basename(path),
+          path,
+          source: 'change',
+          status: 'created',
+          detail: `Verified from assistant output${stat.size ? ` (${fmtBytes(stat.size)})` : ''}`,
+          updatedAt: stat.mtimeMs ?? now
+        })
+        break
+      }
+    }
+
+    if (!files.length) return
+    checkedArtifactMessages.current.set(agentBlock.id, signature)
+    upsertWorkspaceFiles(files)
+    upsertArtifactBlock(agentBlock.turnId ?? `agent-${agentBlock.id}`, `${agentBlock.id}-inline-artifacts`, files, {
+      title: `${files.length} downloadable artifact${files.length === 1 ? '' : 's'} ready`,
+      subtitle: 'Verified from the assistant response'
+    })
   }
 
   const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {
@@ -1637,6 +1739,11 @@ function DesktopApp() {
     if (!thread) return
     savePersistedActivityBlocks(thread, blocks)
   }, [blocks, thread])
+  useEffect(() => {
+    for (const block of blocks) {
+      if (block.type === 'agent') void reconcileAgentArtifactClaims(block)
+    }
+  }, [blocks, runtime.cwd, runtime.workspaceRoot])
   useEffect(() => {
     if (!streaming) return
     const timer = window.setInterval(() => setClock(Date.now()), 1000)
@@ -2205,9 +2312,18 @@ function DesktopApp() {
               }
               if (b.type === 'agent') {
                 const isStreamingAgent = streaming && b.id === streamingAgentId
+                const artifactCandidates = extractArtifactPathCandidates(b.text)
                 return (
                   <div key={b.id} className="message-wrap assistant">
-                    <div className={`bubble assistant${isStreamingAgent ? ' streaming' : ''}`}><Markdown text={b.text} /></div>
+                    <div className={`bubble assistant${isStreamingAgent ? ' streaming' : ''}`}>
+                      <Markdown text={b.text} />
+                      <MessageArtifactButtons
+                        candidates={artifactCandidates}
+                        runtime={runtime}
+                        onDownload={downloadFilePath}
+                        onOpen={openFilePath}
+                      />
+                    </div>
                     <MessageActions
                       onCopy={() => void copyMessageBlock(b)}
                       onDelete={() => void deleteMessageBlock(b)}
