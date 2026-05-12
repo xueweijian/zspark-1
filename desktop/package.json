@@ -50,6 +50,7 @@
       }
     ],
     "win": {
+      "signAndEditExecutable": false,
       "target": "nsis",
       "artifactName": "zspark-${version}-win-${arch}.${ext}"
     },
