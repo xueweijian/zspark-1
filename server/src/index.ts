@@ -9,6 +9,7 @@ import { initDb } from './db.js'
 import { entraAuth } from './entra.js'
 import { registerWorkspaceRoutes } from './workspaces.js'
 import { registerSessionRoutes } from './sessions.js'
+import { registerArtifactRoutes } from './artifacts.js'
 
 const Env = z.object({
   PORT: z.string().default('8787'),
@@ -25,7 +26,7 @@ const env = Env.parse(process.env)
 
 async function main() {
   await initDb(env.DATABASE_URL)
-  const app = Fastify({ logger: { level: 'info' } })
+  const app = Fastify({ logger: { level: 'info' }, bodyLimit: 100 * 1024 * 1024 })
   await app.register(cors, { origin: true, credentials: true })
   await app.register(websocket)
 
@@ -36,6 +37,7 @@ async function main() {
   await registerAuthRoutes(app)
   await registerWorkspaceRoutes(app)
   await registerSessionRoutes(app)
+  await registerArtifactRoutes(app)
   await registerCollabRoutes(app)
   await registerTeamsRoutes(app, env)
 

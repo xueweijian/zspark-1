@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } from 'electro
 import type { OpenDialogOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
-import { basename, delimiter, dirname, join } from 'node:path'
+import { basename, delimiter, dirname, extname, join } from 'node:path'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync } from 'node:fs'
 import { PublicClientApplication } from '@azure/msal-node'
 import { scanRecentArtifacts } from './artifacts'
@@ -171,6 +171,24 @@ function enterpriseStatus(settings = loadSettings()) {
 }
 
 async function enterpriseRequest(path: string, init: RequestInit = {}) {
+  const fetched = await enterpriseFetchResponse(path, init)
+  if (!fetched.response) return fetched
+  const response = fetched.response
+  const bodyText = await response.text()
+  let body: any = null
+  try {
+    body = bodyText ? JSON.parse(bodyText) : null
+  } catch {
+    body = { text: bodyText }
+  }
+  if (!response.ok) {
+    const error = [body?.error, body?.detail].filter(Boolean).join(': ')
+    return { ok: false, status: response.status, error: error || bodyText }
+  }
+  return { ok: true, status: response.status, ...body }
+}
+
+async function enterpriseFetchResponse(path: string, init: RequestInit = {}) {
   const settings = loadSettings()
   const auth = settings.enterpriseAuth
   if (!tokenIsUsable(auth)) {
@@ -185,18 +203,35 @@ async function enterpriseRequest(path: string, init: RequestInit = {}) {
       authorization: `Bearer ${auth!.accessToken}`
     }
   })
-  const bodyText = await response.text()
-  let body: any = null
-  try {
-    body = bodyText ? JSON.parse(bodyText) : null
-  } catch {
-    body = { text: bodyText }
+  return { response }
+}
+
+function artifactMimeType(filePath: string) {
+  switch (extname(filePath).toLowerCase()) {
+    case '.pptx': return 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
+    case '.ppt': return 'application/vnd.ms-powerpoint'
+    case '.docx': return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+    case '.doc': return 'application/msword'
+    case '.xlsx': return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    case '.xls': return 'application/vnd.ms-excel'
+    case '.csv': return 'text/csv'
+    case '.pdf': return 'application/pdf'
+    case '.png': return 'image/png'
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg'
+    case '.webp': return 'image/webp'
+    case '.zip': return 'application/zip'
+    default: return 'application/octet-stream'
   }
-  if (!response.ok) {
-    const error = [body?.error, body?.detail].filter(Boolean).join(': ')
-    return { ok: false, status: response.status, error: error || bodyText }
+}
+
+function contentDispositionFileName(header: string | null) {
+  if (!header) return null
+  const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(header)
+  if (utf8?.[1]) {
+    try { return decodeURIComponent(utf8[1]) } catch {}
   }
-  return { ok: true, status: response.status, ...body }
+  return /filename="([^"]+)"/i.exec(header)?.[1] ?? /filename=([^;]+)/i.exec(header)?.[1]?.trim() ?? null
 }
 
 function resolveCodexBinary(): string {
@@ -561,6 +596,54 @@ ipcMain.handle('enterprise:deleteSession', (_e, workspaceId: string, sessionId: 
     method: 'DELETE'
   })
 ))
+
+ipcMain.handle('enterprise:artifacts', (_e, workspaceId: string, sessionId: string) => (
+  enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts`)
+))
+
+ipcMain.handle('enterprise:uploadArtifact', (_e, workspaceId: string, sessionId: string, filePath: string, meta: any = {}) => {
+  try {
+    if (!filePath || !existsSync(filePath)) return { ok: false, error: 'File does not exist' }
+    const stat = statSync(filePath)
+    if (!stat.isFile()) return { ok: false, error: 'Path is not a file' }
+    const content = readFileSync(filePath)
+    return enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: meta.name || basename(filePath),
+        mimeType: meta.mimeType || artifactMimeType(filePath),
+        localPath: filePath,
+        turnId: meta.turnId,
+        contentBase64: content.toString('base64')
+      })
+    })
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
+})
+
+ipcMain.handle('enterprise:downloadArtifact', async (_e, workspaceId: string, sessionId: string, artifactId: string, name?: string) => {
+  try {
+    const fetched = await enterpriseFetchResponse(
+      `/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/download`
+    )
+    if (!fetched.response) return fetched
+    const response = fetched.response
+    if (!response.ok) {
+      const text = await response.text()
+      return { ok: false, status: response.status, error: text || `Download failed with HTTP ${response.status}` }
+    }
+    const defaultName = name || contentDispositionFileName(response.headers.get('content-disposition')) || artifactId
+    const save = mainWindow
+      ? await dialog.showSaveDialog(mainWindow, { defaultPath: join(app.getPath('downloads'), basename(defaultName)) })
+      : await dialog.showSaveDialog({ defaultPath: join(app.getPath('downloads'), basename(defaultName)) })
+    if (save.canceled || !save.filePath) return { ok: false, canceled: true }
+    writeFileSync(save.filePath, Buffer.from(await response.arrayBuffer()))
+    return { ok: true, path: save.filePath }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
+})
 
 ipcMain.handle('attachments:pick', async () => {
   const options: OpenDialogOptions = {

@@ -42,12 +42,41 @@ export async function initDb(url: string) {
       content JSONB NOT NULL,
       created_at TIMESTAMPTZ DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS artifacts (
+      id UUID PRIMARY KEY,
+      workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+      session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
+      created_by TEXT NOT NULL,
+      name TEXT NOT NULL,
+      mime_type TEXT,
+      size_bytes INTEGER NOT NULL,
+      sha256 TEXT NOT NULL,
+      local_path TEXT,
+      turn_id TEXT,
+      content BYTEA NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
   `)
   await pool.query(`
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE;
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS local_thread_id TEXT;
     ALTER TABLE sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT now();
+    CREATE TABLE IF NOT EXISTS artifacts (
+      id UUID PRIMARY KEY,
+      workspace_id TEXT REFERENCES workspaces(id) ON DELETE CASCADE,
+      session_id UUID REFERENCES sessions(id) ON DELETE CASCADE,
+      created_by TEXT NOT NULL,
+      name TEXT NOT NULL,
+      mime_type TEXT,
+      size_bytes INTEGER NOT NULL,
+      sha256 TEXT NOT NULL,
+      local_path TEXT,
+      turn_id TEXT,
+      content BYTEA NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT now()
+    );
     CREATE INDEX IF NOT EXISTS sessions_workspace_updated_idx ON sessions (workspace_id, updated_at DESC);
     CREATE INDEX IF NOT EXISTS messages_session_created_idx ON messages (session_id, created_at ASC);
+    CREATE INDEX IF NOT EXISTS artifacts_session_created_idx ON artifacts (workspace_id, session_id, created_at DESC);
   `)
 }
