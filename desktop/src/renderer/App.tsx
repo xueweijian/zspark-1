@@ -84,15 +84,19 @@ function send(method: string, params: any = {}) {
 }
 
 type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'web'
+type ActivityActionKind = 'read' | 'write' | 'list' | 'search' | 'run' | 'build' | 'verify' | 'tool' | 'file'
 interface Activity {
   id: string
   kind: ActivityKind
   title: string
   detail?: string
+  actionKind?: ActivityActionKind
+  target?: string
   status: 'running' | 'done' | 'failed'
   startedAt: number
   endedAt?: number
 }
+type ActivityInfo = { title: string; detail?: string; actionKind: ActivityActionKind; target?: string }
 
 type Block =
   | { type: 'user'; id: string; text: string; turnId?: string }
@@ -486,17 +490,68 @@ function activityDetailWeight(block?: Extract<Block, { type: 'turn' }>) {
   return block.activities.reduce((total, activity) => total + (activity.detail?.length ?? 0), 0)
 }
 
+function inferActionKindFromTitle(title?: string): ActivityActionKind | undefined {
+  const t = String(title ?? '').toLowerCase()
+  if (!t) return undefined
+  if (/\bread\b/.test(t)) return 'read'
+  if (/\b(write|wrote|created|prepared|updated|changed|modified)\b/.test(t)) return 'write'
+  if (/\b(search|searched)\b/.test(t)) return 'search'
+  if (/\b(list|listed|inspect|explored)\b/.test(t)) return 'list'
+  if (/\b(build|export|pptx|deck)\b/.test(t)) return 'build'
+  if (/\b(verify|check)\b/.test(t)) return 'verify'
+  if (/\bused\b/.test(t)) return 'tool'
+  return undefined
+}
+
+function truncateActivityDetail(detail?: string, limit = 1800) {
+  if (!detail) return undefined
+  const trimmed = detail.trim()
+  if (trimmed.length <= limit) return trimmed
+  return `Output truncated to last ${limit} characters.\n\n${trimmed.slice(-limit)}`
+}
+
+function normalizeActivity(activity: any): Activity | null {
+  if (!activity || typeof activity.id !== 'string' || typeof activity.title !== 'string') return null
+  const kind: ActivityKind =
+    activity.kind === 'command' || activity.kind === 'file' || activity.kind === 'tool' || activity.kind === 'web'
+      ? activity.kind
+      : 'reasoning'
+  const status: Activity['status'] =
+    activity.status === 'failed' ? 'failed' :
+    activity.status === 'running' ? 'running' : 'done'
+  const startedAt = Number(activity.startedAt) || Date.now()
+  const endedAt = activity.endedAt ? Number(activity.endedAt) : undefined
+  return {
+    id: activity.id,
+    kind,
+    title: activity.title,
+    detail: truncateActivityDetail(activity.detail, kind === 'reasoning' ? 2400 : 1400),
+    actionKind: activity.actionKind ?? inferActionKindFromTitle(activity.title),
+    target: activity.target,
+    status,
+    startedAt,
+    endedAt
+  }
+}
+
 function loadPersistedActivityBlocks(threadId: string): Extract<Block, { type: 'turn' }>[] {
   try {
     const raw = window.localStorage.getItem(activityStorageKey(threadId))
     if (!raw) return []
     const parsed = JSON.parse(raw)
     if (!Array.isArray(parsed)) return []
-    return parsed.filter((block: any): block is Extract<Block, { type: 'turn' }> =>
-      block?.type === 'turn' &&
-      typeof block.turnId === 'string' &&
-      Array.isArray(block.activities)
-    )
+    return parsed
+      .filter((block: any) =>
+        block?.type === 'turn' &&
+        typeof block.turnId === 'string' &&
+        Array.isArray(block.activities)
+      )
+      .map((block: any) => ({
+        ...block,
+        activities: block.activities
+          .map(normalizeActivity)
+          .filter((activity: Activity | null): activity is Activity => Boolean(activity))
+      }))
   } catch {
     return []
   }
@@ -506,7 +561,13 @@ function savePersistedActivityBlocks(threadId: string, blocks: Block[]) {
   const turnBlocks = blocks.filter((block): block is Extract<Block, { type: 'turn' }> => block.type === 'turn')
   if (!turnBlocks.length) return
   try {
-    window.localStorage.setItem(activityStorageKey(threadId), JSON.stringify(turnBlocks.slice(-80)))
+    const normalized = turnBlocks.slice(-80).map((block) => ({
+      ...block,
+      activities: block.activities
+        .map(normalizeActivity)
+        .filter((activity: Activity | null): activity is Activity => Boolean(activity))
+    }))
+    window.localStorage.setItem(activityStorageKey(threadId), JSON.stringify(normalized))
   } catch {
     // Best-effort UI continuity; chat correctness must not depend on storage.
   }
@@ -539,21 +600,144 @@ function mergePersistedActivityBlocks(blocks: Block[], persisted: Extract<Block,
 }
 
 function shortenCommand(command: string, limit = 72) {
-  const firstLine = command.replace(/^\/bin\/zsh -lc\s+/, '').split('\n')[0]?.trim() || command
+  const firstLine = cleanShellCommand(command).split('\n')[0]?.trim() || command
   return firstLine.length > limit ? firstLine.slice(0, limit - 1) + '…' : firstLine
 }
 
-function commandActivityTitle(item: any) {
+function cleanShellCommand(command: string) {
+  return command
+    .replace(/^\/bin\/(?:zsh|bash|sh) -lc\s+/, '')
+    .replace(/^'([\s\S]*)'$/, '$1')
+    .trim()
+}
+
+function titleizeToolName(value?: string) {
+  const raw = String(value ?? 'tool').split(':').pop() ?? 'tool'
+  const lower = raw.toLowerCase()
+  if (lower.includes('computer')) return 'Computer Use'
+  if (lower.includes('read_mcp_resource')) return 'MCP resource'
+  return raw
+    .replace(/[_./-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+function commandActionInfo(action: any): ActivityInfo | null {
+  const actionType = String(action?.type ?? '')
+  const target = action?.path ? String(action.path) : undefined
+  const name = String(action?.name ?? (target ? basename(target) : '')).trim()
+  const label = name || (target ? basename(target) : 'file')
+  if (actionType === 'read') {
+    return { title: `Read ${label}`, detail: target ? shortPath(target) : undefined, actionKind: 'read', target }
+  }
+  if (actionType === 'write' || actionType === 'update') {
+    return { title: `Wrote ${label}`, detail: target ? shortPath(target) : undefined, actionKind: 'write', target }
+  }
+  if (actionType === 'delete') {
+    return { title: `Deleted ${label}`, detail: target ? shortPath(target) : undefined, actionKind: 'write', target }
+  }
+  if (action?.command) return inferCommandInfo(String(action.command))
+  return null
+}
+
+function inferCommandInfo(command: string): ActivityInfo {
+  const cleaned = cleanShellCommand(command)
+  if (/build_artifact_deck\.mjs/.test(cleaned)) return { title: 'Built PPTX deck', actionKind: 'build' }
+  if (/import\(['"]@oai\/artifact-tool['"]\)/.test(cleaned) || /artifact-tool ok/.test(cleaned)) return { title: 'Checked presentation runtime', actionKind: 'verify' }
+  if (/test -s|ls -lh/.test(cleaned)) return { title: 'Verified generated file', actionKind: 'verify' }
+  if (/\bmkdir\b/.test(cleaned)) return { title: 'Prepared workspace folders', actionKind: 'write' }
+  if (/\b(rg|grep)\b/.test(cleaned)) return { title: 'Searched workspace', detail: shortenCommand(cleaned, 96), actionKind: 'search' }
+  if (/\b(find|ls)\b/.test(cleaned)) return { title: 'Listed workspace files', detail: shortenCommand(cleaned, 96), actionKind: 'list' }
+  if (/(cat\s+>|tee\s+|apply_patch)/.test(cleaned)) return { title: 'Wrote workspace files', actionKind: 'write' }
+  if (/\b(cat|sed|head|tail)\b/.test(cleaned)) return { title: 'Read file content', detail: shortenCommand(cleaned, 96), actionKind: 'read' }
+  if (/\bnpm\s+run\s+(typecheck|test|build)\b|\b(pnpm|yarn)\s+(test|build|typecheck)\b/.test(cleaned)) return { title: 'Ran project checks', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
+  if (/\bgit\s+status\b/.test(cleaned)) return { title: 'Checked git status', actionKind: 'run' }
+  if (/\bgit\s+commit\b/.test(cleaned)) return { title: 'Created git commit', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
+  if (/\bgit\s+push\b/.test(cleaned)) return { title: 'Pushed branch', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
+  return { title: `Ran ${shortenCommand(cleaned)}`, detail: shortenCommand(cleaned, 120), actionKind: 'run' }
+}
+
+function commandActivityInfo(item: any): ActivityInfo {
   const command = String(item?.command ?? '')
-  const firstAction = Array.isArray(item?.commandActions) ? item.commandActions[0] : undefined
-  if (firstAction?.type === 'read') return `Read ${firstAction.name ?? basename(String(firstAction.path ?? 'file'))}`
-  if (firstAction?.type === 'write') return `Write ${firstAction.name ?? basename(String(firstAction.path ?? 'file'))}`
-  if (/build_artifact_deck\.mjs/.test(command)) return 'Build PPTX deck'
-  if (/import\('@oai\/artifact-tool'\)/.test(command) || /artifact-tool ok/.test(command)) return 'Check presentation runtime'
-  if (/slide[-_]\d+\.mjs/.test(command) && /(cat >|tee|write)/.test(command)) return 'Write slide source'
-  if (/test -s|ls -lh/.test(command)) return 'Verify generated file'
-  if (/\b(find|ls)\b/.test(command)) return 'Inspect workspace files'
-  return shortenCommand(command)
+  const actions: ActivityInfo[] = Array.isArray(item?.commandActions)
+    ? item.commandActions.map(commandActionInfo).filter((action: ActivityInfo | null): action is ActivityInfo => Boolean(action))
+    : []
+  if (actions.length === 1) return actions[0]
+  if (actions.length > 1) {
+    const firstKind = actions[0].actionKind
+    const sameKind = actions.every((action) => action.actionKind === firstKind)
+    const targets = actions.map((action) => action.target).filter(Boolean).slice(0, 6)
+    if (sameKind && firstKind === 'read') return { title: `Read ${actions.length} files`, detail: targets.map((target) => shortPath(target)).join('\n'), actionKind: 'read' }
+    if (sameKind && firstKind === 'write') return { title: `Wrote ${actions.length} files`, detail: targets.map((target) => shortPath(target)).join('\n'), actionKind: 'write' }
+    return { title: `Ran ${actions.length} command actions`, detail: actions.map((action) => action.title).join('\n'), actionKind: 'run' }
+  }
+  return inferCommandInfo(command)
+}
+
+function commandActivityDetail(item: any, info = commandActivityInfo(item)) {
+  const output = String(item?.aggregated_output ?? item?.aggregatedOutput ?? '').trim()
+  const actionDetail = info.detail || (info.target ? shortPath(info.target) : '')
+  if (!output) return actionDetail || undefined
+  if (info.actionKind === 'read' && output.length > 800) {
+    return actionDetail ? `${actionDetail}\nLarge read output hidden from the activity log.` : 'Large read output hidden from the activity log.'
+  }
+  const capped = truncateActivityDetail(output, info.actionKind === 'run' ? 1400 : 900)
+  return actionDetail && capped ? `${actionDetail}\n\n${capped}` : capped
+}
+
+function toolActivityInfo(item: any) {
+  const toolName = titleizeToolName(item?.tool ?? item?.name ?? item?.server)
+  const detailParts: string[] = []
+  if (item?.server) detailParts.push(`Server: ${item.server}`)
+  if (item?.error?.message) detailParts.push(item.error.message)
+  return {
+    title: `Used ${toolName}`,
+    detail: truncateActivityDetail(detailParts.join('\n'), 900),
+    actionKind: 'tool' as const
+  }
+}
+
+function webSearchActivityInfo(item: any) {
+  const query = String(item?.query ?? '').trim()
+  return {
+    title: query ? `Searched "${query}"` : 'Searched the web',
+    detail: query || undefined,
+    actionKind: 'search' as const
+  }
+}
+
+function actionKindForSummary(activity: Activity): ActivityActionKind | undefined {
+  if (activity.actionKind) return activity.actionKind
+  if (activity.kind === 'tool') return 'tool'
+  if (activity.kind === 'file') return 'file'
+  if (activity.kind === 'web') return 'search'
+  return inferActionKindFromTitle(activity.title)
+}
+
+function activitySummaryLabels(activities: Activity[]) {
+  const visible = activities.filter((activity) => activity.kind !== 'reasoning')
+  const counts = new Map<ActivityActionKind | 'command', number>()
+  for (const activity of visible) {
+    if (activity.kind === 'command') counts.set('command', (counts.get('command') ?? 0) + 1)
+    const actionKind = actionKindForSummary(activity)
+    if (actionKind) counts.set(actionKind, (counts.get(actionKind) ?? 0) + 1)
+  }
+  const labels: string[] = []
+  const plural = (count: number, singular: string, pluralLabel = `${singular}s`) => `${count} ${count === 1 ? singular : pluralLabel}`
+  const push = (count: number | undefined, phrase: (count: number) => string) => {
+    if (count) labels.push(phrase(count))
+  }
+  push(counts.get('command'), (count) => `Ran ${plural(count, 'command')}`)
+  push(counts.get('tool'), (count) => `Used ${plural(count, 'tool')}`)
+  push(counts.get('read'), (count) => `Read ${plural(count, 'file')}`)
+  push(counts.get('write'), (count) => `Wrote ${plural(count, 'file action')}`)
+  push(counts.get('search'), (count) => `Searched ${plural(count, 'time', 'times')}`)
+  push(counts.get('list'), (count) => `Listed ${plural(count, 'folder')}`)
+  push(counts.get('build'), (count) => `Built ${plural(count, 'artifact')}`)
+  push(counts.get('verify'), (count) => `Verified ${plural(count, 'result')}`)
+  push(counts.get('file'), (count) => `Changed ${plural(count, 'file')}`)
+  return labels
 }
 
 function itemTimeMs(item: any, key: 'startedAtMs' | 'completedAtMs', fallback: number) {
@@ -580,11 +764,14 @@ function replayActivityFromItem(item: any, fallbackStartedAt: number): Activity 
     const status: Activity['status'] =
       item.status === 'failed' ? 'failed' :
       item.status === 'inProgress' ? 'running' : 'done'
+    const info = commandActivityInfo(item)
     return {
       id: `replay-a-${id}`,
       kind: 'command',
-      title: commandActivityTitle(item),
-      detail: item.aggregated_output ?? item.aggregatedOutput ?? undefined,
+      title: info.title,
+      detail: commandActivityDetail(item, info),
+      actionKind: info.actionKind,
+      target: info.target,
       status,
       startedAt,
       endedAt: status === 'running' ? undefined : endedAt
@@ -597,26 +784,33 @@ function replayActivityFromItem(item: any, fallbackStartedAt: number): Activity 
       kind: 'file',
       title: `${changes.length} file${changes.length === 1 ? '' : 's'} changed`,
       detail: changes.map((change: any) => `${describeChange(change.kind)} ${change.path}`).join('\n'),
+      actionKind: 'file',
       status: 'done',
       startedAt,
       endedAt
     }
   }
   if (item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall') {
+    const info = toolActivityInfo(item)
     return {
       id: `replay-a-${id}`,
       kind: 'tool',
-      title: item.tool ? `${item.tool}` : 'Tool call',
+      title: info.title,
+      detail: info.detail,
+      actionKind: info.actionKind,
       status: item.status === 'failed' ? 'failed' : 'done',
       startedAt,
       endedAt
     }
   }
   if (item?.type === 'webSearch') {
+    const info = webSearchActivityInfo(item)
     return {
       id: `replay-a-${id}`,
       kind: 'web',
-      title: item.query ? `Searched "${item.query}"` : 'Web search',
+      title: info.title,
+      detail: info.detail,
+      actionKind: info.actionKind,
       status: 'done',
       startedAt,
       endedAt
@@ -973,7 +1167,8 @@ function DesktopApp() {
     })
   }
   const updateActivity = (turnId: string, actId: string, patch: Partial<Activity>) => {
-    updateTurn(turnId, (t) => ({ ...t, activities: t.activities.map((a) => (a.id === actId ? { ...a, ...patch } : a)) }))
+    const cleanPatch = Object.fromEntries(Object.entries(patch).filter(([, value]) => value !== undefined)) as Partial<Activity>
+    updateTurn(turnId, (t) => ({ ...t, activities: t.activities.map((a) => (a.id === actId ? { ...a, ...cleanPatch } : a)) }))
   }
   const ensureActivity = (turnId: string, itemId: string, init: Omit<Activity, 'id' | 'status' | 'startedAt'>) => {
     let actId = itemActivity.current.get(itemId)
@@ -1067,13 +1262,22 @@ function DesktopApp() {
             if (wm) toast('warn', wm)
             return
           }
+          let msg = params?.error?.message ?? params?.message ?? 'Provider error'
+          try { const inner = JSON.parse(msg); msg = inner?.error?.message ?? msg } catch {}
+          if (params?.willRetry) {
+            const cur = currentTurn.current
+            if (cur) {
+              const itemId = `provider-retry-${cur.turnId}`
+              ensureActivity(cur.turnId, itemId, { kind: 'tool', title: 'Provider reconnecting', actionKind: 'tool' })
+              appendActivityDetail(cur.turnId, itemId, `${msg}\n`)
+            }
+            return
+          }
           submitInFlight.current = false
           setSubmitting(false)
           setStreaming(false)
           const cur = currentTurn.current
           if (cur) updateTurn(cur.turnId, (t) => ({ ...t, endedAt: Date.now() }))
-          let msg = params?.error?.message ?? params?.message ?? 'Provider error'
-          try { const inner = JSON.parse(msg); msg = inner?.error?.message ?? msg } catch {}
           if (msg.length > 500) msg = msg.slice(0, 500) + '…'
           toast('error', msg)
           return
@@ -1111,7 +1315,7 @@ function DesktopApp() {
           const itemId = String(params.itemId ?? '')
           if (!itemId) return
           if (!itemActivity.current.has(itemId)) {
-            ensureActivity(turnId, itemId, { kind: 'command', title: 'Command output' })
+            ensureActivity(turnId, itemId, { kind: 'command', title: 'Command output', actionKind: 'run' })
           }
           appendActivityDetail(turnId, itemId, params.delta ?? '')
           return
@@ -1173,18 +1377,20 @@ function DesktopApp() {
           }
           if (item.type === 'commandExecution') {
             const itemId = item.id as string
-            const title = commandActivityTitle(item)
+            const info = commandActivityInfo(item)
             if (method === 'item/started') {
-              ensureActivity(turnId, itemId, { kind: 'command', title })
+              ensureActivity(turnId, itemId, { kind: 'command', title: info.title, detail: info.detail, actionKind: info.actionKind, target: info.target })
             } else {
               const status: Activity['status'] =
                 item.status === 'completed' ? 'done' :
                 item.status === 'failed' ? 'failed' : 'done'
-              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'command', title })
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'command', title: info.title, actionKind: info.actionKind, target: info.target })
               updateActivity(turnId, itemActivity.current.get(itemId)!, {
                 status, endedAt: Date.now(),
-                detail: item.aggregated_output ?? item.aggregatedOutput ?? undefined,
-                title
+                detail: commandActivityDetail(item, info),
+                title: info.title,
+                actionKind: info.actionKind,
+                target: info.target
               })
             }
             return
@@ -1194,33 +1400,33 @@ function DesktopApp() {
             const changes = item.changes ?? []
             const title = `${changes.length} file${changes.length === 1 ? '' : 's'} changed`
             const detail = changes.map((change: any) => `${describeChange(change.kind)} ${change.path}`).join('\n')
-            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'file', title })
+            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'file', title, actionKind: 'file' })
             else {
-              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'file', title })
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'file', title, actionKind: 'file' })
               const files = filesFromChanges(changes, runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot)
               upsertWorkspaceFiles(files)
               upsertArtifactBlock(turnId, itemId, files)
-              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail })
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail, actionKind: 'file' })
             }
             return
           }
           if (item.type === 'mcpToolCall' || item.type === 'dynamicToolCall') {
             const itemId = item.id as string
-            const title = item.tool ? `${item.tool}` : 'tool call'
-            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'tool', title })
+            const info = toolActivityInfo(item)
+            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'tool', title: info.title, detail: info.detail, actionKind: info.actionKind })
             else {
-              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'tool', title })
-              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: item.status === 'failed' ? 'failed' : 'done', endedAt: Date.now() })
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'tool', title: info.title, actionKind: info.actionKind })
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: item.status === 'failed' ? 'failed' : 'done', endedAt: Date.now(), title: info.title, detail: info.detail, actionKind: info.actionKind })
             }
             return
           }
           if (item.type === 'webSearch') {
             const itemId = item.id as string
-            const title = item.query ? `Searched “${item.query}”` : 'Web search'
-            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'web', title })
+            const info = webSearchActivityInfo(item)
+            if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'web', title: info.title, detail: info.detail, actionKind: info.actionKind })
             else {
-              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'web', title })
-              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now() })
+              if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'web', title: info.title, actionKind: info.actionKind })
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title: info.title, detail: info.detail, actionKind: info.actionKind })
             }
             return
           }
@@ -1771,7 +1977,10 @@ function DesktopApp() {
               const dur = (b.endedAt ?? clock) - b.startedAt
               const running = !b.endedAt
               const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
-              const stepsLabel = meaningful.length === 0
+              const summaryLabels = activitySummaryLabels(meaningful)
+              const stepsLabel = summaryLabels.length
+                ? summaryLabels.slice(0, 2).join(' · ')
+                : meaningful.length === 0
                 ? (running ? 'waiting for activity' : (b.activities.some((a) => a.kind === 'reasoning' && a.detail) ? 'thought captured' : 'no tool activity'))
                 : `${meaningful.length} step${meaningful.length === 1 ? '' : 's'}`
               return (
@@ -1790,6 +1999,11 @@ function DesktopApp() {
                   </div>
                   {!b.collapsed && (
                     <div className="activity-body">
+                      {summaryLabels.length > 0 && (
+                        <div className="activity-summary" aria-label="Activity summary">
+                          {summaryLabels.map((label) => <span key={label} className="activity-pill">{label}</span>)}
+                        </div>
+                      )}
                       {b.activities.length === 0 ? (
                         <div className="empty-act">Preparing…</div>
                       ) : b.activities.map((a) => {
@@ -1799,15 +2013,9 @@ function DesktopApp() {
                             <div className="act-icon">{actIcon(a.kind)}</div>
                             <div className="act-meat">
                               <div className="act-title">{a.title}{isPlaceholder ? ' · waiting for first token' : ''}</div>
-                              {a.detail && a.kind === 'reasoning' && (
-                                <div className="act-detail">{a.detail}</div>
-                              )}
-                              {a.detail && a.kind === 'command' && (
-                                <pre className="act-detail mono">{a.detail.slice(-1200)}</pre>
-                              )}
-                              {a.detail && a.kind === 'file' && (
-                                <div className="act-detail">{a.detail}</div>
-                              )}
+                              {a.target && !a.detail && <div className="act-target">{shortPath(a.target)}</div>}
+                              {a.detail && a.kind === 'command' && <pre className="act-detail mono">{a.detail}</pre>}
+                              {a.detail && a.kind !== 'command' && <div className="act-detail">{a.detail}</div>}
                             </div>
                             <div className="act-status">
                               {a.status === 'running' ? '· · ·' :
