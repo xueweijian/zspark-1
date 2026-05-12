@@ -87,6 +87,13 @@ export const IconTrash = () => (
   </Wrap>
 )
 
+export const IconShield = () => (
+  <Wrap>
+    <path d="M12 2 5 5v6c0 4.4 2.8 8.3 7 9.8 4.2-1.5 7-5.4 7-9.8V5l-7-3z" />
+    <path d="m9 12 2 2 4-4" />
+  </Wrap>
+)
+
 export const IconClose = () => (
   <Wrap size={14}>
     <path d="M18 6 6 18M6 6l12 12" />

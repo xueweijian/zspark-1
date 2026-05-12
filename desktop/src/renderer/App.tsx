@@ -5,7 +5,7 @@ import {
   IconNewChat, IconSearch, IconSkills, IconPlugins, IconAutomations,
   IconProject, IconSend, IconClose, IconSettings, IconChevron,
   IconBrain, IconTerminal, IconFile, IconImage, IconTool, IconGlobe,
-  IconCopy, IconRegenerate, IconTrash
+  IconCopy, IconRegenerate, IconTrash, IconShield
 } from './icons'
 import {
   filterSkillCatalog,
@@ -60,11 +60,13 @@ const starters = [
 const FALLBACK_MODEL_METADATA_WARNING = 'Defaulting to fallback metadata'
 const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
 const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
+const USER_APPROVAL_REVIEWER = 'user'
 
 let nextId = 1
 const newId = () => nextId++
 interface Pending { resolve: (msg: any) => void; reject: (err: any) => void }
 const pending = new Map<number, Pending>()
+type JsonRpcId = number | string
 
 function send(method: string, params: any = {}) {
   return new Promise<any>((resolve, reject) => {
@@ -84,6 +86,14 @@ function send(method: string, params: any = {}) {
   })
 }
 
+function sendRpcResult(id: JsonRpcId, result: any) {
+  return window.zspark.send(JSON.stringify({ jsonrpc: '2.0', id, result }))
+}
+
+function sendRpcError(id: JsonRpcId, code: number, message: string) {
+  return window.zspark.send(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }))
+}
+
 type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'web'
 type ActivityActionKind = 'read' | 'write' | 'list' | 'search' | 'run' | 'build' | 'verify' | 'tool' | 'file'
 interface Activity {
@@ -99,10 +109,34 @@ interface Activity {
 }
 type ActivityInfo = { title: string; detail?: string; actionKind: ActivityActionKind; target?: string }
 
+type ApprovalKind = 'command' | 'fileChange' | 'permissions'
+type ApprovalStatus = 'pending' | 'sending' | 'approved' | 'denied' | 'resolved'
+interface ApprovalRequest {
+  id: JsonRpcId
+  key: string
+  kind: ApprovalKind
+  method: string
+  blockId: string
+  threadId: string
+  turnId: string
+  itemId: string
+  title: string
+  description: string
+  detail?: string
+  commandPreview?: string
+  cwd?: string
+  reason?: string
+  paths: string[]
+  params: any
+  status: ApprovalStatus
+  startedAt: number
+}
+
 type Block =
   | { type: 'user'; id: string; text: string; turnId?: string; input?: TurnInputItem[] }
   | { type: 'agent'; id: string; text: string; turnId?: string }
   | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[]; subtitle?: string; tone?: 'normal' | 'warn' }
+  | { type: 'approval'; id: string; turnId: string; request: ApprovalRequest }
   | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
 type MessageBlock = Extract<Block, { type: 'user' | 'agent' }>
 
@@ -458,6 +492,226 @@ function MessageActions({
   )
 }
 
+function rpcKey(id: JsonRpcId) {
+  return String(id)
+}
+
+function userApprovalParams() {
+  return { approvalsReviewer: USER_APPROVAL_REVIEWER }
+}
+
+function isApprovalRequest(method: string) {
+  return method === 'item/commandExecution/requestApproval' ||
+    method === 'item/fileChange/requestApproval' ||
+    method === 'item/permissions/requestApproval' ||
+    method === 'execCommandApproval' ||
+    method === 'applyPatchApproval'
+}
+
+function approvalKindForMethod(method: string): ApprovalKind | null {
+  switch (method) {
+    case 'item/commandExecution/requestApproval': return 'command'
+    case 'execCommandApproval': return 'command'
+    case 'item/fileChange/requestApproval': return 'fileChange'
+    case 'applyPatchApproval': return 'fileChange'
+    case 'item/permissions/requestApproval': return 'permissions'
+    default: return null
+  }
+}
+
+function approvalStatusLabel(status: ApprovalStatus) {
+  switch (status) {
+    case 'pending': return 'Needs approval'
+    case 'sending': return 'Sending decision'
+    case 'approved': return 'Approved'
+    case 'denied': return 'Denied'
+    case 'resolved': return 'No longer needed'
+  }
+}
+
+function approvalDecision(params: any, approved: boolean) {
+  if (!approved) {
+    const decisions = Array.isArray(params?.availableDecisions) ? params.availableDecisions : []
+    return decisions.includes('decline') ? 'decline' : decisions.includes('cancel') ? 'cancel' : 'decline'
+  }
+  const decisions = Array.isArray(params?.availableDecisions) ? params.availableDecisions : []
+  if (decisions.includes('accept')) return 'accept'
+  if (decisions.includes('acceptForSession')) return 'acceptForSession'
+  return 'accept'
+}
+
+function uniqueCompact(values: Array<string | undefined | null>) {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const value of values) {
+    const text = String(value ?? '').trim()
+    if (!text || seen.has(text)) continue
+    seen.add(text)
+    out.push(text)
+  }
+  return out
+}
+
+function pathsFromCommandActions(actions: any[] | null | undefined) {
+  if (!Array.isArray(actions)) return []
+  return uniqueCompact(actions.map((action) => action?.path))
+}
+
+function permissionPaths(permissions: any) {
+  const fs = permissions?.fileSystem
+  const entryPaths = Array.isArray(fs?.entries)
+    ? fs.entries.map((entry: any) => entry?.path ?? entry?.root)
+    : []
+  return uniqueCompact([
+    ...(Array.isArray(fs?.read) ? fs.read : []),
+    ...(Array.isArray(fs?.write) ? fs.write : []),
+    ...entryPaths
+  ])
+}
+
+function permissionSummary(permissions: any) {
+  const parts: string[] = []
+  const paths = permissionPaths(permissions)
+  if (paths.length) parts.push(`${paths.length} filesystem path${paths.length === 1 ? '' : 's'}`)
+  if (permissions?.network?.enabled) parts.push('network access')
+  return parts.length ? parts.join(' and ') : 'extra access'
+}
+
+function grantedPermissionsFromRequest(permissions: any) {
+  const granted: any = {}
+  if (permissions?.network?.enabled) granted.network = { enabled: true }
+  const fs = permissions?.fileSystem
+  if (fs) {
+    const fileSystem: any = {}
+    if (Array.isArray(fs.read) && fs.read.length) fileSystem.read = fs.read
+    if (Array.isArray(fs.write) && fs.write.length) fileSystem.write = fs.write
+    if (Array.isArray(fs.entries) && fs.entries.length) fileSystem.entries = fs.entries
+    if (typeof fs.globScanMaxDepth === 'number') fileSystem.globScanMaxDepth = fs.globScanMaxDepth
+    if (Object.keys(fileSystem).length) granted.fileSystem = fileSystem
+  }
+  return granted
+}
+
+function approvalRequestFromServer(id: JsonRpcId, method: string, params: any): ApprovalRequest | null {
+  const kind = approvalKindForMethod(method)
+  if (!kind) return null
+  const key = rpcKey(id)
+  const turnId = String(params?.turnId ?? '')
+  const threadId = String(params?.threadId ?? params?.conversationId ?? '')
+  const itemId = String(params?.itemId ?? params?.callId ?? key)
+  const cwd = params?.cwd ? String(params.cwd) : undefined
+  const reason = params?.reason ? String(params.reason) : undefined
+  const startedAt = timestampToMs(params?.startedAtMs, Date.now())
+
+  if (kind === 'command') {
+    const rawCommand = Array.isArray(params?.command) ? params.command.join(' ') : params?.command
+    const info = commandActivityInfo({ command: rawCommand, commandActions: params?.commandActions })
+    const command = rawCommand ? cleanShellCommand(String(rawCommand)) : undefined
+    const paths = pathsFromCommandActions(params?.commandActions)
+    return {
+      id, key, kind, method, threadId, turnId, itemId,
+      blockId: `approval-${key}`,
+      title: publicActivityTitleText(info.title),
+      description: params?.networkApprovalContext
+        ? 'Codex needs network permission before continuing this step.'
+        : 'Codex needs your approval before running this action outside the current sandbox.',
+      detail: paths.length ? `${paths.length} related path${paths.length === 1 ? '' : 's'}` : undefined,
+      commandPreview: command ? shortenCommand(command, 120) : undefined,
+      cwd,
+      reason,
+      paths,
+      params,
+      status: 'pending',
+      startedAt
+    }
+  }
+
+  if (kind === 'fileChange') {
+    const grantRoot = params?.grantRoot ? String(params.grantRoot) : undefined
+    const changedPaths = params?.fileChanges && typeof params.fileChanges === 'object'
+      ? Object.keys(params.fileChanges)
+      : []
+    return {
+      id, key, kind, method, threadId, turnId, itemId,
+      blockId: `approval-${key}`,
+      title: 'Allow file changes',
+      description: 'Codex wants to apply file changes and needs your approval.',
+      detail: grantRoot ? `Requested write root: ${shortPath(grantRoot)}` : undefined,
+      cwd,
+      reason,
+      paths: uniqueCompact([grantRoot, ...changedPaths]),
+      params,
+      status: 'pending',
+      startedAt
+    }
+  }
+
+  const paths = permissionPaths(params?.permissions)
+  return {
+    id, key, kind, method, threadId, turnId, itemId,
+    blockId: `approval-${key}`,
+    title: 'Grant extra access',
+    description: `Codex is asking for ${permissionSummary(params?.permissions)}.`,
+    detail: paths.length ? paths.map(shortPath).join('\n') : undefined,
+    cwd,
+    reason,
+    paths,
+    params,
+    status: 'pending',
+    startedAt
+  }
+}
+
+function approvalResponsePayload(request: ApprovalRequest, approved: boolean) {
+  if (request.method === 'execCommandApproval' || request.method === 'applyPatchApproval') {
+    return { decision: approved ? 'approved' : 'denied' }
+  }
+  if (request.kind === 'permissions') {
+    return approved
+      ? { scope: 'turn', permissions: grantedPermissionsFromRequest(request.params?.permissions) }
+      : { scope: 'turn', permissions: {} }
+  }
+  return { decision: approvalDecision(request.params, approved) }
+}
+
+function ApprovalCard({
+  request,
+  onDecision
+}: {
+  request: ApprovalRequest
+  onDecision: (request: ApprovalRequest, approved: boolean) => void
+}) {
+  const actionable = request.status === 'pending'
+  return (
+    <div className={`approval-card approval-${request.status}`}>
+      <div className="approval-mark"><IconShield /></div>
+      <div className="approval-content">
+        <div className="approval-topline">
+          <span>Approval required</span>
+          <em>{approvalStatusLabel(request.status)}</em>
+        </div>
+        <div className="approval-title">{request.title}</div>
+        <div className="approval-desc">{request.description}</div>
+        {(request.reason || request.cwd || request.detail || request.commandPreview || request.paths.length > 0) && (
+          <div className="approval-meta">
+            {request.reason && <div><strong>Reason</strong><span>{request.reason}</span></div>}
+            {request.cwd && <div><strong>Working folder</strong><span title={request.cwd}>{shortPath(request.cwd)}</span></div>}
+            {request.detail && <div><strong>Details</strong><span>{request.detail}</span></div>}
+            {request.paths.slice(0, 4).map((path) => (
+              <div key={path}><strong>Path</strong><span title={path}>{shortPath(path)}</span></div>
+            ))}
+            {request.commandPreview && <div className="approval-command"><strong>Command</strong><span>{request.commandPreview}</span></div>}
+          </div>
+        )}
+        <div className="approval-actions">
+          <button className="approval-approve" disabled={!actionable} onClick={() => onDecision(request, true)}>Approve</button>
+          <button className="approval-deny" disabled={!actionable} onClick={() => onDecision(request, false)}>Deny</button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
 function filesFromChanges(changes: any[], base?: string, now = Date.now()): WorkspaceFile[] {
   return changes.map((change, index) => {
     const fullPath = resolveWorkspacePath(String(change.path ?? ''), base)
@@ -774,6 +1028,7 @@ function inferCommandInfo(command: string): ActivityInfo {
   if (/import\(['"]@oai\/artifact-tool['"]\)/.test(cleaned) || /artifact-tool ok/.test(cleaned)) return { title: 'Checked presentation runtime', actionKind: 'verify' }
   if (/test -s|ls -lh/.test(cleaned)) return { title: 'Verified generated file', actionKind: 'verify' }
   if (/\bmkdir\b/.test(cleaned)) return { title: 'Prepared workspace', actionKind: 'write' }
+  if (/\btrash\b/.test(cleaned)) return { title: 'Move files to Trash', actionKind: 'write' }
   if (/\b(rg|grep)\b/.test(cleaned)) return { title: 'Inspected project context', actionKind: 'search' }
   if (/\b(find|ls)\b/.test(cleaned)) return { title: 'Reviewed workspace files', actionKind: 'list' }
   if (/(cat\s+>|tee\s+|apply_patch)/.test(cleaned)) return { title: 'Drafted workspace content', actionKind: 'write' }
@@ -866,8 +1121,8 @@ function activitySummaryLabels(activities: Activity[]) {
   return labels
 }
 
-function publicActivityTitle(activity: Activity) {
-  const title = activity.title.trim()
+function publicActivityTitleText(value: string) {
+  const title = value.trim()
   if (/^Read SKILL\.md$/i.test(title)) return 'Loaded presentation skill'
   if (/^Read (?:build_artifact_deck|artifact_tool_utils|index)\.mjs$/i.test(title)) return 'Checked Office tooling'
   if (/^Read slide[-_]\d+\.mjs$/i.test(title)) return 'Reviewed slide source'
@@ -882,6 +1137,10 @@ function publicActivityTitle(activity: Activity) {
   if (/^Ran (?:cd |node -e|["']?\/Users\/)/i.test(title)) return 'Ran workspace step'
   if (/\/Users\/|\.cache\/codex-runtimes|node_modules/.test(title)) return 'Ran workspace step'
   return title
+}
+
+function publicActivityTitle(activity: Activity) {
+  return publicActivityTitleText(activity.title)
 }
 
 function publicActivityDetail(activity: Activity) {
@@ -1104,6 +1363,7 @@ function DesktopApp() {
   const agentForTurn = useRef<Map<string, string>>(new Map())
   // Map item id -> activity id
   const itemActivity = useRef<Map<string, string>>(new Map())
+  const approvalRequests = useRef<Map<string, ApprovalRequest>>(new Map())
   const seenTurnStarts = useRef<Set<string>>(new Set())
   const appliedReasoningCompletions = useRef<Set<string>>(new Set())
   const recentNotificationLines = useRef<Map<string, number>>(new Map())
@@ -1171,6 +1431,7 @@ function DesktopApp() {
     currentTurn.current = null
     agentForTurn.current.clear()
     itemActivity.current.clear()
+    approvalRequests.current.clear()
     seenTurnStarts.current.clear()
     appliedReasoningCompletions.current.clear()
     recentNotificationLines.current.clear()
@@ -1423,6 +1684,81 @@ function DesktopApp() {
     // Also link the turn block to this agent block as its final message.
     updateTurn(turnId, (t) => (t.finalMessageId ? t : { ...t, finalMessageId: blockId }))
   }
+  const setApprovalStatus = (key: string, status: ApprovalStatus) => {
+    const current = approvalRequests.current.get(key)
+    if (current) approvalRequests.current.set(key, { ...current, status })
+    setBlocks((bs) => bs.map((b) => (
+      b.type === 'approval' && b.request.key === key
+        ? { ...b, request: { ...b.request, status } }
+        : b
+    )))
+  }
+  const upsertApprovalBlock = (request: ApprovalRequest) => {
+    approvalRequests.current.set(request.key, request)
+    if (request.turnId) {
+      upsertTurnBlock(request.turnId, `turn-${request.turnId}`, request.startedAt)
+      const activityId = `approval-${request.key}`
+      ensureActivity(request.turnId, activityId, {
+        kind: 'tool',
+        title: 'Waiting for approval',
+        detail: request.title,
+        actionKind: 'tool'
+      })
+    }
+    setBlocks((bs) => {
+      const existing = bs.findIndex((b) => b.type === 'approval' && b.request.key === request.key)
+      const block: Block = { type: 'approval', id: request.blockId, turnId: request.turnId, request }
+      if (existing !== -1) return bs.map((b, index) => (index === existing ? block : b))
+
+      const turnIndex = bs.findIndex((b) => b.type === 'turn' && b.turnId === request.turnId)
+      if (turnIndex !== -1) return [...bs.slice(0, turnIndex + 1), block, ...bs.slice(turnIndex + 1)]
+      const userIndex = bs.findIndex((b) => b.type === 'user' && b.turnId === request.turnId)
+      if (userIndex !== -1) return [...bs.slice(0, userIndex + 1), block, ...bs.slice(userIndex + 1)]
+      return [...bs, block]
+    })
+  }
+  const resolveApprovalRequest = (requestId: JsonRpcId) => {
+    const key = rpcKey(requestId)
+    const request = approvalRequests.current.get(key)
+    if (!request || request.status === 'approved' || request.status === 'denied') return
+    setApprovalStatus(key, 'resolved')
+  }
+  const handleServerRequest = (id: JsonRpcId, method: string, params: any) => {
+    if (!isApprovalRequest(method)) {
+      void sendRpcError(id, -32601, `Unsupported server request: ${method}`)
+      toast('warn', `Unsupported server request: ${method}`)
+      return
+    }
+    const request = approvalRequestFromServer(id, method, params)
+    if (!request) {
+      void sendRpcError(id, -32602, 'Malformed approval request')
+      toast('error', 'Malformed approval request')
+      return
+    }
+    if (!request.turnId && currentTurn.current) request.turnId = currentTurn.current.turnId
+    upsertApprovalBlock(request)
+    scrollToLatest('smooth')
+  }
+  const respondApproval = async (request: ApprovalRequest, approved: boolean) => {
+    if (request.status !== 'pending') return
+    setApprovalStatus(request.key, 'sending')
+    try {
+      const ok = await sendRpcResult(request.id, approvalResponsePayload(request, approved))
+      if (!ok) throw new Error('Codex process is not running')
+      setApprovalStatus(request.key, approved ? 'approved' : 'denied')
+      if (request.turnId) {
+        updateActivity(request.turnId, `a-approval-${request.key}`, {
+          status: approved ? 'done' : 'failed',
+          endedAt: Date.now(),
+          title: approved ? 'Approval granted' : 'Approval denied',
+          detail: request.title
+        })
+      }
+    } catch (err: any) {
+      setApprovalStatus(request.key, 'pending')
+      toast('error', err?.message ?? String(err))
+    }
+  }
 
   useEffect(() => { runtimeRef.current = runtime }, [runtime])
   useEffect(() => { inputRef.current = input }, [input])
@@ -1473,6 +1809,10 @@ function DesktopApp() {
           const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
           void scanTurnArtifacts(turnId, startedAt, `scan-${turnId}-completed`)
           currentTurn.current = null
+          return
+        }
+        case 'serverRequest/resolved': {
+          if (params?.requestId !== undefined) resolveApprovalRequest(params.requestId)
           return
         }
         case 'error':
@@ -1669,7 +2009,9 @@ function DesktopApp() {
         if (!line) continue
         try {
           const msg = JSON.parse(line)
-          if (typeof msg.id === 'number' && pending.has(msg.id)) {
+          if (msg.method && msg.id !== undefined) {
+            handleServerRequest(msg.id, msg.method, msg.params)
+          } else if (typeof msg.id === 'number' && pending.has(msg.id)) {
             pending.get(msg.id)!.resolve(msg)
             pending.delete(msg.id)
             if (msg.error && !IGNORED_RPC_ERRORS.has(msg.error.message)) toast('error', msg.error.message)
@@ -1703,7 +2045,7 @@ function DesktopApp() {
       try {
         const init = await send('initialize', { clientInfo: { name: 'zspark-desktop', version: '0.0.1' } })
         if (init.error && init.error.message !== 'Already initialized') { toast('error', init.error.message); return }
-        const t = await send('thread/start', {})
+        const t = await send('thread/start', userApprovalParams())
         const tid = t.result?.thread?.id ?? null
         applyThreadRuntime(t.result)
         setThread(tid); setReady(true)
@@ -1780,7 +2122,7 @@ function DesktopApp() {
     resetLiveTurnState()
     setBlocks([])
     try {
-      const t = await send('thread/start', {})
+      const t = await send('thread/start', userApprovalParams())
       applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? null)
     } catch (e: any) { toast('error', e?.message ?? String(e)) }
@@ -1792,7 +2134,7 @@ function DesktopApp() {
     resetLiveTurnState()
     setBlocks([])
     try {
-      const t = await send('thread/resume', { threadId: id })
+      const t = await send('thread/resume', { threadId: id, ...userApprovalParams() })
       if (t.error) throw new Error(t.error.message)
       applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? id)
@@ -1828,7 +2170,7 @@ function DesktopApp() {
         resetLiveTurnState()
         setBlocks([])
         setThread(null)
-        const t = await send('thread/start', {})
+        const t = await send('thread/start', userApprovalParams())
         applyThreadRuntime(t.result)
         setThread(t.result?.thread?.id ?? null)
       }
@@ -2058,7 +2400,7 @@ function DesktopApp() {
     }
     let accepted = false
     try {
-      const res = await send('turn/start', { threadId: thread, input: inputItems })
+      const res = await send('turn/start', { threadId: thread, input: inputItems, ...userApprovalParams() })
       if (res.error) {
         if (shouldClearComposer) {
           setInput(text)
@@ -2361,6 +2703,15 @@ function DesktopApp() {
                       ))}
                     </div>
                   </div>
+                )
+              }
+              if (b.type === 'approval') {
+                return (
+                  <ApprovalCard
+                    key={b.id}
+                    request={b.request}
+                    onDecision={(request, approved) => void respondApproval(request, approved)}
+                  />
                 )
               }
               const dur = (b.endedAt ?? clock) - b.startedAt
