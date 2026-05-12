@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } from 'electron'
 import type { OpenDialogOptions } from 'electron'
+import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename, delimiter, dirname, join } from 'node:path'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync } from 'node:fs'
@@ -7,6 +8,7 @@ import { scanRecentArtifacts } from './artifacts'
 import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
+import { redactSensitiveLogLine } from './logRedaction'
 
 let mainWindow: BrowserWindow | null = null
 let codex: ChildProcessWithoutNullStreams | null = null
@@ -31,6 +33,7 @@ const CODEX_RUNTIME_NODE = join(CODEX_RUNTIME_DEPS_DIR, 'node', 'bin', process.p
 const CODEX_RUNTIME_NODE_MODULES = join(CODEX_RUNTIME_DEPS_DIR, 'node', 'node_modules')
 const CODEX_RUNTIME_PYTHON = join(CODEX_RUNTIME_DEPS_DIR, 'python', 'bin', process.platform === 'win32' ? 'python.exe' : 'python3')
 const MAX_CODEX_LOG_BYTES = 8 * 1024 * 1024
+const BRIDGE_API_KEY = randomBytes(32).toString('hex')
 
 function resolveWorkspaceRoot(start: string): string {
   let dir = start
@@ -144,7 +147,7 @@ function formatCodexLogChunk(channel: 'stdout' | 'stderr', chunk: string): strin
         }
       } catch {}
     }
-    return `[${channel}] ${line}\n`
+    return `[${channel}] ${redactSensitiveLogLine(line)}\n`
   }).join('')
 }
 
@@ -192,7 +195,7 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
   if (p.wireApi === 'chat') {
     setUpstream({ baseUrl: p.baseUrl, apiKey: p.apiKey })
     effectiveBase = `http://127.0.0.1:${bridgePort ?? 0}/v1`
-    effectiveKey = 'zspark-bridge'
+    effectiveKey = BRIDGE_API_KEY
   } else {
     setUpstream(null)
   }
@@ -267,6 +270,14 @@ function createWindow() {
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url)
     return { action: 'deny' }
+  })
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    const currentUrl = mainWindow?.webContents.getURL()
+    if (!currentUrl || url === currentUrl) return
+    event.preventDefault()
+    if (/^https?:\/\//i.test(url) || /^mailto:/i.test(url)) {
+      shell.openExternal(url)
+    }
   })
   if (process.env.ELECTRON_RENDERER_URL) {
     mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -393,6 +404,19 @@ ipcMain.handle('path:stat', (_e, filePath: string) => {
   }
 })
 
+ipcMain.handle('url:openExternal', async (_e, rawUrl: string) => {
+  try {
+    const url = new URL(rawUrl)
+    if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) {
+      return { ok: false, error: 'Unsupported link protocol' }
+    }
+    await shell.openExternal(url.toString())
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
+})
+
 ipcMain.handle('artifacts:scanRecent', (_e, options: { sinceMs?: number; limit?: number } = {}) => ({
   root: join(WORKSPACE_ROOT, 'outputs'),
   artifacts: scanRecentArtifacts(WORKSPACE_ROOT, {
@@ -402,7 +426,7 @@ ipcMain.handle('artifacts:scanRecent', (_e, options: { sinceMs?: number; limit?:
 }))
 
 app.whenReady().then(async () => {
-  const b = await startBridge()
+  const b = await startBridge(BRIDGE_API_KEY)
   bridgePort = b.port
   bridgeClose = b.close
   spawnCodex()

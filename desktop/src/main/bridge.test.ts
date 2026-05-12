@@ -56,7 +56,7 @@ async function startBridgeForTest() {
   return `http://127.0.0.1:${bridge.port}`
 }
 
-function postJson(url: string, payload: JsonValue): Promise<{ status: number; body: string }> {
+function postJson(url: string, payload: JsonValue, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const target = new URL(url)
     const req = httpRequest({
@@ -64,7 +64,7 @@ function postJson(url: string, payload: JsonValue): Promise<{ status: number; bo
       port: target.port,
       path: target.pathname + target.search,
       method: 'POST',
-      headers: { 'content-type': 'application/json' }
+      headers: { 'content-type': 'application/json', ...headers }
     }, (res) => {
       const chunks: Buffer[] = []
       res.on('data', (chunk) => chunks.push(chunk))
@@ -75,6 +75,28 @@ function postJson(url: string, payload: JsonValue): Promise<{ status: number; bo
     })
     req.on('error', reject)
     req.write(JSON.stringify(payload))
+    req.end()
+  })
+}
+
+function getText(url: string, headers: Record<string, string> = {}): Promise<{ status: number; body: string }> {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url)
+    const req = httpRequest({
+      hostname: target.hostname,
+      port: target.port,
+      path: target.pathname + target.search,
+      method: 'GET',
+      headers
+    }, (res) => {
+      const chunks: Buffer[] = []
+      res.on('data', (chunk) => chunks.push(chunk))
+      res.on('end', () => resolve({
+        status: res.statusCode ?? 0,
+        body: Buffer.concat(chunks).toString('utf8')
+      }))
+    })
+    req.on('error', reject)
     req.end()
   })
 }
@@ -222,5 +244,52 @@ describe('chat responses bridge', () => {
         }
       }
     ])
+  })
+
+  test('requires the bridge token when configured', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      jsonResponse(res, 200, {
+        choices: [{ message: { role: 'assistant', content: 'authorized' } }]
+      })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key' })
+
+    const bridge = await startBridge('bridge-secret')
+    cleanup.push(bridge.close)
+    const bridgeUrl = `http://127.0.0.1:${bridge.port}`
+
+    const rejected = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: 'hi'
+    })
+    expect(rejected.status).toBe(401)
+    expect(upstream.requests).toHaveLength(0)
+
+    const accepted = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: 'hi'
+    }, { authorization: 'Bearer bridge-secret' })
+    expect(accepted.status).toBe(200)
+    expect(responseText(accepted.body)).toBe('authorized')
+  })
+
+  test('normalizes full chat completion URLs for model forwarding', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      jsonResponse(res, 200, { data: [{ id: 'model-a' }] })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1/chat/completions`, apiKey: 'test-key' })
+
+    const bridge = await startBridge('bridge-secret')
+    cleanup.push(bridge.close)
+    const response = await getText(`http://127.0.0.1:${bridge.port}/v1/models`, {
+      authorization: 'Bearer bridge-secret'
+    })
+
+    expect(response.status).toBe(200)
+    expect(upstream.requests[0]?.path).toBe('/v1/models')
   })
 })

@@ -45,6 +45,7 @@ declare global {
       revealPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       downloadPath: (path: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>
       statPath: (path: string) => Promise<PathStatResult>
+      openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>
       scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => Promise<ArtifactScanResult>
       getSettings: () => Promise<{ provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' } }>
       saveSettings: (s: any) => Promise<boolean>
@@ -442,7 +443,14 @@ function Markdown({ text }: { text: string }) {
     const normalized = normalizeMarkdownForDisplay(text || '')
     return DOMPurify.sanitize(marked.parse(normalized, { async: false }) as string)
   }, [text])
-  return <div className="md" dangerouslySetInnerHTML={{ __html: html }} />
+  const onClick = (event: React.MouseEvent<HTMLDivElement>) => {
+    const link = (event.target as Element | null)?.closest?.('a[href]')
+    const href = link?.getAttribute('href') ?? ''
+    if (!/^(https?:|mailto:)/i.test(href)) return
+    event.preventDefault()
+    void window.zspark.openExternalUrl(href)
+  }
+  return <div className="md" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 function artifactDownloadLabel(path: string) {
@@ -461,15 +469,35 @@ function MessageArtifactButtons({
   onDownload: (path: string) => void
   onOpen: (path: string) => void
 }) {
-  const artifacts = useMemo(() => {
-    const seen = new Set<string>()
-    return candidates.flatMap((candidate) => {
-      const path = candidateWorkspacePaths(candidate, runtime)[0] ?? candidate
-      if (!path || seen.has(path)) return []
-      seen.add(path)
-      return [{ path, name: basename(path) }]
-    }).slice(0, 4)
-  }, [candidates, runtime.cwd, runtime.workspaceRoot])
+  const [artifacts, setArtifacts] = useState<Array<{ path: string; name: string }>>([])
+  const candidatesKey = candidates.join('\n')
+  const runtimeKey = `${runtime.cwd ?? ''}|${runtime.workspaceRoot ?? ''}`
+
+  useEffect(() => {
+    let cancelled = false
+    const verify = async () => {
+      const seen = new Set<string>()
+      const verified: Array<{ path: string; name: string }> = []
+      for (const candidate of candidates.slice(0, 8)) {
+        for (const path of candidateWorkspacePaths(candidate, runtime)) {
+          if (!path || seen.has(path)) continue
+          seen.add(path)
+          const stat = await window.zspark.statPath(path)
+          if (!stat.exists || !stat.isFile) continue
+          verified.push({ path, name: basename(path) })
+          break
+        }
+        if (verified.length >= 4) break
+      }
+      if (!cancelled) setArtifacts(verified)
+    }
+    if (candidates.length === 0) {
+      setArtifacts([])
+      return
+    }
+    void verify()
+    return () => { cancelled = true }
+  }, [candidatesKey, runtimeKey])
 
   if (!artifacts.length) return null
   return (
@@ -1497,6 +1525,7 @@ function DesktopApp() {
   const checkedArtifactMessages = useRef<Map<string, string>>(new Map())
   const completedWorkByTurn = useRef<Map<string, Set<CompletedTurnWorkKind>>>(new Map())
   const commandFailuresByTurn = useRef<Map<string, CommandFailureSignal>>(new Map())
+  const switchThreadSeq = useRef(0)
   const completedWorkStallTimers = useRef<Map<string, number>>(new Map())
   const providerRetryTimers = useRef<Map<string, number>>(new Map())
   const interruptFallbackTimers = useRef<Map<string, number>>(new Map())
@@ -2528,24 +2557,32 @@ function DesktopApp() {
 
   const newChat = async () => {
     if (!ready) return
+    const seq = switchThreadSeq.current + 1
+    switchThreadSeq.current = seq
     stickToBottom.current = true
     setShowJumpToLatest(false)
     resetLiveTurnState()
     setBlocks([])
     try {
       const t = await send('thread/start', userApprovalParams())
+      if (seq !== switchThreadSeq.current) return
       applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? null)
-    } catch (e: any) { toast('error', e?.message ?? String(e)) }
+    } catch (e: any) {
+      if (seq === switchThreadSeq.current) toast('error', e?.message ?? String(e))
+    }
   }
   const switchThread = async (id: string) => {
     if (!ready) return
+    const seq = switchThreadSeq.current + 1
+    switchThreadSeq.current = seq
     stickToBottom.current = true
     setShowJumpToLatest(false)
     resetLiveTurnState()
     setBlocks([])
     try {
       const t = await send('thread/resume', { threadId: id, ...userApprovalParams() })
+      if (seq !== switchThreadSeq.current) return
       if (t.error) throw new Error(t.error.message)
       applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? id)
@@ -2553,9 +2590,11 @@ function DesktopApp() {
       let threadForReplay = t.result?.thread
       if (!Array.isArray(threadForReplay?.turns) || threadForReplay.turns.length === 0) {
         const read = await send('thread/read', { threadId: id, includeTurns: true })
+        if (seq !== switchThreadSeq.current) return
         if (read.error) throw new Error(read.error.message)
         threadForReplay = read.result?.thread ?? threadForReplay
       }
+      if (seq !== switchThreadSeq.current) return
       const base = t.result?.cwd ?? threadForReplay?.cwd ?? runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot
       const replay = blocksFromThreadTurns(threadForReplay?.turns ?? [], base)
       const restoredBlocks = mergePersistedActivityBlocks(replay.blocks, loadPersistedActivityBlocks(id))
@@ -2565,7 +2604,9 @@ function DesktopApp() {
         const preview = stripInternalPromptContext(threads.find((candidate) => candidate.id === id)?.preview?.trim() ?? '')
         if (preview) setBlocks([{ type: 'user', id: `preview-${id}`, text: preview }])
       }
-    } catch (e: any) { toast('error', e?.message ?? String(e)) }
+    } catch (e: any) {
+      if (seq === switchThreadSeq.current) toast('error', e?.message ?? String(e))
+    }
   }
   const deleteThread = async (id: string, e?: React.MouseEvent) => {
     e?.stopPropagation()

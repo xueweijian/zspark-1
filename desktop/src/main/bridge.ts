@@ -33,6 +33,11 @@ interface UpstreamConfig {
 let upstream: UpstreamConfig | null = null
 export function setUpstream(cfg: UpstreamConfig | null) { upstream = cfg }
 
+function isAuthorized(req: IncomingMessage, authToken?: string): boolean {
+  if (!authToken) return true
+  return req.headers.authorization === `Bearer ${authToken}`
+}
+
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
@@ -378,7 +383,8 @@ function toolsToChat(tools: any[] | undefined): any[] | undefined {
 
 function genId(prefix: string) { return `${prefix}_${Math.random().toString(16).slice(2, 18)}` }
 
-async function handleResponses(req: IncomingMessage, res: ServerResponse) {
+async function handleResponses(req: IncomingMessage, res: ServerResponse, authToken?: string) {
+  if (!isAuthorized(req, authToken)) { writeJsonError(res, 401, 'unauthorized'); return }
   if (!upstream) { res.writeHead(503).end('upstream not configured'); return }
   const body = await readBody(req)
   let payload: any
@@ -610,18 +616,19 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse) {
   upstreamReq.end()
 }
 
-export function startBridge(): Promise<{ port: number; close: () => void }> {
+export function startBridge(authToken?: string): Promise<{ port: number; close: () => void }> {
   const server = createServer((req, res) => {
     if (!req.url) { res.writeHead(404).end(); return }
     if (req.method === 'POST' && req.url.startsWith('/v1/responses')) {
-      handleResponses(req, res).catch((e) => { res.writeHead(500).end(e?.message ?? 'error') })
+      handleResponses(req, res, authToken).catch((e) => { res.writeHead(500).end(e?.message ?? 'error') })
       return
     }
     if (req.method === 'GET' && req.url.startsWith('/v1/models')) {
       // Forward to upstream so codex can probe model availability
+      if (!isAuthorized(req, authToken)) { writeJsonError(res, 401, 'unauthorized'); return }
       if (!upstream) { res.writeHead(503).end(); return }
-      const u = new URL(upstream.baseUrl.replace(/\/+$/, '') + '/models')
-      const reqLib = u.protocol === 'https:' ? httpsRequest : httpRequest
+      const u = buildUpstreamUrl(upstream.baseUrl, MODELS_SUFFIX)
+      const reqLib = requestLibForUrl(u)
       const fwd = reqLib({
         hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
         path: u.pathname, method: 'GET',
