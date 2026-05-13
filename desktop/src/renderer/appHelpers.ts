@@ -98,6 +98,7 @@ const FILE_SOURCES = new Set(['attachment', 'change'])
 const FILE_STATUSES = new Set(['attached', 'created', 'modified', 'deleted', 'missing'])
 const APPROVAL_KINDS = new Set(['command', 'fileChange', 'permissions'])
 const APPROVAL_STATUSES = new Set(['pending', 'sending', 'approved', 'denied', 'resolved'])
+const TURN_BLOCK_STATUSES = new Set(['running', 'completed', 'interrupted', 'failed'])
 
 function normalizeSnapshotActivity(activity: any): Activity | null {
   if (!activity || typeof activity !== 'object') return null
@@ -220,7 +221,8 @@ function normalizeSnapshotBlock(block: any): Block | null {
       collapsed: Boolean(block.collapsed),
       finalMessageId: optionalBoundedString(block.finalMessageId, 240),
       startedAt: finiteNumber(block.startedAt, Date.now()),
-      endedAt: block.endedAt == null ? undefined : finiteNumber(block.endedAt)
+      endedAt: block.endedAt == null ? undefined : finiteNumber(block.endedAt),
+      status: TURN_BLOCK_STATUSES.has(block.status) ? block.status : undefined
     }
   }
   return null

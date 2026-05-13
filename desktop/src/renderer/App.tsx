@@ -25,10 +25,8 @@ import {
   type CommandFailureSignal
 } from './commandSafety'
 import {
-  COMPLETED_WORK_FINALIZATION_TIMEOUT_MS,
   PROVIDER_RECONNECT_AUTO_INTERRUPT_MS,
   TURN_INTERRUPT_FALLBACK_RELEASE_MS,
-  shouldRecoverFromCompletedWorkStall,
   shouldRecoverFromProviderRetry,
   type CompletedTurnWorkKind
 } from './turnRecovery'
@@ -902,7 +900,6 @@ function DesktopApp() {
   const completedWorkByTurn = useRef<Map<string, Set<CompletedTurnWorkKind>>>(new Map())
   const commandFailuresByTurn = useRef<Map<string, CommandFailureSignal>>(new Map())
   const switchThreadSeq = useRef(0)
-  const completedWorkStallTimers = useRef<Map<string, number>>(new Map())
   const providerRetryTimers = useRef<Map<string, number>>(new Map())
   const interruptFallbackTimers = useRef<Map<string, number>>(new Map())
   const interruptingTurns = useRef<Set<string>>(new Set())
@@ -983,7 +980,6 @@ function DesktopApp() {
         timers.current.delete(id)
       }
     }
-    clear(completedWorkStallTimers)
     clear(providerRetryTimers)
     clear(interruptFallbackTimers)
   }
@@ -1441,6 +1437,7 @@ function DesktopApp() {
           id: b.id || blockId,
           collapsed: false,
           endedAt: undefined,
+          status: 'running',
           activities: hasThinking ? b.activities : [activity, ...b.activities]
         }
       })
@@ -1453,6 +1450,7 @@ function DesktopApp() {
           turnId,
           collapsed: false,
           startedAt,
+          status: 'running',
           activities: [activity]
         }
       ], turnId)
@@ -1611,7 +1609,6 @@ function DesktopApp() {
     const current = completedWorkByTurn.current.get(turnId) ?? new Set<CompletedTurnWorkKind>()
     current.add(kind)
     completedWorkByTurn.current.set(turnId, current)
-    scheduleCompletedWorkFinalizationRecovery(turnId)
   }
 
   const settleTurnRecovery = (turnId: string) => {
@@ -1631,6 +1628,7 @@ function DesktopApp() {
       ...t,
       endedAt: Date.now(),
       collapsed: false,
+      status: 'interrupted',
       activities: t.activities.map((a) => {
         if (a.id === providerRetryActivityId) {
           return {
@@ -1718,23 +1716,6 @@ function DesktopApp() {
     providerRetryTimers.current.set(turnId, timer)
   }
 
-  const scheduleCompletedWorkFinalizationRecovery = (turnId: string) => {
-    const completedWorkCount = completedWorkByTurn.current.get(turnId)?.size ?? 0
-    if (!shouldRecoverFromCompletedWorkStall({
-      completedWorkCount,
-      alreadyInterrupting: interruptingTurns.current.has(turnId)
-    })) return
-    if (completedWorkStallTimers.current.has(turnId)) return
-    const timer = window.setTimeout(() => {
-      completedWorkStallTimers.current.delete(turnId)
-      interruptProviderRetryTurn(
-        turnId,
-        'Completed work was already recorded, but the provider did not finish the final response.'
-      )
-    }, COMPLETED_WORK_FINALIZATION_TIMEOUT_MS)
-    completedWorkStallTimers.current.set(turnId, timer)
-  }
-
   useEffect(() => { runtimeRef.current = runtime }, [runtime])
   useEffect(() => { threadRef.current = thread }, [thread])
   useEffect(() => { activeSharedWorkspaceRef.current = activeSharedWorkspace }, [activeSharedWorkspace])
@@ -1782,7 +1763,9 @@ function DesktopApp() {
           updateTurn(turnId, (t) => {
             // Mark any still-running activities done at end of turn (incl. our placeholder Thinking)
             const acts = t.activities.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now(), title: a.kind === 'reasoning' ? 'Thought' : a.title } : a))
-            return { ...t, endedAt: Date.now(), collapsed: false, activities: acts }
+            const turnStatus = params?.turn?.status
+            const status = turnStatus === 'interrupted' ? 'interrupted' : turnStatus === 'failed' ? 'failed' : 'completed'
+            return { ...t, endedAt: Date.now(), collapsed: false, status, activities: acts }
           })
           const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
           void scanTurnArtifacts(turnId, startedAt, `scan-${turnId}-completed`)
@@ -1803,6 +1786,7 @@ function DesktopApp() {
             updateTurn(cur.turnId, (t) => ({
               ...t,
               endedAt: Date.now(),
+              status: statusType === 'interrupted' ? 'interrupted' : 'completed',
               activities: t.activities.map((a) => (
                 a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now() } : a
               ))
@@ -1829,9 +1813,10 @@ function DesktopApp() {
           })
           updateActivity(turnId, actId, { status: 'done', endedAt: Date.now() })
           updateTurn(turnId, (t) => ({
-            ...t,
-            endedAt: t.endedAt ?? Date.now(),
-            activities: t.activities.map((a) => (
+              ...t,
+              endedAt: t.endedAt ?? Date.now(),
+              status: 'completed',
+              activities: t.activities.map((a) => (
               a.kind === 'reasoning' && a.status === 'running'
                 ? { ...a, status: 'done' as const, endedAt: Date.now(), title: 'Context prepared' }
                 : a
@@ -1870,6 +1855,7 @@ function DesktopApp() {
             updateTurn(cur.turnId, (t) => ({
               ...t,
               endedAt: Date.now(),
+              status: 'failed',
               activities: t.activities.map((a) => (
                 a.status === 'running' ? { ...a, status: 'failed' as const, endedAt: Date.now() } : a
               ))
@@ -3126,7 +3112,8 @@ function DesktopApp() {
                 )
               }
               const running = !b.endedAt
-              const failed = b.activities.some((a) => a.status === 'failed')
+              const interrupted = b.status === 'interrupted'
+              const failed = b.status === 'failed' || b.activities.some((a) => a.status === 'failed')
               const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
               const summaryLabels = activitySummaryLabels(meaningful)
               const visibleActivities = displayActivities(b.activities)
@@ -3142,7 +3129,7 @@ function DesktopApp() {
                       <span className={`spinner${running ? ' spin' : ''}${failed ? ' failed' : ''}`} />
                       <div className="head-copy">
                         <div className="head-line">
-                          <span className="head-title">{running ? 'Working' : failed ? 'Needs attention' : 'Completed'}</span>
+                          <span className="head-title">{running ? 'Working' : interrupted ? 'Stopped' : failed ? 'Needs attention' : 'Completed'}</span>
                           <span className="head-meta">Activity log · <ActivityDuration startedAt={b.startedAt} endedAt={b.endedAt} /> · {stepsLabel}</span>
                         </div>
                       </div>

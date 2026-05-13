@@ -96,11 +96,11 @@ describe('blocksFromSharedSnapshot', () => {
     const out = blocksFromSharedSnapshot({
       blocks: [
         { type: 'files', id: 'f', turnId: 't1', title: 'files', files: [{ id: 'x', name: 'a.txt', path: '/tmp/a.txt', source: 'bad', status: 'bad', updatedAt: 1 }] },
-        { type: 'turn', id: 'turn', turnId: 't1', collapsed: false, startedAt: 1, activities: [{ id: 'a', kind: 'command', title: 'Ran', status: 'running', startedAt: 1 }, { id: 2, title: 'bad' }] }
+        { type: 'turn', id: 'turn', turnId: 't1', collapsed: false, startedAt: 1, status: 'interrupted', activities: [{ id: 'a', kind: 'command', title: 'Ran', status: 'running', startedAt: 1 }, { id: 2, title: 'bad' }] }
       ] as any
     })
     expect(out).toHaveLength(2)
     expect(out[0]).toMatchObject({ type: 'files', files: [{ source: 'change', status: 'missing' }] })
-    expect(out[1]).toMatchObject({ type: 'turn', activities: [{ id: 'a', kind: 'command', status: 'running' }] })
+    expect(out[1]).toMatchObject({ type: 'turn', status: 'interrupted', activities: [{ id: 'a', kind: 'command', status: 'running' }] })
   })
 })

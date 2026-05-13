@@ -15,6 +15,7 @@ export interface Pending {
 
 export type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'web' | 'memory'
 export type ActivityActionKind = 'read' | 'write' | 'list' | 'search' | 'run' | 'build' | 'verify' | 'tool' | 'file'
+export type TurnBlockStatus = 'running' | 'completed' | 'interrupted' | 'failed'
 
 export interface Activity {
   id: string
@@ -99,7 +100,7 @@ export type Block =
   | { type: 'agent'; id: string; text: string; turnId?: string; memoryCitation?: MemoryCitation | null }
   | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[]; subtitle?: string; tone?: 'normal' | 'warn' }
   | { type: 'approval'; id: string; turnId: string; request: ApprovalRequest }
-  | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
+  | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number; status?: TurnBlockStatus }
 
 export type MessageBlock = Extract<Block, { type: 'user' | 'agent' }>
 
