@@ -1,0 +1,85 @@
+import { describe, expect, test } from 'vitest'
+import {
+  basename,
+  blocksFromSharedSnapshot,
+  changeKindLabel,
+  describeChange,
+  displaySkillName,
+  displayThreadPreview,
+  fmtBytes,
+  fmtDuration,
+  formatUserInputContent,
+  isSharedArtifactPath,
+  scopeLabel,
+  sharedArtifactPath,
+  stripInternalPromptContext,
+  titleFromBlocks
+} from './appHelpers'
+
+describe('formatting', () => {
+  test('fmtDuration', () => {
+    expect(fmtDuration(0)).toBe('<1s')
+    expect(fmtDuration(45_000)).toBe('45s')
+    expect(fmtDuration(125_000)).toBe('2m 5s')
+  })
+  test('fmtBytes', () => {
+    expect(fmtBytes(512)).toBe('512 B')
+    expect(fmtBytes(1024 * 5)).toBe('5.0 KB')
+    expect(fmtBytes(1024 * 1024 * 12)).toBe('12 MB')
+  })
+  test('basename', () => {
+    expect(basename('/a/b/c.txt')).toBe('c.txt')
+    expect(basename('C:\\\\foo\\\\bar.csv')).toBe('bar.csv')
+  })
+})
+
+describe('content helpers', () => {
+  test('stripInternalPromptContext removes skill prelude', () => {
+    expect(stripInternalPromptContext('Hello\n\nUse skill: foo')).toBe('Hello')
+  })
+  test('formatUserInputContent collapses skill-only inputs', () => {
+    expect(formatUserInputContent([{ type: 'skill', name: 'work:report' }])).toBe('Using report')
+  })
+  test('displaySkillName trims namespace', () => {
+    expect(displaySkillName('work:report')).toBe('report')
+  })
+})
+
+describe('changes / shared artifacts', () => {
+  test('changeKindLabel maps kinds', () => {
+    expect(changeKindLabel({ type: 'add' })).toBe('created')
+    expect(changeKindLabel('delete')).toBe('deleted')
+    expect(changeKindLabel('update')).toBe('modified')
+  })
+  test('describeChange surfaces moves', () => {
+    expect(describeChange({ type: 'update', movePath: 'old.md' })).toBe('Moved from old.md')
+  })
+  test('shared artifact paths round-trip', () => {
+    const p = sharedArtifactPath('w', 's', 'a', 'name.txt')
+    expect(p).toBe('shared://w/s/a/name.txt')
+    expect(isSharedArtifactPath(p)).toBe(true)
+    expect(isSharedArtifactPath('/local/file')).toBe(false)
+  })
+})
+
+describe('thread / scope helpers', () => {
+  test('displayThreadPreview falls back to id slice', () => {
+    expect(displayThreadPreview({ id: 'abcdef0123' })).toBe('abcdef01')
+    expect(displayThreadPreview({ id: '123', preview: 'hi' })).toBe('hi')
+  })
+  test('titleFromBlocks reads first user line', () => {
+    expect(titleFromBlocks([{ type: 'user', id: '1', text: 'Hello there' }] as any)).toBe('Hello there')
+  })
+  test('scopeLabel maps scopes', () => {
+    expect(scopeLabel('repo')).toBe('Project')
+    expect(scopeLabel(undefined)).toBe('Skill')
+  })
+})
+
+describe('blocksFromSharedSnapshot', () => {
+  test('drops unknown block types', () => {
+    const out = blocksFromSharedSnapshot({ blocks: [{ type: 'mystery' }, { type: 'user', id: '1', text: 'hi' }] as any })
+    expect(out).toHaveLength(1)
+    expect(out[0].type).toBe('user')
+  })
+})

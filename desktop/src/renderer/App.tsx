@@ -32,6 +32,114 @@ import {
   shouldRecoverFromProviderRetry,
   type CompletedTurnWorkKind
 } from './turnRecovery'
+import type {
+  Activity,
+  ActivityActionKind,
+  ActivityInfo,
+  ActivityKind,
+  AppSettingsView,
+  ApprovalKind,
+  ApprovalRequest,
+  ApprovalStatus,
+  ArtifactScanResult,
+  AttachmentMeta,
+  Block,
+  DiscoverLocalSkillsResult,
+  EnterpriseConfig,
+  EnterpriseDeviceCode,
+  EnterpriseForm,
+  EnterpriseStatus,
+  JsonRpcId,
+  LocalSkillMeta,
+  MemoryCitation,
+  MemoryCitationEntry,
+  MessageBlock,
+  Panel,
+  PathStatResult,
+  PickAttachmentsResult,
+  ProviderForm,
+  RuntimeHostInfo,
+  RuntimeInfo,
+  SharedArtifact,
+  SharedSession,
+  SharedSessionMutation,
+  SharedSessionSnapshot,
+  SharedWorkspace,
+  SkillMeta,
+  ThreadSummary,
+  Toast,
+  ToastKind,
+  TurnInputItem,
+  WorkspaceFile,
+  WorkspaceRuntimeInfo
+} from './appTypes'
+import {
+  IGNORED_RPC_ERRORS,
+  errorMessage,
+  isMissingRolloutError,
+  pending,
+  rejectPendingRequests,
+  send,
+  sendRpcError,
+  sendRpcResult,
+  shouldAutoToastRpcError
+} from './ipc'
+import {
+  basename,
+  blocksFromSharedSnapshot,
+  changeKindLabel,
+  describeChange,
+  displaySkillName,
+  displayThreadPreview,
+  fmtBytes,
+  fmtDuration,
+  formatUserInputContent,
+  isSharedArtifactPath,
+  localSkillSourceLabel,
+  normalizeInputItemsForResubmit,
+  scopeLabel,
+  sharedArtifactFile,
+  sharedArtifactPath,
+  sharedSessionToThread,
+  skillStatusClass,
+  skillStatusLabel,
+  stripInternalPromptContext,
+  titleFromBlocks,
+  turnIdFromParams
+} from './appHelpers'
+import {
+  ACTIVITY_STORAGE_PREFIX,
+  actionKindForSummary,
+  activityDetailWeight,
+  activitySummaryLabels,
+  cleanShellCommand,
+  commandActionInfo,
+  commandActivityDetail,
+  commandActivityInfo,
+  displayActivities,
+  inferActionKindFromTitle,
+  inferCommandInfo,
+  itemTimeMs,
+  loadPersistedActivityBlocks,
+  memoryCitationDetail,
+  memoryCitationTitle,
+  mergePersistedActivityBlocks,
+  normalizeActivity,
+  normalizeMemoryCitation,
+  orderBlocksForTurn,
+  publicActivityDetail,
+  publicActivityTitle,
+  publicActivityTitleText,
+  replayActivityFromItem,
+  savePersistedActivityBlocks,
+  serializePersistedActivityBlocks,
+  shortenCommand,
+  timestampToMs,
+  titleizeToolName,
+  toolActivityInfo,
+  truncateActivityDetail,
+  webSearchActivityInfo
+} from './activityHelpers'
 
 declare global {
   interface Window {
@@ -87,291 +195,12 @@ const starters = [
   { t: 'Automate a workflow', d: 'Schedule a recurring task from natural language.' }
 ]
 
-const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
-const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
+// Renderer-internal constants kept colocated with App because every consumer
+// is the App component itself. Pure helpers, types, and the IPC client live
+// in `appTypes.ts`, `appHelpers.ts`, `activityHelpers.ts`, and `ipc.ts`.
 const USER_APPROVAL_REVIEWER = 'user'
 const ZSPARK_APPROVAL_POLICY = 'on-request'
 const MAX_STDOUT_BUFFER_CHARS = 2_000_000
-
-function errorMessage(error: any) {
-  return error?.message ? String(error.message) : String(error)
-}
-
-function isMissingRolloutError(message?: string) {
-  return /^no rollout found for thread id\b/.test(String(message ?? ''))
-}
-
-function shouldAutoToastRpcError(message?: string) {
-  return Boolean(message && !IGNORED_RPC_ERRORS.has(message) && !isMissingRolloutError(message))
-}
-
-let nextId = 1
-const newId = () => nextId++
-type JsonRpcId = number | string
-interface Pending { resolve: (msg: any) => void; reject: (err: any) => void }
-const pending = new Map<JsonRpcId, Pending>()
-
-function rejectPendingRequests(message: string) {
-  for (const entry of pending.values()) entry.reject(new Error(message))
-  pending.clear()
-}
-
-function send(method: string, params: any = {}) {
-  return new Promise<any>((resolve, reject) => {
-    const id = newId()
-    pending.set(id, { resolve, reject })
-    window.zspark.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }))
-      .then((ok) => {
-        if (!ok) {
-          pending.delete(id)
-          reject(new Error('Codex process is not running'))
-        }
-      })
-      .catch((err) => {
-        pending.delete(id)
-        reject(err)
-      })
-  })
-}
-
-function sendRpcResult(id: JsonRpcId, result: any) {
-  return window.zspark.send(JSON.stringify({ jsonrpc: '2.0', id, result }))
-}
-
-function sendRpcError(id: JsonRpcId, code: number, message: string) {
-  return window.zspark.send(JSON.stringify({ jsonrpc: '2.0', id, error: { code, message } }))
-}
-
-type ActivityKind = 'reasoning' | 'command' | 'file' | 'tool' | 'web' | 'memory'
-type ActivityActionKind = 'read' | 'write' | 'list' | 'search' | 'run' | 'build' | 'verify' | 'tool' | 'file'
-interface Activity {
-  id: string
-  kind: ActivityKind
-  title: string
-  detail?: string
-  actionKind?: ActivityActionKind
-  target?: string
-  status: 'running' | 'done' | 'failed'
-  startedAt: number
-  endedAt?: number
-}
-type ActivityInfo = { title: string; detail?: string; actionKind: ActivityActionKind; target?: string }
-
-type ApprovalKind = 'command' | 'fileChange' | 'permissions'
-type ApprovalStatus = 'pending' | 'sending' | 'approved' | 'denied' | 'resolved'
-interface ApprovalRequest {
-  id: JsonRpcId
-  key: string
-  kind: ApprovalKind
-  method: string
-  blockId: string
-  threadId: string
-  turnId: string
-  itemId: string
-  title: string
-  description: string
-  detail?: string
-  commandPreview?: string
-  cwd?: string
-  reason?: string
-  paths: string[]
-  params: any
-  status: ApprovalStatus
-  startedAt: number
-}
-
-interface MemoryCitationEntry {
-  path: string
-  lineStart?: number
-  lineEnd?: number
-  note?: string
-}
-
-interface MemoryCitation {
-  entries?: MemoryCitationEntry[]
-  threadIds?: string[]
-}
-
-type Block =
-  | { type: 'user'; id: string; text: string; turnId?: string; input?: TurnInputItem[] }
-  | { type: 'agent'; id: string; text: string; turnId?: string; memoryCitation?: MemoryCitation | null }
-  | { type: 'files'; id: string; turnId: string; title: string; files: WorkspaceFile[]; subtitle?: string; tone?: 'normal' | 'warn' }
-  | { type: 'approval'; id: string; turnId: string; request: ApprovalRequest }
-  | { type: 'turn'; id: string; turnId: string; activities: Activity[]; collapsed: boolean; finalMessageId?: string; startedAt: number; endedAt?: number }
-type MessageBlock = Extract<Block, { type: 'user' | 'agent' }>
-
-type ToastKind = 'info' | 'warn' | 'error'
-interface Toast { id: string; kind: ToastKind; text: string }
-
-interface ProviderForm { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
-type EnterpriseForm = EnterpriseConfig
-
-type Panel = null | 'search' | 'skills' | 'plugins' | 'automations' | 'history' | 'shared'
-
-interface ThreadSummary { id: string; preview?: string; createdAt?: number; updatedAt?: number; name?: string | null }
-interface SharedSession {
-  id: string
-  owner?: string
-  title?: string | null
-  local_thread_id?: string | null
-  created_at?: string
-  updated_at?: string
-}
-interface SharedSessionSnapshot {
-  version?: number
-  title?: string
-  localThreadId?: string | null
-  blocks?: Block[]
-  artifacts?: SharedArtifact[]
-  updatedAt?: number
-}
-interface SharedSessionMutation {
-  title?: string
-  localThreadId?: string | null
-  snapshot?: SharedSessionSnapshot
-}
-interface SharedArtifact {
-  id: string
-  workspace_id?: string
-  session_id?: string
-  name: string
-  mime_type?: string | null
-  size_bytes?: number
-  sha256?: string
-  local_path?: string | null
-  turn_id?: string | null
-  created_at?: string
-}
-interface SkillMeta {
-  name: string
-  description?: string
-  shortDescription?: string
-  displayName?: string
-  path?: string
-  scope?: string
-  enabled?: boolean
-  dependencies?: { tools?: Array<{ type?: string; value?: string; description?: string }> }
-  availability?: 'usable' | 'localOnly'
-  source?: string
-}
-
-type LocalSkillSource = 'workspace' | 'user' | 'system' | 'pluginCache'
-interface LocalSkillMeta {
-  name: string
-  description?: string
-  shortDescription?: string
-  displayName?: string
-  path: string
-  source: LocalSkillSource
-}
-
-interface DiscoverLocalSkillsResult {
-  skills: LocalSkillMeta[]
-  errors: string[]
-}
-
-interface AttachmentMeta {
-  id: string
-  name: string
-  path: string
-  mime: string
-  kind: 'image' | 'file'
-  size: number
-}
-
-interface PickAttachmentsResult {
-  attachments: Omit<AttachmentMeta, 'id'>[]
-  errors: string[]
-}
-
-interface PathStatResult {
-  exists: boolean
-  isFile?: boolean
-  isDirectory?: boolean
-  size?: number
-  mtimeMs?: number
-  error?: string
-}
-
-interface ArtifactScanResult {
-  root: string
-  artifacts: Array<{
-    name: string
-    path: string
-    size: number
-    mtimeMs: number
-  }>
-}
-
-interface AppSettingsView {
-  provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
-  enterprise?: EnterpriseConfig
-  warnings?: string[]
-}
-
-interface EnterpriseConfig {
-  serverUrl: string
-  tenantId: string
-  clientId: string
-  apiScope: string
-  authority: string
-}
-
-interface EnterpriseStatus {
-  configured: boolean
-  signedIn: boolean
-  account: {
-    username?: string
-    name?: string
-    homeAccountId?: string
-    expiresAt?: number
-  } | null
-  config: EnterpriseConfig
-}
-
-interface EnterpriseDeviceCode {
-  userCode?: string
-  verificationUri?: string
-  message?: string
-  expiresOn?: number | null
-}
-
-interface SharedWorkspace {
-  id: string
-  name: string
-  owner_key?: string
-  created_at?: string
-  updated_at?: string
-}
-
-interface RuntimeHostInfo {
-  workspaceRoot: string
-  attachmentDir: string
-  codexRunning: boolean
-  bridgePort: number | null
-  provider?: { baseUrl: string; model: string; wireApi: 'responses' | 'chat' }
-  workspaceRuntime?: WorkspaceRuntimeInfo
-}
-
-interface WorkspaceRuntimeInfo {
-  nodePath: string
-  nodeModulesPath: string
-  pythonPath: string
-  available: boolean
-}
-
-interface RuntimeInfo extends Partial<RuntimeHostInfo> {
-  cwd?: string
-  model?: string
-  modelProvider?: string
-  serviceTier?: string | null
-  approvalPolicy?: unknown
-  approvalsReviewer?: unknown
-  sandbox?: unknown
-  permissionProfile?: unknown
-  activePermissionProfile?: { id?: string; modifications?: unknown[] } | null
-  reasoningEffort?: string | null
-}
 
 function candidateWorkspacePaths(path: string, runtime: RuntimeInfo) {
   if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) return [path]
@@ -385,64 +214,6 @@ function candidateWorkspacePaths(path: string, runtime: RuntimeInfo) {
   })
 }
 
-function sharedArtifactPath(workspaceId: string, sessionId: string, artifactId: string, name: string) {
-  return `shared://${workspaceId}/${sessionId}/${artifactId}/${name}`
-}
-
-function isSharedArtifactPath(path?: string) {
-  return Boolean(path?.startsWith('shared://'))
-}
-
-function sharedArtifactFile(workspaceId: string, sessionId: string, artifact: SharedArtifact): WorkspaceFile {
-  const createdAt = artifact.created_at ? Date.parse(artifact.created_at) : Date.now()
-  return {
-    id: `shared-${artifact.id}`,
-    name: artifact.name,
-    path: sharedArtifactPath(workspaceId, sessionId, artifact.id, artifact.name),
-    source: 'change',
-    status: 'created',
-    detail: `Shared artifact${artifact.size_bytes ? ` (${fmtBytes(artifact.size_bytes)})` : ''}`,
-    updatedAt: Number.isFinite(createdAt) ? createdAt : Date.now(),
-    sharedArtifact: {
-      workspaceId,
-      sessionId,
-      artifactId: artifact.id,
-      sizeBytes: artifact.size_bytes
-    }
-  }
-}
-
-interface WorkspaceFile {
-  id: string
-  name: string
-  path: string
-  source: 'attachment' | 'change'
-  status: 'attached' | 'created' | 'modified' | 'deleted' | 'missing'
-  detail?: string
-  updatedAt: number
-  sharedArtifact?: {
-    workspaceId: string
-    sessionId: string
-    artifactId: string
-    sizeBytes?: number
-  }
-}
-
-type TurnInputItem =
-  | { type: 'text'; text: string; textElements?: any[]; text_elements?: any[] }
-  | { type: 'image'; url: string }
-  | { type: 'localImage'; path: string }
-  | { type: 'skill'; name: string; path: string }
-  | { type: 'mention'; name: string; path: string }
-
-function fmtDuration(ms: number) {
-  const s = Math.round(ms / 1000)
-  if (s < 1) return '<1s'
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  return `${m}m ${s % 60}s`
-}
-
 function ActivityDuration({ startedAt, endedAt }: { startedAt: number; endedAt?: number }) {
   const [now, setNow] = useState(Date.now())
   useEffect(() => {
@@ -453,168 +224,7 @@ function ActivityDuration({ startedAt, endedAt }: { startedAt: number; endedAt?:
   return <>{fmtDuration((endedAt ?? now) - startedAt)}</>
 }
 
-function fmtBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`
-  const kb = bytes / 1024
-  if (kb < 1024) return `${kb.toFixed(kb < 10 ? 1 : 0)} KB`
-  const mb = kb / 1024
-  return `${mb.toFixed(mb < 10 ? 1 : 0)} MB`
-}
-
-function basename(path: string) {
-  return path.split(/[\\/]/).filter(Boolean).pop() ?? path
-}
-
-function stripInternalPromptContext(text: string) {
-  const raw = String(text ?? '')
-  const marker = raw.search(
-    /(?:^|\n\s*\n)\s*(?:Use skill:|Attached file:|Attached image:|Zspark local runtime|Zspark execution safety:|Hard delivery contract:|Before using @oai\/artifact-tool|Before the final answer|For PPTX\/presentation tasks|The final response must|\[Skill:)/
-  )
-  return (marker === -1 ? raw : raw.slice(0, marker)).trim()
-}
-
-function displaySkillName(name?: string) {
-  const raw = String(name ?? 'selected skill')
-  return raw.split(':').pop() || raw
-}
-
-function displayThreadPreview(thread: ThreadSummary) {
-  const label = stripInternalPromptContext(thread.preview?.trim() || thread.name || '')
-  return label || thread.id.slice(0, 8)
-}
-
-function sharedSessionToThread(session: SharedSession): ThreadSummary {
-  const updated = session.updated_at ? Math.floor(new Date(session.updated_at).getTime() / 1000) : undefined
-  const created = session.created_at ? Math.floor(new Date(session.created_at).getTime() / 1000) : undefined
-  return {
-    id: session.id,
-    name: session.title ?? undefined,
-    preview: session.title ?? undefined,
-    createdAt: Number.isFinite(created) ? created : undefined,
-    updatedAt: Number.isFinite(updated) ? updated : undefined
-  }
-}
-
-function titleFromBlocks(blocks: Block[]) {
-  const user = blocks.find((block): block is Extract<Block, { type: 'user' }> => block.type === 'user')
-  const title = stripInternalPromptContext(user?.text ?? '').split('\n').find(Boolean)?.trim()
-  return (title || 'New shared chat').slice(0, 120)
-}
-
-function blocksFromSharedSnapshot(snapshot?: SharedSessionSnapshot | null): Block[] {
-  const blocks = Array.isArray(snapshot?.blocks) ? snapshot.blocks : []
-  return blocks.filter((block: any) => (
-    block?.type === 'user' ||
-    block?.type === 'agent' ||
-    block?.type === 'files' ||
-    block?.type === 'approval' ||
-    block?.type === 'turn'
-  ))
-}
-
-function formatUserInputContent(content: any[]) {
-  const visible: string[] = []
-  const skills: string[] = []
-  for (const c of content) {
-    if (c?.type === 'text') {
-      const text = stripInternalPromptContext(c.text ?? '')
-      if (text) visible.push(text)
-      continue
-    }
-    if (c?.type === 'image') {
-      visible.push(`[Image: ${c.url?.startsWith?.('data:') ? 'attached image' : c.url ?? 'attached image'}]`)
-      continue
-    }
-    if (c?.type === 'localImage') {
-      visible.push(`[Image: ${basename(String(c.path ?? 'attached image'))}]`)
-      continue
-    }
-    if (c?.type === 'skill') {
-      skills.push(displaySkillName(c.name))
-      continue
-    }
-    if (c?.type === 'mention') {
-      visible.push(`[Mention: ${c.name ?? 'selected mention'}]`)
-    }
-  }
-  if (visible.length) return visible.join('\n')
-  if (skills.length) return `Using ${skills.join(', ')}`
-  return ''
-}
-
-function normalizeInputItemsForResubmit(content: any[]): TurnInputItem[] {
-  const items: TurnInputItem[] = []
-  for (const c of content) {
-    if (c?.type === 'text') {
-      const text = String(c.text ?? '')
-      if (text) items.push({ type: 'text', text, textElements: c.textElements ?? c.text_elements ?? [] })
-      continue
-    }
-    if (c?.type === 'image' && c.url) {
-      items.push({ type: 'image', url: String(c.url) })
-      continue
-    }
-    if (c?.type === 'localImage' && c.path) {
-      items.push({ type: 'localImage', path: String(c.path) })
-      continue
-    }
-    if (c?.type === 'skill' && c.name && c.path) {
-      items.push({ type: 'skill', name: String(c.name), path: String(c.path) })
-      continue
-    }
-    if (c?.type === 'mention' && c.name && c.path) {
-      items.push({ type: 'mention', name: String(c.name), path: String(c.path) })
-    }
-  }
-  return items
-}
-
-function scopeLabel(scope?: string) {
-  switch (scope) {
-    case 'repo': return 'Project'
-    case 'user': return 'User'
-    case 'system': return 'System'
-    case 'admin': return 'Admin'
-    default: return 'Skill'
-  }
-}
-
-function localSkillSourceLabel(source?: string) {
-  switch (source) {
-    case 'workspace': return 'Project'
-    case 'pluginCache': return 'Plugin cache'
-    case 'system': return 'System'
-    case 'user': return 'User'
-    default: return source ?? 'Local'
-  }
-}
-
-function skillStatusLabel(skill: SkillMeta) {
-  if (skill.availability === 'localOnly') return 'Detected'
-  if (skill.enabled === false) return 'Disabled'
-  return 'Ready'
-}
-
-function skillStatusClass(skill: SkillMeta) {
-  if (skill.availability === 'localOnly') return 'local'
-  if (skill.enabled === false) return 'disabled'
-  return 'ready'
-}
-
-function changeKindLabel(kind: any): WorkspaceFile['status'] {
-  if (kind?.type === 'add' || kind === 'add') return 'created'
-  if (kind?.type === 'delete' || kind === 'delete') return 'deleted'
-  return 'modified'
-}
-
-function describeChange(kind: any) {
-  if (kind?.type === 'update' && kind.movePath) return `Moved from ${kind.movePath}`
-  return changeKindLabel(kind)
-}
-
-function turnIdFromParams(params: any) {
-  return String(params?.turnId ?? params?.turn?.id ?? '')
-}
+marked.setOptions({ gfm: true, breaks: true })
 
 marked.setOptions({ gfm: true, breaks: true })
 
@@ -748,45 +358,6 @@ function MessageActions({
   )
 }
 
-function normalizeMemoryCitation(citation: any): MemoryCitation | null {
-  if (!citation || typeof citation !== 'object') return null
-  const entries = Array.isArray(citation.entries)
-    ? citation.entries
-        .map((entry: any): MemoryCitationEntry | null => {
-          const path = String(entry?.path ?? '').trim()
-          if (!path) return null
-          return {
-            path,
-            lineStart: Number.isFinite(Number(entry?.lineStart)) ? Number(entry.lineStart) : undefined,
-            lineEnd: Number.isFinite(Number(entry?.lineEnd)) ? Number(entry.lineEnd) : undefined,
-            note: entry?.note ? String(entry.note) : undefined
-          }
-        })
-        .filter((entry: MemoryCitationEntry | null): entry is MemoryCitationEntry => Boolean(entry))
-    : []
-  const threadIds = Array.isArray(citation.threadIds)
-    ? citation.threadIds.map((id: any) => String(id)).filter(Boolean)
-    : []
-  if (!entries.length && !threadIds.length) return null
-  return { entries, threadIds }
-}
-
-function memoryCitationTitle(citation?: MemoryCitation | null) {
-  const count = citation?.entries?.length ?? 0
-  if (count > 0) return `Referenced ${count} memor${count === 1 ? 'y' : 'ies'}`
-  const threadCount = citation?.threadIds?.length ?? 0
-  return threadCount > 0 ? `Used memory from ${threadCount} thread${threadCount === 1 ? '' : 's'}` : 'Referenced memory'
-}
-
-function memoryCitationDetail(citation?: MemoryCitation | null) {
-  const entries = citation?.entries ?? []
-  if (!entries.length) return undefined
-  return entries.slice(0, 4).map((entry) => {
-    const line = entry.lineStart ? `:${entry.lineStart}` : ''
-    const note = entry.note ? ` — ${entry.note}` : ''
-    return `${basename(entry.path)}${line}${note}`
-  }).join('\n')
-}
 
 function MemoryCitationPill({ citation }: { citation?: MemoryCitation | null }) {
   if (!citation) return null
@@ -1167,453 +738,6 @@ function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; 
   return { blocks, files }
 }
 
-function orderBlocksForTurn(blocks: Block[], turnId: string) {
-  const groupedIndices = blocks
-    .map((block, index) => ({ block, index }))
-    .filter(({ block }) =>
-      (block.type === 'user' && block.turnId === turnId) ||
-      (block.type === 'turn' && block.turnId === turnId)
-    )
-    .map(({ index }) => index)
-  if (groupedIndices.length < 2) return blocks
-
-  const insertAt = Math.min(...groupedIndices)
-  const users = blocks.filter((block) => block.type === 'user' && block.turnId === turnId)
-  const turns = blocks.filter((block) => block.type === 'turn' && block.turnId === turnId)
-  const rest = blocks.filter((block) =>
-    !((block.type === 'user' && block.turnId === turnId) ||
-      (block.type === 'turn' && block.turnId === turnId))
-  )
-  return [...rest.slice(0, insertAt), ...users, ...turns, ...rest.slice(insertAt)]
-}
-
-function activityStorageKey(threadId: string) {
-  return `${ACTIVITY_STORAGE_PREFIX}${threadId}`
-}
-
-function activityDetailWeight(block?: Extract<Block, { type: 'turn' }>) {
-  if (!block) return 0
-  return block.activities.reduce((total, activity) => total + (activity.detail?.length ?? 0), 0)
-}
-
-function inferActionKindFromTitle(title?: string): ActivityActionKind | undefined {
-  const t = String(title ?? '').toLowerCase()
-  if (!t) return undefined
-  if (/\bread\b/.test(t)) return 'read'
-  if (/\b(write|wrote|created|prepared|updated|changed|modified)\b/.test(t)) return 'write'
-  if (/\b(search|searched)\b/.test(t)) return 'search'
-  if (/\b(list|listed|inspect|explored)\b/.test(t)) return 'list'
-  if (/\b(build|export|pptx|deck)\b/.test(t)) return 'build'
-  if (/\b(verify|check)\b/.test(t)) return 'verify'
-  if (/\bused\b/.test(t)) return 'tool'
-  return undefined
-}
-
-function truncateActivityDetail(detail?: string, limit = 1800) {
-  if (!detail) return undefined
-  const trimmed = detail.trim()
-  if (trimmed.length <= limit) return trimmed
-  return `Output truncated to last ${limit} characters.\n\n${trimmed.slice(-limit)}`
-}
-
-function normalizeActivity(activity: any): Activity | null {
-  if (!activity || typeof activity.id !== 'string' || typeof activity.title !== 'string') return null
-  const kind: ActivityKind =
-    activity.kind === 'command' || activity.kind === 'file' || activity.kind === 'tool' || activity.kind === 'web' || activity.kind === 'memory'
-      ? activity.kind
-      : 'reasoning'
-  const status: Activity['status'] =
-    activity.status === 'failed' ? 'failed' :
-    activity.status === 'running' ? 'running' : 'done'
-  const startedAt = Number(activity.startedAt) || Date.now()
-  const endedAt = activity.endedAt ? Number(activity.endedAt) : undefined
-  return {
-    id: activity.id,
-    kind,
-    title: activity.title,
-    detail: truncateActivityDetail(activity.detail, kind === 'reasoning' ? 2400 : 1400),
-    actionKind: activity.actionKind ?? inferActionKindFromTitle(activity.title),
-    target: activity.target,
-    status,
-    startedAt,
-    endedAt
-  }
-}
-
-function loadPersistedActivityBlocks(threadId: string): Extract<Block, { type: 'turn' }>[] {
-  try {
-    const raw = window.localStorage.getItem(activityStorageKey(threadId))
-    if (!raw) return []
-    const parsed = JSON.parse(raw)
-    if (!Array.isArray(parsed)) return []
-    return parsed
-      .filter((block: any) =>
-        block?.type === 'turn' &&
-        typeof block.turnId === 'string' &&
-        Array.isArray(block.activities)
-      )
-      .map((block: any) => ({
-        ...block,
-        activities: block.activities
-          .map(normalizeActivity)
-          .filter((activity: Activity | null): activity is Activity => Boolean(activity))
-      }))
-  } catch {
-    return []
-  }
-}
-
-function serializePersistedActivityBlocks(blocks: Block[]) {
-  const turnBlocks = blocks.filter((block): block is Extract<Block, { type: 'turn' }> => block.type === 'turn')
-  if (!turnBlocks.length) return null
-  const normalized = turnBlocks.slice(-80).map((block) => ({
-    ...block,
-    activities: block.activities
-      .map(normalizeActivity)
-      .filter((activity: Activity | null): activity is Activity => Boolean(activity))
-  }))
-  return JSON.stringify(normalized)
-}
-
-function savePersistedActivityBlocks(threadId: string, serialized: string) {
-  try {
-    window.localStorage.setItem(activityStorageKey(threadId), serialized)
-  } catch {
-    // Best-effort UI continuity; chat correctness must not depend on storage.
-  }
-}
-
-function mergePersistedActivityBlocks(blocks: Block[], persisted: Extract<Block, { type: 'turn' }>[]) {
-  if (!persisted.length) return blocks
-  let next = [...blocks]
-  for (const persistedTurn of persisted) {
-    const existingIndex = next.findIndex((block) => block.type === 'turn' && block.turnId === persistedTurn.turnId)
-    if (existingIndex !== -1) {
-      const existing = next[existingIndex] as Extract<Block, { type: 'turn' }>
-      if (activityDetailWeight(persistedTurn) > activityDetailWeight(existing) || existing.activities.length === 0) {
-        next[existingIndex] = { ...persistedTurn, collapsed: false }
-      }
-      next = orderBlocksForTurn(next, persistedTurn.turnId)
-      continue
-    }
-
-    const userIndex = next.findIndex((block) => block.type === 'user' && block.turnId === persistedTurn.turnId)
-    if (userIndex === -1) continue
-    next = [
-      ...next.slice(0, userIndex + 1),
-      { ...persistedTurn, collapsed: false },
-      ...next.slice(userIndex + 1)
-    ]
-    next = orderBlocksForTurn(next, persistedTurn.turnId)
-  }
-  return next
-}
-
-function shortenCommand(command: string, limit = 72) {
-  const firstLine = cleanShellCommand(command).split('\n')[0]?.trim() || command
-  return firstLine.length > limit ? firstLine.slice(0, limit - 1) + '…' : firstLine
-}
-
-function cleanShellCommand(command: string) {
-  return command
-    .replace(/^\/bin\/(?:zsh|bash|sh) -lc\s+/, '')
-    .replace(/^'([\s\S]*)'$/, '$1')
-    .trim()
-}
-
-function titleizeToolName(value?: string) {
-  const raw = String(value ?? 'tool').split(':').pop() ?? 'tool'
-  const lower = raw.toLowerCase()
-  if (lower.includes('computer')) return 'Computer Use'
-  if (lower.includes('read_mcp_resource')) return 'MCP resource'
-  return raw
-    .replace(/[_./-]+/g, ' ')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .replace(/\b\w/g, (c) => c.toUpperCase())
-}
-
-function commandActionInfo(action: any): ActivityInfo | null {
-  const actionType = String(action?.type ?? '')
-  const target = action?.path ? String(action.path) : undefined
-  const name = String(action?.name ?? (target ? basename(target) : '')).trim()
-  const label = name || (target ? basename(target) : 'file')
-  if (target && /\/presentations\/[^/]+\/skills\/presentations\/SKILL\.md$/.test(target)) {
-    return { title: 'Loaded presentation skill', actionKind: 'read', target }
-  }
-  if (target && /\/skills\/(?:presentations|documents|spreadsheets)\//.test(target)) {
-    return { title: 'Checked Office tooling', actionKind: 'read', target }
-  }
-  if (target && /\/slides\/slide[-_]\d+\.mjs$/i.test(target)) {
-    return { title: `Drafted ${label.replace(/\.mjs$/i, '')}`, actionKind: 'write', target }
-  }
-  if (actionType === 'read') {
-    return { title: `Read ${label}`, actionKind: 'read', target }
-  }
-  if (actionType === 'write' || actionType === 'update') {
-    return { title: `Wrote ${label}`, actionKind: 'write', target }
-  }
-  if (actionType === 'delete') {
-    return { title: `Deleted ${label}`, actionKind: 'write', target }
-  }
-  if (action?.command) return inferCommandInfo(String(action.command))
-  return null
-}
-
-function inferCommandInfo(command: string): ActivityInfo {
-  const cleaned = cleanShellCommand(command)
-  if (/build_artifact_deck\.mjs/.test(cleaned)) return { title: 'Built PPTX deck', actionKind: 'build' }
-  if (/import\(['"]@oai\/artifact-tool['"]\)/.test(cleaned) || /artifact-tool ok/.test(cleaned)) return { title: 'Checked presentation runtime', actionKind: 'verify' }
-  if (/\bmkdir\b/.test(cleaned)) return { title: 'Prepared workspace', actionKind: 'write' }
-  if (/\btrash\b|\.Trash|~\/\.Trash|\bmv\b.+(?:Trash|\.Trash)/.test(cleaned)) return { title: 'Move files to Trash', actionKind: 'write' }
-  if (/test -s|ls -lh/.test(cleaned)) return { title: 'Verified generated file', actionKind: 'verify' }
-  if (/\b(rg|grep)\b/.test(cleaned)) return { title: 'Inspected project context', actionKind: 'search' }
-  if (/\b(find|ls)\b/.test(cleaned)) return { title: 'Reviewed workspace files', actionKind: 'list' }
-  if (/(cat\s+>|tee\s+|apply_patch)/.test(cleaned)) return { title: 'Drafted workspace content', actionKind: 'write' }
-  if (/\b(cat|sed|head|tail)\b/.test(cleaned)) return { title: 'Read source material', actionKind: 'read' }
-  if (/\bnpm\s+run\s+(typecheck|test|build)\b|\b(pnpm|yarn)\s+(test|build|typecheck)\b/.test(cleaned)) return { title: 'Ran quality checks', actionKind: 'run' }
-  if (/\bgit\s+status\b/.test(cleaned)) return { title: 'Checked git status', actionKind: 'run' }
-  if (/\bgit\s+commit\b/.test(cleaned)) return { title: 'Created git commit', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
-  if (/\bgit\s+push\b/.test(cleaned)) return { title: 'Pushed branch', detail: shortenCommand(cleaned, 96), actionKind: 'run' }
-  return { title: 'Ran workspace step', actionKind: 'run' }
-}
-
-function commandActivityInfo(item: any): ActivityInfo {
-  const command = String(item?.command ?? '')
-  const actions: ActivityInfo[] = Array.isArray(item?.commandActions)
-    ? item.commandActions.map(commandActionInfo).filter((action: ActivityInfo | null): action is ActivityInfo => Boolean(action))
-    : []
-  if (actions.length === 1) return actions[0]
-  if (actions.length > 1) {
-    const firstKind = actions[0].actionKind
-    const sameKind = actions.every((action) => action.actionKind === firstKind)
-    if (sameKind && firstKind === 'read') return { title: `Read ${actions.length} files`, actionKind: 'read' }
-    if (sameKind && firstKind === 'write') return { title: `Wrote ${actions.length} files`, actionKind: 'write' }
-    return { title: `Ran ${actions.length} command actions`, detail: actions.map((action) => action.title).join('\n'), actionKind: 'run' }
-  }
-  return inferCommandInfo(command)
-}
-
-function commandActivityDetail(item: any, info = commandActivityInfo(item)) {
-  const output = String(item?.aggregated_output ?? item?.aggregatedOutput ?? '').trim()
-  const failure = detectMaskedCommandFailure(output)
-  const actionDetail = info.detail || (info.target ? shortPath(info.target) : '')
-  if (!output) return actionDetail || undefined
-  if (failure) return failure.detail
-  if (info.actionKind === 'read' && output.length > 800) {
-    return actionDetail ? `${actionDetail}\nLarge read output hidden from the activity log.` : 'Large read output hidden from the activity log.'
-  }
-  const capped = truncateActivityDetail(output, info.actionKind === 'run' ? 1400 : 900)
-  return actionDetail && capped ? `${actionDetail}\n\n${capped}` : capped
-}
-
-function toolActivityInfo(item: any) {
-  const toolName = titleizeToolName(item?.tool ?? item?.name ?? item?.server)
-  const detailParts: string[] = []
-  if (item?.server) detailParts.push(`Server: ${item.server}`)
-  if (item?.error?.message) detailParts.push(item.error.message)
-  return {
-    title: `Used ${toolName}`,
-    detail: truncateActivityDetail(detailParts.join('\n'), 900),
-    actionKind: 'tool' as const
-  }
-}
-
-function webSearchActivityInfo(item: any) {
-  const query = String(item?.query ?? '').trim()
-  return {
-    title: query ? `Searched "${query}"` : 'Searched the web',
-    detail: query || undefined,
-    actionKind: 'search' as const
-  }
-}
-
-function actionKindForSummary(activity: Activity): ActivityActionKind | undefined {
-  if (activity.actionKind) return activity.actionKind
-  if (activity.kind === 'memory') return undefined
-  if (activity.kind === 'tool') return 'tool'
-  if (activity.kind === 'file') return 'file'
-  if (activity.kind === 'web') return 'search'
-  return inferActionKindFromTitle(activity.title)
-}
-
-function activitySummaryLabels(activities: Activity[]) {
-  const visible = activities.filter((activity) => activity.kind !== 'reasoning')
-  const counts = new Map<ActivityActionKind | 'command' | 'memory' | 'failed', number>()
-  for (const activity of visible) {
-    if (activity.status === 'failed') {
-      counts.set('failed', (counts.get('failed') ?? 0) + 1)
-      continue
-    }
-    if (activity.kind === 'command') counts.set('command', (counts.get('command') ?? 0) + 1)
-    if (activity.kind === 'memory') counts.set('memory', (counts.get('memory') ?? 0) + 1)
-    const actionKind = actionKindForSummary(activity)
-    if (actionKind) counts.set(actionKind, (counts.get(actionKind) ?? 0) + 1)
-  }
-  const labels: string[] = []
-  const plural = (count: number, singular: string, pluralLabel = `${singular}s`) => `${count} ${count === 1 ? singular : pluralLabel}`
-  const push = (count: number | undefined, phrase: (count: number) => string) => {
-    if (count) labels.push(phrase(count))
-  }
-  push(counts.get('failed'), (count) => `Blocked ${plural(count, 'step')}`)
-  push(counts.get('command'), (count) => `Ran ${plural(count, 'command')}`)
-  push(counts.get('tool'), (count) => `Used ${plural(count, 'tool')}`)
-  push(counts.get('read'), (count) => `Read ${plural(count, 'file')}`)
-  push(counts.get('write'), (count) => `Wrote ${plural(count, 'file action')}`)
-  push(counts.get('search'), (count) => `Searched ${plural(count, 'time', 'times')}`)
-  push(counts.get('list'), (count) => `Listed ${plural(count, 'folder')}`)
-  push(counts.get('build'), (count) => `Built ${plural(count, 'artifact')}`)
-  push(counts.get('verify'), (count) => `Verified ${plural(count, 'result')}`)
-  push(counts.get('file'), (count) => `Changed ${plural(count, 'file')}`)
-  push(counts.get('memory'), (count) => `Recorded ${plural(count, 'memory event')}`)
-  return labels
-}
-
-function publicActivityTitleText(value: string) {
-  const title = value.trim()
-  if (/^Read SKILL\.md$/i.test(title)) return 'Loaded presentation skill'
-  if (/^Read (?:build_artifact_deck|artifact_tool_utils|index)\.mjs$/i.test(title)) return 'Checked Office tooling'
-  if (/^Read slide[-_]\d+\.mjs$/i.test(title)) return 'Reviewed slide source'
-  if (/^Prepared workspace folders$/i.test(title)) return 'Prepared workspace'
-  if (/^Wrote workspace files$/i.test(title)) return 'Drafted workspace content'
-  if (/^Listed workspace files$/i.test(title)) return 'Reviewed workspace files'
-  if (/^Read file content$/i.test(title)) return 'Read source material'
-  if (/^Searched workspace$/i.test(title)) return 'Inspected project context'
-  if (/^read_mcp_resource$/i.test(title)) return 'Used MCP resource'
-  if (/^tool call$/i.test(title)) return 'Used tool'
-  if (/^Ran \d+ command actions$/i.test(title)) return 'Ran workspace step'
-  if (/^Ran (?:cd |node -e|["']?\/Users\/)/i.test(title)) return 'Ran workspace step'
-  if (/\/Users\/|\.cache\/codex-runtimes|node_modules/.test(title)) return 'Ran workspace step'
-  return title
-}
-
-function publicActivityTitle(activity: Activity) {
-  return publicActivityTitleText(activity.title)
-}
-
-function publicActivityDetail(activity: Activity) {
-  const detail = activity.detail?.trim()
-  if (!detail) return undefined
-  if (activity.kind === 'reasoning' || activity.kind === 'memory') return detail
-  return undefined
-}
-
-function displayActivities(activities: Activity[]) {
-  const visible: Array<Activity & { displayTitle: string; repeatCount: number }> = []
-  for (const activity of activities) {
-    const displayTitle = publicActivityTitle(activity)
-    const previous = visible[visible.length - 1]
-    if (
-      previous &&
-      previous.displayTitle === displayTitle &&
-      previous.status === activity.status &&
-      previous.kind === activity.kind
-    ) {
-      previous.repeatCount += 1
-      previous.endedAt = activity.endedAt ?? previous.endedAt
-      const existingDetail = previous.detail?.trim()
-      const nextDetail = activity.detail?.trim()
-      if (nextDetail && !existingDetail) {
-        previous.detail = nextDetail
-      } else if (nextDetail && existingDetail && !existingDetail.includes(nextDetail)) {
-        previous.detail = `${existingDetail}\n\n${nextDetail}`
-      }
-      continue
-    }
-    visible.push({ ...activity, displayTitle, repeatCount: 1 })
-  }
-  return visible
-}
-
-function itemTimeMs(item: any, key: 'startedAtMs' | 'completedAtMs', fallback: number) {
-  return timestampToMs(item?.[key] ?? item?.[key.replace('Ms', '')], fallback)
-}
-
-function timestampToMs(value: any, fallback = Date.now()) {
-  const n = Number(value)
-  if (!Number.isFinite(n) || n <= 0) return fallback
-  return n < 10000000000 ? n * 1000 : n
-}
-
-function replayActivityFromItem(item: any, fallbackStartedAt: number): Activity | undefined {
-  const id = String(item?.id ?? `replay-${Math.random()}`)
-  const startedAt = itemTimeMs(item, 'startedAtMs', fallbackStartedAt)
-  const endedAt = itemTimeMs(item, 'completedAtMs', startedAt)
-  if (item?.type === 'reasoning') {
-    const summary = Array.isArray(item.summary) ? item.summary.join('\n\n') : ''
-    const content = Array.isArray(item.content) ? item.content.join('\n\n') : ''
-    const detail = (summary + (summary && content ? '\n\n' : '') + content).trim()
-    return { id: `replay-a-${id}`, kind: 'reasoning', title: 'Thought', detail: detail || undefined, status: 'done', startedAt, endedAt }
-  }
-  if (item?.type === 'commandExecution') {
-    const status: Activity['status'] =
-      item.status === 'failed' ? 'failed' :
-      item.status === 'inProgress' ? 'running' : 'done'
-    const info = commandActivityInfo(item)
-    return {
-      id: `replay-a-${id}`,
-      kind: 'command',
-      title: info.title,
-      detail: commandActivityDetail(item, info),
-      actionKind: info.actionKind,
-      target: info.target,
-      status,
-      startedAt,
-      endedAt: status === 'running' ? undefined : endedAt
-    }
-  }
-  if (item?.type === 'fileChange') {
-    const changes = item.changes ?? []
-    return {
-      id: `replay-a-${id}`,
-      kind: 'file',
-      title: `${changes.length} file${changes.length === 1 ? '' : 's'} changed`,
-      detail: changes.map((change: any) => `${describeChange(change.kind)} ${change.path}`).join('\n'),
-      actionKind: 'file',
-      status: 'done',
-      startedAt,
-      endedAt
-    }
-  }
-  if (item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall') {
-    const info = toolActivityInfo(item)
-    return {
-      id: `replay-a-${id}`,
-      kind: 'tool',
-      title: info.title,
-      detail: info.detail,
-      actionKind: info.actionKind,
-      status: item.status === 'failed' ? 'failed' : 'done',
-      startedAt,
-      endedAt
-    }
-  }
-  if (item?.type === 'webSearch') {
-    const info = webSearchActivityInfo(item)
-    return {
-      id: `replay-a-${id}`,
-      kind: 'web',
-      title: info.title,
-      detail: info.detail,
-      actionKind: info.actionKind,
-      status: 'done',
-      startedAt,
-      endedAt
-    }
-  }
-  if (item?.type === 'contextCompaction') {
-    return {
-      id: `replay-a-${id}`,
-      kind: 'memory',
-      title: 'Compacted context',
-      detail: 'Earlier conversation context was summarized for future turns.',
-      status: 'done',
-      startedAt,
-      endedAt
-    }
-  }
-  return undefined
-}
 
 function actIcon(k: ActivityKind) {
   switch (k) {
