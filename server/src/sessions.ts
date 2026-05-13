@@ -1,5 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
+import type { PoolClient } from 'pg'
+import { z } from 'zod'
 import { pool } from './db.js'
 import { displayPrincipal, principalKeys } from './principal.js'
 import { canAccessWorkspace } from './workspaces.js'
@@ -9,17 +11,17 @@ interface SessionParams {
   sessionId?: string
 }
 
-interface CreateSessionBody {
-  title?: string
-  localThreadId?: string
-  snapshot?: unknown
-}
+const CreateSessionBody = z.object({
+  title: z.string().max(160).optional(),
+  localThreadId: z.string().max(160).optional(),
+  snapshot: z.unknown().optional()
+})
 
-interface UpdateSessionBody {
-  title?: string
-  localThreadId?: string | null
-  snapshot?: unknown
-}
+const UpdateSessionBody = z.object({
+  title: z.string().max(160).optional(),
+  localThreadId: z.string().max(160).nullable().optional(),
+  snapshot: z.unknown().optional()
+})
 
 async function ensureWorkspaceAccess(req: FastifyRequest, workspaceId: string) {
   return canAccessWorkspace(req, workspaceId)
@@ -54,9 +56,9 @@ async function latestSnapshot(sessionId: string) {
   return result.rows[0]?.content ?? null
 }
 
-async function writeSnapshot(sessionId: string, snapshot: unknown) {
-  if (!pool || snapshot === undefined) return
-  await pool.query(
+async function writeSnapshot(client: PoolClient, sessionId: string, snapshot: unknown) {
+  if (snapshot === undefined) return
+  await client.query(
     `
       INSERT INTO messages (session_id, role, content)
       VALUES ($1, 'snapshot', $2::jsonb)
@@ -95,18 +97,30 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     const owner = keys[0]
     if (!owner) return reply.code(401).send({ error: 'unauthenticated' })
 
-    const body = (req.body ?? {}) as CreateSessionBody
+    const parsed = CreateSessionBody.safeParse(req.body ?? {})
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid session payload', detail: parsed.error.flatten() })
+    const body = parsed.data
     const id = randomUUID()
-    const result = await pool.query(
-      `
-        INSERT INTO sessions (id, owner, title, workspace_id, local_thread_id, updated_at)
-        VALUES ($1, $2, $3, $4, $5, now())
-        RETURNING id, owner, title, local_thread_id, created_at, updated_at
-      `,
-      [id, owner, sessionTitle(body.title, req), workspaceId, body.localThreadId ?? null]
-    )
-    await writeSnapshot(id, body.snapshot)
-    return reply.code(201).send({ session: result.rows[0] })
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const result = await client.query(
+        `
+          INSERT INTO sessions (id, owner, title, workspace_id, local_thread_id, updated_at)
+          VALUES ($1, $2, $3, $4, $5, now())
+          RETURNING id, owner, title, local_thread_id, created_at, updated_at
+        `,
+        [id, owner, sessionTitle(body.title, req), workspaceId, body.localThreadId ?? null]
+      )
+      await writeSnapshot(client, id, body.snapshot)
+      await client.query('COMMIT')
+      return reply.code(201).send({ session: result.rows[0] })
+    } catch (err) {
+      await client.query('ROLLBACK')
+      throw err
+    } finally {
+      client.release()
+    }
   })
 
   app.get('/workspaces/:workspaceId/sessions/:sessionId', async (req, reply) => {
@@ -138,24 +152,36 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     if (!(await sessionBelongsToWorkspace(sessionId, workspaceId))) {
       return reply.code(404).send({ error: 'session not found' })
     }
-    const body = (req.body ?? {}) as UpdateSessionBody
+    const parsed = UpdateSessionBody.safeParse(req.body ?? {})
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid session payload', detail: parsed.error.flatten() })
+    const body = parsed.data
     const title = body.title === undefined ? null : sessionTitle(body.title, req)
     const hasTitle = body.title !== undefined
     const hasLocalThreadId = body.localThreadId !== undefined
-    const result = await pool.query(
-      `
-        UPDATE sessions
-        SET
-          title = CASE WHEN $3::boolean THEN $4 ELSE title END,
-          local_thread_id = CASE WHEN $5::boolean THEN $6 ELSE local_thread_id END,
-          updated_at = now()
-        WHERE id = $1 AND workspace_id = $2
-        RETURNING id, owner, title, local_thread_id, created_at, updated_at
-      `,
-      [sessionId, workspaceId, hasTitle, title, hasLocalThreadId, body.localThreadId ?? null]
-    )
-    await writeSnapshot(sessionId, body.snapshot)
-    return { session: result.rows[0] }
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const result = await client.query(
+        `
+          UPDATE sessions
+          SET
+            title = CASE WHEN $3::boolean THEN $4 ELSE title END,
+            local_thread_id = CASE WHEN $5::boolean THEN $6 ELSE local_thread_id END,
+            updated_at = now()
+          WHERE id = $1 AND workspace_id = $2
+          RETURNING id, owner, title, local_thread_id, created_at, updated_at
+        `,
+        [sessionId, workspaceId, hasTitle, title, hasLocalThreadId, body.localThreadId ?? null]
+      )
+      await writeSnapshot(client, sessionId, body.snapshot)
+      await client.query('COMMIT')
+      return { session: result.rows[0] }
+    } catch (err) {
+      await client.query('ROLLBACK')
+      throw err
+    } finally {
+      client.release()
+    }
   })
 
   app.delete('/workspaces/:workspaceId/sessions/:sessionId', async (req, reply) => {

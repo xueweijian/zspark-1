@@ -1,23 +1,22 @@
 import type { FastifyInstance, FastifyRequest, FastifyReply } from 'fastify'
-import { createLocalJWKSet, jwtVerify } from 'jose'
+import { createRemoteJWKSet, jwtVerify } from 'jose'
 
 interface EntraEnv {
+  NODE_ENV?: string
   ZSPARK_TENANT_ID?: string
   ZSPARK_CLIENT_ID?: string
   ZSPARK_AUTHORITY?: string
 }
 
-let jwks: ReturnType<typeof createLocalJWKSet> | null = null
-let jwksExpiresAt = 0
+let jwks: ReturnType<typeof createRemoteJWKSet> | null = null
+let jwksUrl = ''
 
-async function getJwks(env: EntraEnv) {
-  if (jwks && jwksExpiresAt > Date.now()) return jwks
-  const response = await fetch(`${authorityBase(env)}/discovery/v2.0/keys`)
-  if (!response.ok) {
-    throw new Error(`JWKS fetch failed with HTTP ${response.status}`)
+function getJwks(env: EntraEnv) {
+  const nextJwksUrl = `${authorityBase(env)}/discovery/v2.0/keys`
+  if (!jwks || jwksUrl !== nextJwksUrl) {
+    jwks = createRemoteJWKSet(new URL(nextJwksUrl))
+    jwksUrl = nextJwksUrl
   }
-  jwks = createLocalJWKSet(await response.json())
-  jwksExpiresAt = Date.now() + 12 * 60 * 60 * 1000
   return jwks
 }
 
@@ -40,11 +39,12 @@ function authorityBase(env: EntraEnv) {
  * - Validates `aud` against ZSPARK_CLIENT_ID and `iss` tenant
  * - Sets req.principal = upn|preferred_username|sub
  *
- * Falls back to the X-Domain-User dev shim when Entra is not configured,
- * so contributors can boot the stack without Azure access.
+ * In development only, falls back to the X-Domain-User shim when Entra is not
+ * configured, so contributors can boot the stack without Azure access.
  */
 export function entraAuth(env: EntraEnv) {
   const enabled = Boolean(env.ZSPARK_TENANT_ID && env.ZSPARK_CLIENT_ID)
+  const allowDevShim = env.NODE_ENV === 'development'
 
   return async (req: FastifyRequest, reply: FastifyReply) => {
     if (
@@ -55,6 +55,10 @@ export function entraAuth(env: EntraEnv) {
     }
 
     if (!enabled) {
+      if (!allowDevShim) {
+        reply.code(503).send({ error: 'Entra ID is not configured' })
+        return reply
+      }
       const principal = req.headers['x-domain-user']
       if (!principal) {
         reply.code(401).send({ error: 'unauthenticated', hint: 'set X-Domain-User in dev or configure Entra ID' })
@@ -66,6 +70,10 @@ export function entraAuth(env: EntraEnv) {
 
     const auth = req.headers['authorization']
     const urlToken = tokenFromQuery(req.url)
+    if (urlToken && !allowQueryToken(req)) {
+      reply.code(400).send({ error: 'access_token query parameter is only allowed for /collab websocket upgrades' })
+      return reply
+    }
     if (!auth?.toLowerCase().startsWith('bearer ') && !urlToken) {
       reply.code(401).header('WWW-Authenticate', 'Bearer').send({ error: 'missing bearer token' })
       return reply
@@ -73,9 +81,10 @@ export function entraAuth(env: EntraEnv) {
     const token = urlToken ?? auth!.slice(7).trim()
 
     try {
-      const { payload } = await jwtVerify(token, await getJwks(env), {
+      const { payload } = await jwtVerify(token, getJwks(env), {
         audience: tokenAudiences(env),
-        issuer: tokenIssuers(env)
+        issuer: tokenIssuers(env),
+        algorithms: ['RS256']
       })
       if (env.ZSPARK_TENANT_ID && payload['tid'] !== env.ZSPARK_TENANT_ID) {
         throw new Error('unexpected tenant id in access token')
@@ -117,4 +126,8 @@ function tokenFromQuery(url: string) {
   } catch {
     return undefined
   }
+}
+
+function allowQueryToken(req: FastifyRequest) {
+  return req.url.startsWith('/collab/') && String(req.headers.upgrade ?? '').toLowerCase() === 'websocket'
 }

@@ -64,12 +64,17 @@ ZSPARK_SERVER_URL=http://143.64.174.225:8787
 ## Server 端环境变量
 
 ```
+NODE_ENV=production
 ZSPARK_TENANT_ID=<...>
 ZSPARK_CLIENT_ID=<...>            # 用于 aud 校验
 ZSPARK_AUTHORITY=https://login.partner.microsoftonline.cn/<tenant-id>/v2.0
+ZSPARK_CORS_ORIGINS=https://your-desktop-shell-origin.example
+ZSPARK_ARTIFACT_STORAGE_DIR=/data/artifacts
 ```
 
-服务器启动时会自动拉 `<authority>/discovery/v2.0/keys` 拿 JWKS，缓存 12h。
+服务器启动时会通过 `<authority>/discovery/v2.0/keys` 校验 JWKS，并固定只接受
+`RS256` token。`X-Domain-User` 只在 `NODE_ENV=development` 且未配置 Entra 时可用，
+生产环境不要打开这个 dev shim。
 
 ## Shared workspace 行为
 

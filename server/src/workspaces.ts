@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { z } from 'zod'
 import { pool } from './db.js'
 import { displayPrincipal, principalKeys } from './principal.js'
 
-interface CreateWorkspaceBody {
-  name?: string
-}
+const CreateWorkspaceBody = z.object({
+  name: z.string().trim().min(1).max(120).optional()
+})
 
 export async function canAccessWorkspace(req: FastifyRequest, workspaceId: string) {
   const keys = principalKeys(req)
@@ -47,9 +48,11 @@ export async function registerWorkspaceRoutes(app: FastifyInstance) {
     const ownerKey = keys[0]
     if (!ownerKey) return reply.code(401).send({ error: 'unauthenticated' })
 
-    const body = (req.body ?? {}) as CreateWorkspaceBody
+    const parsed = CreateWorkspaceBody.safeParse(req.body ?? {})
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid workspace payload', detail: parsed.error.flatten() })
+    const body = parsed.data
     const id = randomUUID()
-    const name = (body.name?.trim() || `${displayPrincipal(req)} shared workspace`).slice(0, 120)
+    const name = body.name || `${displayPrincipal(req)} shared workspace`
 
     const result = await pool.query(
       `

@@ -2,8 +2,10 @@ import { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } from 'electro
 import type { OpenDialogOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
-import { basename, delimiter, dirname, extname, join } from 'node:path'
+import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync } from 'node:fs'
+import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
 import { PublicClientApplication } from '@azure/msal-node'
 import { scanRecentArtifacts } from './artifacts'
 import { importAttachmentFiles } from './attachments'
@@ -45,6 +47,7 @@ interface AppSettings {
 
 let bridgePort: number | null = null
 let bridgeClose: (() => void) | null = null
+let settingsLoadIssue: string | null = null
 
 const PROVIDER_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/models']
 const DEFAULT_ENTRA_TENANT_ID = process.env.ZSPARK_TENANT_ID ?? 'ae266ff5-076f-4eb1-b91b-788a04d2abe0'
@@ -78,38 +81,76 @@ function resolveWorkspaceRoot(start: string): string {
 function loadSettings(): AppSettings {
   try {
     const raw = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
-    if (raw?.provider?.encryptedApiKey && safeStorage.isEncryptionAvailable()) {
+    settingsLoadIssue = null
+    if (raw?.provider?.encryptedApiKey && settingsEncryptionAvailable()) {
       raw.provider.apiKey = safeStorage.decryptString(Buffer.from(raw.provider.encryptedApiKey, 'base64'))
       delete raw.provider.encryptedApiKey
     }
-    if (raw?.enterpriseAuth?.encryptedAccessToken && safeStorage.isEncryptionAvailable()) {
+    if (raw?.enterpriseAuth?.encryptedAccessToken && settingsEncryptionAvailable()) {
       raw.enterpriseAuth.accessToken = safeStorage.decryptString(Buffer.from(raw.enterpriseAuth.encryptedAccessToken, 'base64'))
       delete raw.enterpriseAuth.encryptedAccessToken
     }
     return raw
-  } catch {
+  } catch (err: any) {
+    if (err?.code === 'ENOENT') {
+      settingsLoadIssue = null
+      return {}
+    }
+    const backupPath = `${SETTINGS_PATH}.corrupt-${Date.now()}`
+    try {
+      if (existsSync(SETTINGS_PATH)) renameSync(SETTINGS_PATH, backupPath)
+      settingsLoadIssue = `Settings could not be read and were preserved at ${backupPath}.`
+    } catch (renameErr: any) {
+      settingsLoadIssue = `Settings could not be read. ${renameErr?.message ?? String(renameErr)}`
+    }
     return {}
   }
+}
+
+function settingsEncryptionAvailable() {
+  try {
+    return safeStorage.isEncryptionAvailable()
+  } catch {
+    return false
+  }
+}
+
+function settingsWarnings(s: AppSettings) {
+  const warnings: string[] = []
+  if (settingsLoadIssue) warnings.push(settingsLoadIssue)
+  if (!settingsEncryptionAvailable()) {
+    warnings.push('System keychain encryption is unavailable. Provider API keys and Entra tokens saved on this machine will be stored in the app settings file.')
+  }
+  if ((s.provider as any)?.encryptedApiKey && !s.provider?.apiKey) {
+    warnings.push('An encrypted provider API key exists but cannot be decrypted on this machine. Re-enter the key before saving provider settings.')
+  }
+  if ((s.enterpriseAuth as any)?.encryptedAccessToken && !s.enterpriseAuth?.accessToken) {
+    warnings.push('The saved Entra token cannot be decrypted on this machine. Sign in again before using shared workspaces.')
+  }
+  return warnings
 }
 
 function saveSettings(s: AppSettings) {
   mkdirSync(app.getPath('userData'), { recursive: true })
   const out: any = { ...s }
-  if (out.provider?.apiKey && safeStorage.isEncryptionAvailable()) {
+  if (out.provider?.apiKey && settingsEncryptionAvailable()) {
     out.provider = {
       ...out.provider,
       encryptedApiKey: safeStorage.encryptString(out.provider.apiKey).toString('base64')
     }
     delete out.provider.apiKey
   }
-  if (out.enterpriseAuth?.accessToken && safeStorage.isEncryptionAvailable()) {
+  if (out.enterpriseAuth?.accessToken && settingsEncryptionAvailable()) {
     out.enterpriseAuth = {
       ...out.enterpriseAuth,
       encryptedAccessToken: safeStorage.encryptString(out.enterpriseAuth.accessToken).toString('base64')
     }
     delete out.enterpriseAuth.accessToken
   }
-  writeFileSync(SETTINGS_PATH, JSON.stringify(out, null, 2))
+  const tmpPath = `${SETTINGS_PATH}.${process.pid}.${Date.now()}.tmp`
+  writeFileSync(tmpPath, JSON.stringify(out, null, 2), { mode: 0o600 })
+  renameSync(tmpPath, SETTINGS_PATH)
+  settingsLoadIssue = null
 }
 
 function defaultEnterpriseConfig(): EnterpriseConfig {
@@ -142,14 +183,18 @@ function tokenIsUsable(auth?: EnterpriseAuth) {
 }
 
 function safeSettingsView(s: AppSettings) {
-  const view: AppSettings = {
-    ...s,
-    enterprise: effectiveEnterpriseConfig(s)
+  const view: AppSettings & { warnings: string[] } = {
+    enterprise: effectiveEnterpriseConfig(s),
+    warnings: settingsWarnings(s)
   }
-  if (s.provider?.apiKey) {
-    view.provider = { ...s.provider, apiKey: s.provider.apiKey.slice(0, 4) + '••••' + s.provider.apiKey.slice(-4) }
+  if (s.provider) {
+    view.provider = {
+      baseUrl: s.provider.baseUrl,
+      model: s.provider.model,
+      wireApi: s.provider.wireApi,
+      apiKey: s.provider.apiKey ? s.provider.apiKey.slice(0, 4) + '••••' + s.provider.apiKey.slice(-4) : ''
+    }
   }
-  delete view.enterpriseAuth
   return view
 }
 
@@ -232,6 +277,34 @@ function contentDispositionFileName(header: string | null) {
     try { return decodeURIComponent(utf8[1]) } catch {}
   }
   return /filename="([^"]+)"/i.exec(header)?.[1] ?? /filename=([^;]+)/i.exec(header)?.[1]?.trim() ?? null
+}
+
+function isInsidePath(root: string, candidate: string) {
+  const rel = relative(resolve(root), resolve(candidate))
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel))
+}
+
+function allowedLocalPathRoots() {
+  return [
+    WORKSPACE_ROOT,
+    app.getPath('downloads')
+  ]
+}
+
+function resolveAllowedLocalPath(filePath: string) {
+  const normalized = isAbsolute(filePath) ? resolve(filePath) : resolve(WORKSPACE_ROOT, filePath)
+  if (!allowedLocalPathRoots().some((root) => isInsidePath(root, normalized))) {
+    throw new Error('Path is outside the allowed zspark workspace/download directories')
+  }
+  return normalized
+}
+
+async function openExternalUrl(rawUrl: string) {
+  const url = new URL(rawUrl)
+  if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) {
+    throw new Error('Unsupported link protocol')
+  }
+  await shell.openExternal(url.toString())
 }
 
 function resolveCodexBinary(): string {
@@ -335,7 +408,7 @@ function formatCodexLogChunk(channel: 'stdout' | 'stderr', chunk: string): strin
  * even though the upstream feature flag is experimental and off by default.
  */
 function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<string, string> } {
-  const tomlString = (s: string) => `"${s.replace(/"/g, '\\"')}"`
+  const tomlString = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
   const baseArgs = [
     // Trust our own workspace so codex stops nagging about project-local
     // config every spawn. The path is whatever directory the binary
@@ -429,7 +502,7 @@ function createWindow() {
     }
   })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    shell.openExternal(url)
+    openExternalUrl(url).catch(() => {})
     return { action: 'deny' }
   })
   mainWindow.webContents.on('will-navigate', (event, url) => {
@@ -437,7 +510,7 @@ function createWindow() {
     if (!currentUrl || url === currentUrl) return
     event.preventDefault()
     if (/^https?:\/\//i.test(url) || /^mailto:/i.test(url)) {
-      shell.openExternal(url)
+      openExternalUrl(url).catch(() => {})
     }
   })
   if (process.env.ELECTRON_RENDERER_URL) {
@@ -486,7 +559,7 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => {
     codex?.kill()
     spawnCodex()
   }
-  return true
+  return { ok: true, warnings: settingsWarnings(next) }
 })
 
 ipcMain.handle('enterprise:status', () => enterpriseStatus())
@@ -522,7 +595,7 @@ ipcMain.handle('enterprise:login', async () => {
           message: response.message
         })
         if (response.verificationUri) {
-          shell.openExternal(response.verificationUri)
+          openExternalUrl(response.verificationUri).catch(() => {})
         }
       }
     })
@@ -603,16 +676,18 @@ ipcMain.handle('enterprise:artifacts', (_e, workspaceId: string, sessionId: stri
 
 ipcMain.handle('enterprise:uploadArtifact', (_e, workspaceId: string, sessionId: string, filePath: string, meta: any = {}) => {
   try {
-    if (!filePath || !existsSync(filePath)) return { ok: false, error: 'File does not exist' }
-    const stat = statSync(filePath)
+    if (!filePath) return { ok: false, error: 'Missing file path' }
+    const safePath = resolveAllowedLocalPath(filePath)
+    if (!existsSync(safePath)) return { ok: false, error: 'File does not exist' }
+    const stat = statSync(safePath)
     if (!stat.isFile()) return { ok: false, error: 'Path is not a file' }
-    const content = readFileSync(filePath)
+    const content = readFileSync(safePath)
     return enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts`, {
       method: 'POST',
       body: JSON.stringify({
-        name: meta.name || basename(filePath),
-        mimeType: meta.mimeType || artifactMimeType(filePath),
-        localPath: filePath,
+        name: meta.name || basename(safePath),
+        mimeType: meta.mimeType || artifactMimeType(safePath),
+        localPath: safePath,
         turnId: meta.turnId,
         contentBase64: content.toString('base64')
       })
@@ -638,7 +713,8 @@ ipcMain.handle('enterprise:downloadArtifact', async (_e, workspaceId: string, se
       ? await dialog.showSaveDialog(mainWindow, { defaultPath: join(app.getPath('downloads'), basename(defaultName)) })
       : await dialog.showSaveDialog({ defaultPath: join(app.getPath('downloads'), basename(defaultName)) })
     if (save.canceled || !save.filePath) return { ok: false, canceled: true }
-    writeFileSync(save.filePath, Buffer.from(await response.arrayBuffer()))
+    if (!response.body) return { ok: false, error: 'Download response did not include a body' }
+    await pipeline(Readable.fromWeb(response.body as any), createWriteStream(save.filePath))
     return { ok: true, path: save.filePath }
   } catch (err: any) {
     return { ok: false, error: err?.message ?? String(err) }
@@ -684,26 +760,41 @@ ipcMain.handle('runtime:get', () => {
 ipcMain.handle('skills:localAvailability', () => discoverLocalSkills(WORKSPACE_ROOT))
 
 ipcMain.handle('path:open', async (_e, filePath: string) => {
-  if (!filePath) return { ok: false, error: 'Missing file path' }
-  const error = await shell.openPath(filePath)
-  return error ? { ok: false, error } : { ok: true }
+  try {
+    if (!filePath) return { ok: false, error: 'Missing file path' }
+    const safePath = resolveAllowedLocalPath(filePath)
+    const error = await shell.openPath(safePath)
+    return error ? { ok: false, error } : { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
 })
 
 ipcMain.handle('path:reveal', (_e, filePath: string) => {
-  if (!filePath) return { ok: false, error: 'Missing file path' }
-  shell.showItemInFolder(filePath)
-  return { ok: true }
+  try {
+    if (!filePath) return { ok: false, error: 'Missing file path' }
+    shell.showItemInFolder(resolveAllowedLocalPath(filePath))
+    return { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
 })
 
 ipcMain.handle('path:download', async (_e, filePath: string) => {
-  if (!filePath) return { ok: false, error: 'Missing file path' }
-  if (!existsSync(filePath)) return { ok: false, error: 'File does not exist' }
+  let safePath: string
+  try {
+    if (!filePath) return { ok: false, error: 'Missing file path' }
+    safePath = resolveAllowedLocalPath(filePath)
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
+  if (!existsSync(safePath)) return { ok: false, error: 'File does not exist' }
   const save = mainWindow
-    ? await dialog.showSaveDialog(mainWindow, { defaultPath: join(app.getPath('downloads'), basename(filePath)) })
-    : await dialog.showSaveDialog({ defaultPath: join(app.getPath('downloads'), basename(filePath)) })
+    ? await dialog.showSaveDialog(mainWindow, { defaultPath: join(app.getPath('downloads'), basename(safePath)) })
+    : await dialog.showSaveDialog({ defaultPath: join(app.getPath('downloads'), basename(safePath)) })
   if (save.canceled || !save.filePath) return { ok: false, canceled: true }
   try {
-    copyFileSync(filePath, save.filePath)
+    copyFileSync(safePath, save.filePath)
     return { ok: true, path: save.filePath }
   } catch (err: any) {
     return { ok: false, error: err?.message ?? String(err) }
@@ -713,7 +804,8 @@ ipcMain.handle('path:download', async (_e, filePath: string) => {
 ipcMain.handle('path:stat', (_e, filePath: string) => {
   if (!filePath) return { exists: false, error: 'Missing file path' }
   try {
-    const stat = statSync(filePath)
+    const safePath = resolveAllowedLocalPath(filePath)
+    const stat = statSync(safePath)
     return {
       exists: true,
       isFile: stat.isFile(),
@@ -722,17 +814,13 @@ ipcMain.handle('path:stat', (_e, filePath: string) => {
       mtimeMs: stat.mtimeMs
     }
   } catch {
-    return { exists: false }
+    return { exists: false, error: 'File is unavailable or outside the allowed zspark directories' }
   }
 })
 
 ipcMain.handle('url:openExternal', async (_e, rawUrl: string) => {
   try {
-    const url = new URL(rawUrl)
-    if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) {
-      return { ok: false, error: 'Unsupported link protocol' }
-    }
-    await shell.openExternal(url.toString())
+    await openExternalUrl(rawUrl)
     return { ok: true }
   } catch (err: any) {
     return { ok: false, error: err?.message ?? String(err) }

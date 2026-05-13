@@ -1,10 +1,19 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { createReadStream, existsSync } from 'node:fs'
+import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
+import { z } from 'zod'
 import { pool } from './db.js'
 import { displayPrincipal } from './principal.js'
 import { canAccessWorkspace } from './workspaces.js'
 
 const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024
+const MAX_ARTIFACT_BODY_BYTES = 70 * 1024 * 1024
+
+interface ArtifactEnv {
+  ZSPARK_ARTIFACT_STORAGE_DIR?: string
+}
 
 interface ArtifactParams {
   workspaceId: string
@@ -12,16 +21,32 @@ interface ArtifactParams {
   artifactId?: string
 }
 
-interface UploadArtifactBody {
-  name?: string
-  mimeType?: string
-  localPath?: string
-  turnId?: string
-  contentBase64?: string
-}
+const UploadArtifactBody = z.object({
+  name: z.string().max(180).optional(),
+  mimeType: z.string().max(200).optional(),
+  localPath: z.string().max(1000).optional(),
+  turnId: z.string().max(120).optional(),
+  contentBase64: z.string().min(1)
+})
 
 function safeFileName(name: string) {
   return name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 180) || 'artifact'
+}
+
+function storageRoot(env: ArtifactEnv) {
+  return resolve(env.ZSPARK_ARTIFACT_STORAGE_DIR || join(process.cwd(), 'data', 'artifacts'))
+}
+
+function isInsidePath(root: string, candidate: string) {
+  const rel = relative(resolve(root), resolve(candidate))
+  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel))
+}
+
+async function writeArtifactFile(root: string, id: string, content: Buffer) {
+  const filePath = join(root, id.slice(0, 2), id)
+  await mkdir(dirname(filePath), { recursive: true })
+  await writeFile(filePath, content, { mode: 0o600 })
+  return filePath
 }
 
 function artifactMetadata(row: any) {
@@ -52,7 +77,9 @@ async function ensureArtifactAccess(req: FastifyRequest, workspaceId: string, se
   return (await canAccessWorkspace(req, workspaceId)) && (await sessionBelongsToWorkspace(sessionId, workspaceId))
 }
 
-export async function registerArtifactRoutes(app: FastifyInstance) {
+export async function registerArtifactRoutes(app: FastifyInstance, env: ArtifactEnv = {}) {
+  const root = storageRoot(env)
+
   app.get('/workspaces/:workspaceId/sessions/:sessionId/artifacts', async (req, reply) => {
     if (!pool) return reply.code(503).send({ error: 'database unavailable' })
     const { workspaceId, sessionId } = req.params as ArtifactParams
@@ -72,17 +99,16 @@ export async function registerArtifactRoutes(app: FastifyInstance) {
     return { artifacts: result.rows.map(artifactMetadata) }
   })
 
-  app.post('/workspaces/:workspaceId/sessions/:sessionId/artifacts', async (req, reply) => {
+  app.post('/workspaces/:workspaceId/sessions/:sessionId/artifacts', { bodyLimit: MAX_ARTIFACT_BODY_BYTES }, async (req, reply) => {
     if (!pool) return reply.code(503).send({ error: 'database unavailable' })
     const { workspaceId, sessionId } = req.params as ArtifactParams
     if (!(await ensureArtifactAccess(req, workspaceId, sessionId))) {
       return reply.code(403).send({ error: 'workspace forbidden' })
     }
 
-    const body = (req.body ?? {}) as UploadArtifactBody
-    if (!body.contentBase64 || typeof body.contentBase64 !== 'string') {
-      return reply.code(400).send({ error: 'contentBase64 is required' })
-    }
+    const parsed = UploadArtifactBody.safeParse(req.body ?? {})
+    if (!parsed.success) return reply.code(400).send({ error: 'invalid artifact payload', detail: parsed.error.flatten() })
+    const body = parsed.data
 
     let content: Buffer
     try {
@@ -98,13 +124,14 @@ export async function registerArtifactRoutes(app: FastifyInstance) {
     const id = randomUUID()
     const name = safeFileName(body.name?.trim() || 'artifact')
     const sha256 = createHash('sha256').update(content).digest('hex')
+    const storagePath = await writeArtifactFile(root, id, content)
     const result = await pool.query(
       `
         INSERT INTO artifacts (
           id, workspace_id, session_id, created_by, name, mime_type,
-          size_bytes, sha256, local_path, turn_id, content
+          size_bytes, sha256, local_path, turn_id, storage_path, content
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)
         RETURNING id, workspace_id, session_id, name, mime_type, size_bytes, sha256, local_path, turn_id, created_at
       `,
       [
@@ -116,9 +143,9 @@ export async function registerArtifactRoutes(app: FastifyInstance) {
         body.mimeType?.trim() || null,
         content.length,
         sha256,
-        body.localPath?.slice(0, 1000) || null,
-        body.turnId?.slice(0, 120) || null,
-        content
+        body.localPath || null,
+        body.turnId || null,
+        storagePath
       ]
     )
     await pool.query('UPDATE sessions SET updated_at = now() WHERE id = $1 AND workspace_id = $2', [sessionId, workspaceId])
@@ -134,7 +161,7 @@ export async function registerArtifactRoutes(app: FastifyInstance) {
     }
     const result = await pool.query(
       `
-        SELECT name, mime_type, content
+        SELECT name, mime_type, content, storage_path
         FROM artifacts
         WHERE id = $1 AND workspace_id = $2 AND session_id = $3
         LIMIT 1
@@ -144,9 +171,16 @@ export async function registerArtifactRoutes(app: FastifyInstance) {
     if (!result.rowCount) return reply.code(404).send({ error: 'artifact not found' })
     const row = result.rows[0]
     const fileName = safeFileName(row.name)
-    return reply
+    const response = reply
       .header('content-type', row.mime_type || 'application/octet-stream')
       .header('content-disposition', `attachment; filename="${fileName}"`)
-      .send(row.content)
+    if (row.storage_path) {
+      const filePath = resolve(row.storage_path)
+      if (!isInsidePath(root, filePath)) return reply.code(500).send({ error: 'artifact storage path is invalid' })
+      if (!existsSync(filePath)) return reply.code(404).send({ error: 'artifact file is missing' })
+      return response.send(createReadStream(filePath))
+    }
+    if (row.content) return response.send(row.content)
+    return reply.code(404).send({ error: 'artifact content is missing' })
   })
 }

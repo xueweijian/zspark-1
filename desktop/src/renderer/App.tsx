@@ -48,7 +48,7 @@ declare global {
       openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>
       scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => Promise<ArtifactScanResult>
       getSettings: () => Promise<AppSettingsView>
-      saveSettings: (s: any) => Promise<boolean>
+      saveSettings: (s: any) => Promise<{ ok: boolean; warnings?: string[] }>
       enterpriseStatus: () => Promise<EnterpriseStatus>
       enterpriseLogin: () => Promise<{ ok: boolean; status?: EnterpriseStatus; error?: string }>
       enterpriseLogout: () => Promise<EnterpriseStatus>
@@ -91,6 +91,7 @@ const IGNORED_RPC_ERRORS = new Set(['Not initialized', 'Already initialized'])
 const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
 const USER_APPROVAL_REVIEWER = 'user'
 const ZSPARK_APPROVAL_POLICY = 'on-request'
+const MAX_STDOUT_BUFFER_CHARS = 2_000_000
 
 function errorMessage(error: any) {
   return error?.message ? String(error.message) : String(error)
@@ -106,9 +107,14 @@ function shouldAutoToastRpcError(message?: string) {
 
 let nextId = 1
 const newId = () => nextId++
-interface Pending { resolve: (msg: any) => void; reject: (err: any) => void }
-const pending = new Map<number, Pending>()
 type JsonRpcId = number | string
+interface Pending { resolve: (msg: any) => void; reject: (err: any) => void }
+const pending = new Map<JsonRpcId, Pending>()
+
+function rejectPendingRequests(message: string) {
+  for (const entry of pending.values()) entry.reject(new Error(message))
+  pending.clear()
+}
 
 function send(method: string, params: any = {}) {
   return new Promise<any>((resolve, reject) => {
@@ -300,6 +306,7 @@ interface ArtifactScanResult {
 interface AppSettingsView {
   provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
   enterprise?: EnterpriseConfig
+  warnings?: string[]
 }
 
 interface EnterpriseConfig {
@@ -434,6 +441,16 @@ function fmtDuration(ms: number) {
   if (s < 60) return `${s}s`
   const m = Math.floor(s / 60)
   return `${m}m ${s % 60}s`
+}
+
+function ActivityDuration({ startedAt, endedAt }: { startedAt: number; endedAt?: number }) {
+  const [now, setNow] = useState(Date.now())
+  useEffect(() => {
+    if (endedAt) return
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [endedAt])
+  return <>{fmtDuration((endedAt ?? now) - startedAt)}</>
 }
 
 function fmtBytes(bytes: number) {
@@ -601,19 +618,33 @@ function turnIdFromParams(params: any) {
 
 marked.setOptions({ gfm: true, breaks: true })
 
+function secureMarkdownLinks(html: string) {
+  return html.replace(/<a\s+([^>]*?)>/gi, (_match, attrs) => {
+    let nextAttrs = String(attrs)
+    if (!/\btarget=/i.test(nextAttrs)) nextAttrs += ' target="_blank"'
+    if (!/\brel=/i.test(nextAttrs)) nextAttrs += ' rel="noopener noreferrer"'
+    return `<a ${nextAttrs}>`
+  })
+}
+
 function Markdown({ text }: { text: string }) {
   const html = useMemo(() => {
     const normalized = normalizeMarkdownForDisplay(text || '')
-    return DOMPurify.sanitize(marked.parse(normalized, { async: false }) as string)
+    const sanitized = DOMPurify.sanitize(marked.parse(normalized, { async: false }) as string, {
+      ADD_ATTR: ['target', 'rel'],
+      ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
+    })
+    return secureMarkdownLinks(sanitized)
   }, [text])
   const onClick = (event: React.MouseEvent<HTMLDivElement>) => {
     const link = (event.target as Element | null)?.closest?.('a[href]')
     const href = link?.getAttribute('href') ?? ''
-    if (!/^(https?:|mailto:)/i.test(href)) return
+    if (!link) return
     event.preventDefault()
+    if (!/^(https?:|mailto:)/i.test(href)) return
     void window.zspark.openExternalUrl(href)
   }
-  return <div className="md" onClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />
+  return <div className="md" onClick={onClick} onAuxClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />
 }
 
 function artifactDownloadLabel(path: string) {
@@ -1224,17 +1255,21 @@ function loadPersistedActivityBlocks(threadId: string): Extract<Block, { type: '
   }
 }
 
-function savePersistedActivityBlocks(threadId: string, blocks: Block[]) {
+function serializePersistedActivityBlocks(blocks: Block[]) {
   const turnBlocks = blocks.filter((block): block is Extract<Block, { type: 'turn' }> => block.type === 'turn')
-  if (!turnBlocks.length) return
+  if (!turnBlocks.length) return null
+  const normalized = turnBlocks.slice(-80).map((block) => ({
+    ...block,
+    activities: block.activities
+      .map(normalizeActivity)
+      .filter((activity: Activity | null): activity is Activity => Boolean(activity))
+  }))
+  return JSON.stringify(normalized)
+}
+
+function savePersistedActivityBlocks(threadId: string, serialized: string) {
   try {
-    const normalized = turnBlocks.slice(-80).map((block) => ({
-      ...block,
-      activities: block.activities
-        .map(normalizeActivity)
-        .filter((activity: Activity | null): activity is Activity => Boolean(activity))
-    }))
-    window.localStorage.setItem(activityStorageKey(threadId), JSON.stringify(normalized))
+    window.localStorage.setItem(activityStorageKey(threadId), serialized)
   } catch {
     // Best-effort UI continuity; chat correctness must not depend on storage.
   }
@@ -1593,15 +1628,18 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
     authority: ''
   })
   const [saving, setSaving] = useState(false)
+  const [warnings, setWarnings] = useState<string[]>([])
   useEffect(() => {
     window.zspark.getSettings().then((s) => {
       if (s.provider) setForm((p) => ({ ...p, ...s.provider }))
       if (s.enterprise) setEnterprise((p) => ({ ...p, ...s.enterprise }))
+      setWarnings(s.warnings ?? [])
     })
   }, [])
   const save = async () => {
     setSaving(true)
-    await window.zspark.saveSettings({ provider: form, enterprise })
+    const result = await window.zspark.saveSettings({ provider: form, enterprise })
+    setWarnings(result.warnings ?? [])
     setSaving(false); onClose()
   }
   return (
@@ -1625,6 +1663,11 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
               <option value="chat">Chat Completions (via local bridge)</option>
             </select>
           </label>
+          {warnings.length > 0 && (
+            <div className="settings-warning" role="alert">
+              {warnings.map((warning) => <div key={warning}>{warning}</div>)}
+            </div>
+          )}
         </div>
         <div className="settings-group">
           <div>
@@ -1685,7 +1728,6 @@ function DesktopApp() {
   const [streaming, setStreaming] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [messageActionBusy, setMessageActionBusy] = useState(false)
-  const [clock, setClock] = useState(Date.now())
   const [showJumpToLatest, setShowJumpToLatest] = useState(false)
   const [showSettings, setShowSettings] = useState(false)
   const [panel, setPanel] = useState<Panel>(null)
@@ -1735,7 +1777,9 @@ function DesktopApp() {
   const activeSharedWorkspaceRef = useRef<string | null>(null)
   const activeSharedSessionRef = useRef<string | null>(null)
   const lastLocalThreadRef = useRef<string | null>(null)
+  const lastPersistedActivityKey = useRef('')
   const sharedSyncTimer = useRef<number | null>(null)
+  const lastSharedSnapshotKey = useRef('')
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
   const submitInFlight = useRef(false)
@@ -2564,7 +2608,6 @@ function DesktopApp() {
           submitInFlight.current = false
           setSubmitting(false)
           setStreaming(true)
-          setClock(Date.now())
           stickToBottom.current = true
           setShowJumpToLatest(false)
           const turnId = turnIdFromParams(params)
@@ -2900,6 +2943,9 @@ function DesktopApp() {
 
     const offStdout = window.zspark.onStdout((chunk) => {
       buf.current += chunk
+      if (buf.current.length > MAX_STDOUT_BUFFER_CHARS) {
+        buf.current = buf.current.slice(-MAX_STDOUT_BUFFER_CHARS)
+      }
       let nl: number
       while ((nl = buf.current.indexOf('\n')) !== -1) {
         const line = buf.current.slice(0, nl).trim()
@@ -2909,7 +2955,7 @@ function DesktopApp() {
           const msg = JSON.parse(line)
           if (msg.method && msg.id !== undefined) {
             handleServerRequest(msg.id, msg.method, msg.params)
-          } else if (typeof msg.id === 'number' && pending.has(msg.id)) {
+          } else if (msg.id !== undefined && pending.has(msg.id)) {
             pending.get(msg.id)!.resolve(msg)
             pending.delete(msg.id)
             if (msg.error && shouldAutoToastRpcError(msg.error.message)) toast('error', msg.error.message)
@@ -2930,6 +2976,7 @@ function DesktopApp() {
     })
     const offStderr = window.zspark.onStderr(() => {})
     const offExit = window.zspark.onExit(() => {
+      rejectPendingRequests('Codex process exited before replying')
       submitInFlight.current = false
       setSubmitting(false)
       setReady(false)
@@ -2983,7 +3030,12 @@ function DesktopApp() {
   }, [thread])
   useEffect(() => {
     if (!thread) return
-    savePersistedActivityBlocks(thread, blocks)
+    const serialized = serializePersistedActivityBlocks(blocks)
+    if (!serialized) return
+    const key = `${thread}:${serialized}`
+    if (key === lastPersistedActivityKey.current) return
+    savePersistedActivityBlocks(thread, serialized)
+    lastPersistedActivityKey.current = key
   }, [blocks, thread])
   useEffect(() => {
     if (!activeSharedWorkspace || !activeSharedSession || !blocks.length) return
@@ -2991,12 +3043,16 @@ function DesktopApp() {
     sharedSyncTimer.current = window.setTimeout(() => {
       const title = titleFromBlocks(blocks)
       const localThreadId = threadRef.current
+      const snapshot = { version: 1, blocks, localThreadId, title, updatedAt: Date.now() }
+      const snapshotKey = JSON.stringify({ activeSharedWorkspace, activeSharedSession, localThreadId, title, blocks })
+      if (snapshotKey === lastSharedSnapshotKey.current) return
       void window.zspark.enterpriseUpdateSession(activeSharedWorkspace, activeSharedSession, {
         title,
         localThreadId,
-        snapshot: { version: 1, blocks, localThreadId, title, updatedAt: Date.now() }
+        snapshot
       }).then((result) => {
         if (!result.ok) return
+        lastSharedSnapshotKey.current = snapshotKey
         setSharedSessions((prev) => prev.map((session) => (
           session.id === activeSharedSession
             ? { ...session, ...(result.session ?? {}), title, local_thread_id: localThreadId }
@@ -3013,11 +3069,6 @@ function DesktopApp() {
       if (block.type === 'agent') void reconcileAgentArtifactClaims(block)
     }
   }, [blocks, runtime.cwd, runtime.workspaceRoot])
-  useEffect(() => {
-    if (!streaming) return
-    const timer = window.setInterval(() => setClock(Date.now()), 1000)
-    return () => window.clearInterval(timer)
-  }, [streaming])
   useEffect(() => {
     const ta = taRef.current; if (!ta) return
     ta.style.height = 'auto'; ta.style.height = Math.min(ta.scrollHeight, 200) + 'px'
@@ -3906,7 +3957,6 @@ function DesktopApp() {
                   />
                 )
               }
-              const dur = (b.endedAt ?? clock) - b.startedAt
               const running = !b.endedAt
               const failed = b.activities.some((a) => a.status === 'failed')
               const meaningful = b.activities.filter((a) => !(a.kind === 'reasoning' && a.id.startsWith('thinking-') && !a.detail))
@@ -3925,7 +3975,7 @@ function DesktopApp() {
                       <div className="head-copy">
                         <div className="head-line">
                           <span className="head-title">{running ? 'Working' : failed ? 'Needs attention' : 'Completed'}</span>
-                          <span className="head-meta">Activity log · {fmtDuration(dur)} · {stepsLabel}</span>
+                          <span className="head-meta">Activity log · <ActivityDuration startedAt={b.startedAt} endedAt={b.endedAt} /> · {stepsLabel}</span>
                         </div>
                       </div>
                     </div>

@@ -23,6 +23,8 @@
 import { createServer, IncomingMessage, ServerResponse } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import { request as httpRequest } from 'node:http'
+import type { ClientRequest, IncomingMessage as ClientResponse } from 'node:http'
+import { StringDecoder } from 'node:string_decoder'
 import { URL } from 'node:url'
 
 interface UpstreamConfig {
@@ -32,6 +34,8 @@ interface UpstreamConfig {
 
 let upstream: UpstreamConfig | null = null
 export function setUpstream(cfg: UpstreamConfig | null) { upstream = cfg }
+
+const UPSTREAM_TIMEOUT_MS = 120_000
 
 function isAuthorized(req: IncomingMessage, authToken?: string): boolean {
   if (!authToken) return true
@@ -47,9 +51,27 @@ function readBody(req: IncomingMessage): Promise<Buffer> {
   })
 }
 
+function responseWritable(res: ServerResponse) {
+  return !res.destroyed && !res.writableEnded
+}
+
+function writeIfOpen(res: ServerResponse, chunk: string | Buffer) {
+  if (!responseWritable(res)) return false
+  return res.write(chunk)
+}
+
+function endIfOpen(res: ServerResponse, chunk?: string | Buffer) {
+  if (!responseWritable(res)) return
+  res.end(chunk)
+}
+
 function sseWrite(res: ServerResponse, event: string, data: any) {
-  res.write(`event: ${event}\n`)
-  res.write(`data: ${JSON.stringify(data)}\n\n`)
+  return writeIfOpen(res, `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
+}
+
+function sseDone(res: ServerResponse) {
+  writeIfOpen(res, 'data: [DONE]\n\n')
+  endIfOpen(res)
 }
 
 const CHAT_COMPLETIONS_SUFFIX = '/chat/completions'
@@ -153,6 +175,7 @@ function chatErrorMessage(statusCode: number | undefined, body: Buffer): string 
 }
 
 function writeResponseFailed(res: ServerResponse, ctx: ResponseContext, message: string) {
+  if (!responseWritable(res)) return
   if (!res.headersSent) {
     res.writeHead(200, responseHeaders(true))
   }
@@ -167,12 +190,13 @@ function writeResponseFailed(res: ServerResponse, ctx: ResponseContext, message:
       error: { type: 'server_error', code: 'upstream_error', message }
     }
   })
-  res.end()
+  endIfOpen(res)
 }
 
 function writeJsonError(res: ServerResponse, statusCode: number, message: string) {
+  if (!responseWritable(res)) return
   res.writeHead(statusCode, responseHeaders(false))
-  res.end(JSON.stringify({ error: { message } }))
+  endIfOpen(res, JSON.stringify({ error: { message } }))
 }
 
 function chatMessageResult(json: any): { text: string; toolCalls: FunctionCallState[]; reasoning: string } {
@@ -293,14 +317,14 @@ function emitChatJsonAsResponsesSse(res: ServerResponse, ctx: ResponseContext, j
       usage: responsesUsageFromChat(json.usage)
     }
   })
-  res.write('data: [DONE]\n\n')
-  res.end()
+  sseDone(res)
 }
 
 function writeChatJsonAsResponsesJson(res: ServerResponse, ctx: ResponseContext, json: any) {
   const result = chatMessageResult(json)
+  if (!responseWritable(res)) return
   res.writeHead(200, responseHeaders(false))
-  res.end(JSON.stringify({
+  endIfOpen(res, JSON.stringify({
     id: ctx.responseId,
     object: 'response',
     created_at: ctx.createdAt,
@@ -385,7 +409,8 @@ function genId(prefix: string) { return `${prefix}_${Math.random().toString(16).
 
 async function handleResponses(req: IncomingMessage, res: ServerResponse, authToken?: string) {
   if (!isAuthorized(req, authToken)) { writeJsonError(res, 401, 'unauthorized'); return }
-  if (!upstream) { res.writeHead(503).end('upstream not configured'); return }
+  const cfg = upstream
+  if (!cfg) { res.writeHead(503).end('upstream not configured'); return }
   const body = await readBody(req)
   let payload: any
   try { payload = JSON.parse(body.toString('utf8')) } catch { res.writeHead(400).end('bad json'); return }
@@ -409,7 +434,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
   // Strip undefined to avoid choking strict providers
   for (const k of Object.keys(chatBody)) if (chatBody[k] === undefined) delete chatBody[k]
 
-  const u = buildUpstreamUrl(upstream.baseUrl, CHAT_COMPLETIONS_SUFFIX)
+  const u = buildUpstreamUrl(cfg.baseUrl, CHAT_COMPLETIONS_SUFFIX)
   const reqLib = requestLibForUrl(u)
   const responseId = genId('resp')
   const itemId = genId('msg')
@@ -430,17 +455,31 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
     })
   }
 
-  const upstreamReq = reqLib({
+  let upstreamDone = false
+  let upstreamReq: ClientRequest | null = null
+  const abortUpstream = () => {
+    if (!upstreamDone) upstreamReq?.destroy(new Error('downstream closed'))
+  }
+  req.on('aborted', abortUpstream)
+  res.on('close', () => {
+    if (!upstreamDone && !res.writableEnded) abortUpstream()
+  })
+
+  upstreamReq = reqLib({
     hostname: u.hostname,
     port: u.port || (u.protocol === 'https:' ? 443 : 80),
     path: u.pathname + u.search,
     method: 'POST',
     headers: {
       'content-type': 'application/json',
-      authorization: `Bearer ${upstream.apiKey}`,
+      authorization: `Bearer ${cfg.apiKey}`,
       accept: stream ? 'text/event-stream' : 'application/json'
     }
   }, (upstreamRes) => {
+    const markDone = () => { upstreamDone = true }
+    upstreamRes.on('end', markDone)
+    upstreamRes.on('close', markDone)
+
     if (!stream) {
       const chunks: Buffer[] = []
       upstreamRes.on('data', (c) => chunks.push(c))
@@ -454,7 +493,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
         try {
           writeChatJsonAsResponsesJson(res, ctx, JSON.parse(raw.toString('utf8')))
         } catch (e) {
-          res.writeHead(502).end('upstream parse error')
+          if (responseWritable(res)) res.writeHead(502).end('upstream parse error')
         }
       })
       return
@@ -491,6 +530,19 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
     let toolCalls: Map<number, FunctionCallState> = new Map()
     let nextOutputIndex = 1 // 0 is the message item
     let completed = false
+    let usage: ReturnType<typeof responsesUsageFromChat> | undefined
+    const decoder = new StringDecoder('utf8')
+    let waitingForDrain = false
+
+    const pauseForBackpressure = () => {
+      if (waitingForDrain || !res.writableNeedDrain) return
+      waitingForDrain = true
+      upstreamRes.pause()
+      res.once('drain', () => {
+        waitingForDrain = false
+        upstreamRes.resume()
+      })
+    }
 
     const finalize = () => {
       if (completed) return
@@ -523,18 +575,20 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
         response: {
           id: responseId, object: 'response', created_at: createdAt, model: payload.model,
           status: 'completed',
-          output
+          output,
+          usage
         }
       })
-      res.write('data: [DONE]\n\n')
-      res.end()
+      sseDone(res)
     }
 
-    upstreamRes.on('data', (chunk: Buffer) => {
-      buf += chunk.toString('utf8')
+    const processSseText = (text: string) => {
+      if (completed) return
+      buf += text
       const frames = buf.split(/\r?\n\r?\n/)
       buf = frames.pop() ?? ''
       for (const frame of frames) {
+        if (completed) return
         const data = frame
           .split(/\r?\n/)
           .filter((l) => l.startsWith('data:'))
@@ -544,6 +598,8 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
         if (data === '[DONE]') { finalize(); return }
         let evt: any
         try { evt = JSON.parse(data) } catch { continue }
+        const chunkUsage = responsesUsageFromChat(evt.usage)
+        if (chunkUsage) usage = chunkUsage
         // Some providers (Azure-OpenAI) emit a `prompt_filter_results` only chunk
         if (!evt.choices || evt.choices.length === 0) continue
         const delta = evt.choices[0]?.delta ?? {}
@@ -598,14 +654,26 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
             }
           }
         }
-        // 4. finish_reason → finalize immediately
-        if (evt.choices[0]?.finish_reason) finalize()
       }
+      pauseForBackpressure()
+    }
+
+    upstreamRes.on('data', (chunk: Buffer) => {
+      processSseText(decoder.write(chunk))
     })
-    upstreamRes.on('end', () => { finalize() })
+    upstreamRes.on('end', () => {
+      const rest = decoder.end()
+      if (rest) processSseText(rest)
+      finalize()
+    })
     upstreamRes.on('error', () => { finalize() })
   })
+  upstreamReq.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    upstreamReq?.destroy(new Error('upstream timeout'))
+  })
   upstreamReq.on('error', (e) => {
+    upstreamDone = true
+    if (String(e.message).includes('downstream closed')) return
     if (stream) {
       writeResponseFailed(res, ctx, `upstream error: ${e.message}`)
     } else {
@@ -626,15 +694,24 @@ export function startBridge(authToken?: string): Promise<{ port: number; close: 
     if (req.method === 'GET' && req.url.startsWith('/v1/models')) {
       // Forward to upstream so codex can probe model availability
       if (!isAuthorized(req, authToken)) { writeJsonError(res, 401, 'unauthorized'); return }
-      if (!upstream) { res.writeHead(503).end(); return }
-      const u = buildUpstreamUrl(upstream.baseUrl, MODELS_SUFFIX)
+      const cfg = upstream
+      if (!cfg) { res.writeHead(503).end(); return }
+      const u = buildUpstreamUrl(cfg.baseUrl, MODELS_SUFFIX)
       const reqLib = requestLibForUrl(u)
       const fwd = reqLib({
         hostname: u.hostname, port: u.port || (u.protocol === 'https:' ? 443 : 80),
         path: u.pathname, method: 'GET',
-        headers: { authorization: `Bearer ${upstream.apiKey}` }
-      }, (r) => { res.writeHead(r.statusCode ?? 200, r.headers as any); r.pipe(res) })
-      fwd.on('error', () => res.writeHead(502).end())
+        headers: { authorization: `Bearer ${cfg.apiKey}` }
+      }, (r: ClientResponse) => { res.writeHead(r.statusCode ?? 200, r.headers as any); r.pipe(res) })
+      let forwardDone = false
+      res.on('close', () => {
+        if (!forwardDone && !res.writableEnded) fwd.destroy(new Error('downstream closed'))
+      })
+      fwd.setTimeout(UPSTREAM_TIMEOUT_MS, () => fwd.destroy(new Error('upstream timeout')))
+      fwd.on('close', () => { forwardDone = true })
+      fwd.on('error', () => {
+        if (responseWritable(res)) res.writeHead(502).end()
+      })
       fwd.end()
       return
     }

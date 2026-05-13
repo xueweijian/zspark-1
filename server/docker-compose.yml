@@ -13,12 +13,18 @@ services:
   server:
     build: .
     environment:
+      NODE_ENV: ${NODE_ENV:-production}
       DATABASE_URL: postgres://zspark:zspark@postgres:5432/zspark
       REDIS_URL: redis://redis:6379
       ZSPARK_TENANT_ID: ${ZSPARK_TENANT_ID:-}
       ZSPARK_CLIENT_ID: ${ZSPARK_CLIENT_ID:-}
       ZSPARK_AUTHORITY: ${ZSPARK_AUTHORITY:-}
+      ZSPARK_CORS_ORIGINS: ${ZSPARK_CORS_ORIGINS:-}
+      ZSPARK_ARTIFACT_STORAGE_DIR: ${ZSPARK_ARTIFACT_STORAGE_DIR:-/data/artifacts}
+      TEAMS_WEBHOOK_ALLOWED_HOSTS: ${TEAMS_WEBHOOK_ALLOWED_HOSTS:-}
     ports: ["8787:8787"]
+    volumes: ["artifactdata:/data/artifacts"]
     depends_on: [postgres, redis]
 volumes:
   pgdata: {}
+  artifactdata: {}

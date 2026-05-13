@@ -324,6 +324,7 @@ input,textarea,select{font:inherit}
 .modal-actions button:disabled{opacity:.5;cursor:not-allowed}
 .settings-group{display:flex;flex-direction:column;gap:10px;border:1px solid #eef2f7;border-radius:10px;padding:13px;background:#fbfcfd}
 .settings-group + .settings-group{margin-top:2px}
+.settings-warning{border:1px solid #fed7aa;border-radius:9px;background:#fff7ed;color:#9a3412;padding:9px 10px;font-size:12.5px;line-height:1.45;display:flex;flex-direction:column;gap:4px}
 
 /* Side drawer (Search/Skills/Plugins/Automations/History) */
 .drawer-bg{position:fixed;inset:0;background:rgba(9,9,11,.32);display:flex;justify-content:flex-end;z-index:55;animation:fadeIn .15s ease-out}

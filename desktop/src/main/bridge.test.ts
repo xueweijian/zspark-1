@@ -7,6 +7,7 @@ type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string
 
 interface CapturedRequest {
   path: string
+  authorization?: string
   body: any
 }
 
@@ -35,7 +36,7 @@ async function startUpstream(
     const rawBody = await readBody(req)
     const text = rawBody.toString('utf8')
     const body = text ? JSON.parse(text) : null
-    requests.push({ path: req.url ?? '', body })
+    requests.push({ path: req.url ?? '', authorization: req.headers.authorization, body })
     await handler(req, res, body)
   })
 
@@ -212,6 +213,69 @@ describe('chat responses bridge', () => {
       output_tokens_details: { reasoning_tokens: 0 },
       total_tokens: 19
     })
+  })
+
+  test('keeps streaming usage frames from chat providers', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write('data: {"choices":[{"delta":{"content":"hi"}}]}\n\n')
+      res.write('data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}\n\n')
+      res.write('data: [DONE]\n\n')
+      res.end()
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: true,
+      input: 'hi'
+    })
+
+    const completed = parseSseEvents(response.body).find((event) => event.type === 'response.completed')
+    expect(completed?.response.usage).toEqual({
+      input_tokens: 3,
+      input_tokens_details: { cached_tokens: 0 },
+      output_tokens: 4,
+      output_tokens_details: { reasoning_tokens: 0 },
+      total_tokens: 7
+    })
+  })
+
+  test('keeps in-flight requests on the upstream captured at request start', async () => {
+    let upstreamAReceived!: () => void
+    const upstreamARequest = new Promise<void>((resolve) => { upstreamAReceived = resolve })
+    const upstreamA = await startUpstream(async (_req, res) => {
+      upstreamAReceived()
+      await new Promise((resolve) => setTimeout(resolve, 20))
+      jsonResponse(res, 200, {
+        choices: [{ message: { role: 'assistant', content: 'from a' } }]
+      })
+    })
+    const upstreamB = await startUpstream((_req, res) => {
+      jsonResponse(res, 200, {
+        choices: [{ message: { role: 'assistant', content: 'from b' } }]
+      })
+    })
+    cleanup.push(upstreamA.close, upstreamB.close)
+    setUpstream({ baseUrl: `${upstreamA.baseUrl}/v1`, apiKey: 'key-a' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const responsePromise = postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: 'hi'
+    })
+    await upstreamARequest
+    setUpstream({ baseUrl: `${upstreamB.baseUrl}/v1`, apiKey: 'key-b' })
+    const response = await responsePromise
+
+    expect(response.status).toBe(200)
+    expect(responseText(response.body)).toBe('from a')
+    expect(upstreamA.requests).toHaveLength(1)
+    expect(upstreamA.requests[0]?.authorization).toBe('Bearer key-a')
+    expect(upstreamB.requests).toHaveLength(0)
   })
 
   test('sends only chat-compatible function tools upstream', async () => {

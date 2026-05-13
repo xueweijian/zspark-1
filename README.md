@@ -156,11 +156,14 @@ docker compose up -d --build
 curl http://127.0.0.1:8787/healthz
 ```
 
+`server/docker-compose.yml` defaults `NODE_ENV` to `production`, so shared workspace routes require valid Entra configuration by default. For local-only development without Entra ID, start the stack with `NODE_ENV=development` and send `X-Domain-User` from a trusted local client.
+
 The server starts:
 
 - Fastify API on port `8787`
 - Postgres for workspace/session/artifact persistence
 - Redis for collaboration support
+- A local artifact volume for generated files, configured by `ZSPARK_ARTIFACT_STORAGE_DIR`
 
 Desktop clients should point their enterprise/shared workspace settings at the server URL, for example:
 
@@ -184,7 +187,7 @@ ZSPARK_SERVER_URL=http://YOUR_SERVER_IP:8787
 
 For Azure China setup details, see [docs/entra-setup.md](docs/entra-setup.md).
 
-For local development without Entra ID, the server supports an `X-Domain-User` dev identity shim when Entra variables are not configured.
+For local development without Entra ID, the server supports an `X-Domain-User` dev identity shim only when `NODE_ENV=development` and Entra variables are not configured. Do not run that shim on an internet-facing server.
 
 ## Shared workspace behavior
 
