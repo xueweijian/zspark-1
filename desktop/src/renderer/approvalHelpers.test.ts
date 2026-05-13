@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { approvalDecision, approvalResponsePayload, approvalStatusLabel } from './approvalHelpers'
+import { approvalDecision, approvalResponsePayload, approvalStatusLabel, approvalTopline } from './approvalHelpers'
 import type { ApprovalRequest } from './appTypes'
 
 function request(partial: Partial<ApprovalRequest>): ApprovalRequest {
@@ -66,5 +66,20 @@ describe('approvalResponsePayload', () => {
 
   test('labels approve all distinctly', () => {
     expect(approvalStatusLabel('approvedAll')).toBe('Approved all')
+  })
+
+  test('uses session-scoped decisions for legacy approval methods', () => {
+    expect(approvalResponsePayload(request({
+      method: 'execCommandApproval'
+    }), 'approveAll')).toEqual({ decision: 'approved_for_session' })
+    expect(approvalResponsePayload(request({
+      kind: 'fileChange',
+      method: 'applyPatchApproval'
+    }), 'approveAll')).toEqual({ decision: 'approved_for_session' })
+  })
+
+  test('shows resolved approval cards as granted instead of still required', () => {
+    expect(approvalTopline('approvedAll')).toBe('Approval granted')
+    expect(approvalTopline('pending')).toBe('Approval required')
   })
 })

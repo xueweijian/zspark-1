@@ -33,7 +33,8 @@ import {
 import {
   approvalResponsePayload,
   approvalStatusForDecision,
-  approvalStatusLabel
+  approvalStatusLabel,
+  approvalTopline
 } from './approvalHelpers'
 import type {
   Activity,
@@ -525,12 +526,12 @@ function ApprovalCard({
       <div className="approval-mark"><IconShield /></div>
       <div className="approval-content">
         <div className="approval-topline">
-          <span>Approval required</span>
+          <span>{approvalTopline(request.status)}</span>
           <em>{approvalStatusLabel(request.status)}</em>
         </div>
         <div className="approval-title">{request.title}</div>
         {!compact && <div className="approval-desc">{request.description}</div>}
-        {compact && approvedAll && <div className="approval-desc">Future matching actions can continue without another prompt.</div>}
+        {compact && approvedAll && <div className="approval-desc">Future actions in this run can continue without another prompt.</div>}
         {!compact && (request.reason || request.cwd || request.detail || request.commandPreview || request.paths.length > 0) && (
           <div className="approval-meta">
             {request.reason && <div><strong>Reason</strong><span>{request.reason}</span></div>}
@@ -857,6 +858,7 @@ function DesktopApp() {
   // Map item id -> activity id
   const itemActivity = useRef<Map<string, string>>(new Map())
   const approvalRequests = useRef<Map<string, ApprovalRequest>>(new Map())
+  const autoApprovedTurns = useRef<Set<string>>(new Set())
   const seenTurnStarts = useRef<Set<string>>(new Set())
   const appliedReasoningCompletions = useRef<Set<string>>(new Set())
   const recentNotificationLines = useRef<Map<string, number>>(new Map())
@@ -1519,6 +1521,51 @@ function DesktopApp() {
       return upsertApprovalBlockByTurnOrder(bs, block)
     })
   }
+  const canAutoApproveRequest = (request: ApprovalRequest) => (
+    Boolean(request.turnId && autoApprovedTurns.current.has(request.turnId))
+  )
+  const autoApproveRequest = (request: ApprovalRequest) => {
+    approvalRequests.current.set(request.key, { ...request, status: 'approvedAll' })
+    setApprovalStatus(request.key, 'approvedAll')
+    if (request.turnId) {
+      upsertTurnBlock(request.turnId, `turn-${request.turnId}`, request.startedAt)
+      const activityId = ensureActivity(request.turnId, `approval-${request.key}`, {
+        kind: 'tool',
+        title: 'Auto-approved workspace step',
+        detail: request.title,
+        actionKind: 'tool'
+      })
+      updateActivity(request.turnId, activityId, {
+        status: 'done',
+        endedAt: Date.now(),
+        title: 'Auto-approved workspace step',
+        detail: request.title
+      })
+    }
+    void sendRpcResult(request.id, approvalResponsePayload(request, 'approveAll'))
+      .then((ok) => {
+        if (!ok) throw new Error('Codex process is not running')
+      })
+      .catch((err: any) => {
+        approvalRequests.current.delete(request.key)
+        if (request.turnId) {
+          updateActivity(request.turnId, `a-approval-${request.key}`, {
+            status: 'failed',
+            endedAt: Date.now(),
+            title: 'Auto-approval failed',
+            detail: err?.message ?? String(err)
+          })
+        }
+        upsertApprovalBlock({ ...request, status: 'pending' })
+        toast('error', err?.message ?? String(err))
+      })
+  }
+  const autoApprovePendingRequestsForTurn = (turnId: string, exceptKey: string) => {
+    for (const request of Array.from(approvalRequests.current.values())) {
+      if (request.key === exceptKey || request.turnId !== turnId || request.status !== 'pending') continue
+      autoApproveRequest(request)
+    }
+  }
   const resolveApprovalRequest = (requestId: JsonRpcId) => {
     const key = rpcKey(requestId)
     const request = approvalRequests.current.get(key)
@@ -1538,17 +1585,23 @@ function DesktopApp() {
       return
     }
     if (!request.turnId && currentTurn.current) request.turnId = currentTurn.current.turnId
+    if (canAutoApproveRequest(request)) {
+      autoApproveRequest(request)
+      return
+    }
     upsertApprovalBlock(request)
     scrollToLatest('smooth')
   }
   const respondApproval = async (request: ApprovalRequest, mode: ApprovalDecisionMode) => {
     if (request.status !== 'pending') return
     setApprovalStatus(request.key, 'sending')
+    if (mode === 'approveAll' && request.turnId) autoApprovedTurns.current.add(request.turnId)
     try {
       const ok = await sendRpcResult(request.id, approvalResponsePayload(request, mode))
       if (!ok) throw new Error('Codex process is not running')
       const status = approvalStatusForDecision(mode)
       setApprovalStatus(request.key, status)
+      if (mode === 'approveAll' && request.turnId) autoApprovePendingRequestsForTurn(request.turnId, request.key)
       if (request.turnId) {
         updateActivity(request.turnId, `a-approval-${request.key}`, {
           status: mode === 'deny' ? 'failed' : 'done',
@@ -1558,6 +1611,7 @@ function DesktopApp() {
         })
       }
     } catch (err: any) {
+      if (mode === 'approveAll' && request.turnId) autoApprovedTurns.current.delete(request.turnId)
       setApprovalStatus(request.key, 'pending')
       toast('error', err?.message ?? String(err))
     }
@@ -1574,6 +1628,7 @@ function DesktopApp() {
     clearTurnRecoveryTimers(turnId)
     completedWorkByTurn.current.delete(turnId)
     interruptingTurns.current.delete(turnId)
+    autoApprovedTurns.current.delete(turnId)
   }
 
   const releaseTurnLocally = (turnId: string, detail: string) => {

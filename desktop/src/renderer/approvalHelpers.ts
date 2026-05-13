@@ -11,6 +11,20 @@ export function approvalStatusLabel(status: ApprovalStatus) {
   }
 }
 
+export function approvalTopline(status: ApprovalStatus) {
+  switch (status) {
+    case 'pending':
+    case 'sending':
+      return 'Approval required'
+    case 'approved':
+    case 'approvedAll':
+    case 'resolved':
+      return 'Approval granted'
+    case 'denied':
+      return 'Approval denied'
+  }
+}
+
 function availableDecisionNames(params: any) {
   const decisions = Array.isArray(params?.availableDecisions) ? params.availableDecisions : []
   return decisions.flatMap((decision: any) => {
@@ -65,7 +79,8 @@ export function approvalStatusForDecision(mode: ApprovalDecisionMode): ApprovalS
 export function approvalResponsePayload(request: ApprovalRequest, mode: ApprovalDecisionMode) {
   const approved = mode !== 'deny'
   if (request.method === 'execCommandApproval' || request.method === 'applyPatchApproval') {
-    return { decision: approved ? 'approved' : 'denied' }
+    if (!approved) return { decision: 'denied' }
+    return { decision: mode === 'approveAll' ? 'approved_for_session' : 'approved' }
   }
   if (request.kind === 'permissions') {
     return approved
