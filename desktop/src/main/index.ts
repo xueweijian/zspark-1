@@ -2,7 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell, safeStorage } from 'electro
 import type { OpenDialogOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
-import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
+import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync, realpathSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
@@ -12,6 +12,13 @@ import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
 import { redactSensitiveLogLine } from './logRedaction'
+import { artifactMimeType, contentDispositionFileName } from './mime'
+import {
+  ensureShellOpenAllowed,
+  isInsidePath,
+  openExternalUrl,
+  resolveAllowedLocalPath as resolveAllowedLocalPathRaw
+} from './pathSafety'
 
 let mainWindow: BrowserWindow | null = null
 let codex: ChildProcessWithoutNullStreams | null = null
@@ -254,82 +261,8 @@ async function enterpriseFetchResponse(path: string, init: RequestInit = {}) {
   return { response }
 }
 
-function artifactMimeType(filePath: string) {
-  switch (extname(filePath).toLowerCase()) {
-    case '.pptx': return 'application/vnd.openxmlformats-officedocument.presentationml.presentation'
-    case '.ppt': return 'application/vnd.ms-powerpoint'
-    case '.docx': return 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
-    case '.doc': return 'application/msword'
-    case '.xlsx': return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-    case '.xls': return 'application/vnd.ms-excel'
-    case '.csv': return 'text/csv'
-    case '.pdf': return 'application/pdf'
-    case '.png': return 'image/png'
-    case '.jpg':
-    case '.jpeg': return 'image/jpeg'
-    case '.webp': return 'image/webp'
-    case '.zip': return 'application/zip'
-    default: return 'application/octet-stream'
-  }
-}
-
-function contentDispositionFileName(header: string | null) {
-  if (!header) return null
-  const utf8 = /filename\*=UTF-8''([^;]+)/i.exec(header)
-  if (utf8?.[1]) {
-    try { return decodeURIComponent(utf8[1]) } catch {}
-  }
-  return /filename="([^"]+)"/i.exec(header)?.[1] ?? /filename=([^;]+)/i.exec(header)?.[1]?.trim() ?? null
-}
-
-function isInsidePath(root: string, candidate: string) {
-  const rel = relative(resolve(root), resolve(candidate))
-  return rel === '' || (!!rel && !rel.startsWith('..') && !isAbsolute(rel))
-}
-
-function allowedLocalPathRoots() {
-  return [
-    WORKSPACE_ROOT,
-    app.getPath('downloads')
-  ]
-}
-
 function resolveAllowedLocalPath(filePath: string) {
-  const normalized = isAbsolute(filePath) ? resolve(filePath) : resolve(WORKSPACE_ROOT, filePath)
-  if (!allowedLocalPathRoots().some((root) => isInsidePath(root, normalized))) {
-    throw new Error('Path is outside the allowed zspark workspace/download directories')
-  }
-  return normalized
-}
-
-async function openExternalUrl(rawUrl: string) {
-  const url = new URL(rawUrl)
-  if (!['http:', 'https:', 'mailto:'].includes(url.protocol)) {
-    throw new Error('Unsupported link protocol')
-  }
-  await shell.openExternal(url.toString())
-}
-
-// Files explicitly allowed to be opened with the OS default handler from a
-// path:open IPC. Anything else (executables, scripts, .app bundles, …) is
-// blocked so a compromised renderer can't launch arbitrary binaries.
-const SHELL_OPEN_ALLOWED_EXTENSIONS = new Set([
-  '.txt', '.md', '.markdown', '.csv', '.json', '.log', '.html', '.htm', '.xml',
-  '.pdf',
-  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.avif', '.svg',
-  '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx',
-  '.mp3', '.wav', '.flac', '.mp4', '.mov', '.webm',
-  '.zip'
-])
-
-function ensureShellOpenAllowed(filePath: string) {
-  const ext = extname(filePath).toLowerCase()
-  if (!ext) {
-    throw new Error('Files without an extension cannot be opened from zspark')
-  }
-  if (!SHELL_OPEN_ALLOWED_EXTENSIONS.has(ext)) {
-    throw new Error(`Opening ${ext} files from zspark is not allowed`)
-  }
+  return resolveAllowedLocalPathRaw(WORKSPACE_ROOT, filePath)
 }
 
 function resolveCodexBinary(): string {
