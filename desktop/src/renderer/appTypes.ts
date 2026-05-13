@@ -273,6 +273,8 @@ export interface WorkspaceRuntimeInfo {
   nodeModulesPath: string
   pythonPath: string
   available: boolean
+  nodeAvailable: boolean
+  pythonAvailable: boolean
 }
 
 export interface RuntimeHostInfo {

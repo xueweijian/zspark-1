@@ -357,21 +357,27 @@ function workspaceRuntimeInfo() {
   const nodePathReal = realpathIfExists(nodePath)
   const nodeModulesPathReal = realpathIfExists(nodeModulesPath)
   const pythonPathReal = realpathIfExists(pythonPath)
-  const insideRoot = Boolean(
+  const nodeInsideRoot = Boolean(
     runtimeRootReal &&
     nodePathReal &&
     nodeModulesPathReal &&
-    pythonPathReal &&
     isInsidePath(runtimeRootReal, nodePathReal) &&
-    isInsidePath(runtimeRootReal, nodeModulesPathReal) &&
+    isInsidePath(runtimeRootReal, nodeModulesPathReal)
+  )
+  const pythonInsideRoot = Boolean(
+    runtimeRootReal &&
+    pythonPathReal &&
     isInsidePath(runtimeRootReal, pythonPathReal)
   )
-  const available = insideRoot && existsSync(nodePath) && existsSync(nodeModulesPath) && existsSync(pythonPath)
+  const nodeAvailable = nodeInsideRoot && existsSync(nodePath) && existsSync(nodeModulesPath)
+  const pythonAvailable = pythonInsideRoot && existsSync(pythonPath)
   return {
     nodePath: nodePathReal ?? nodePath,
     nodeModulesPath: nodeModulesPathReal ?? nodeModulesPath,
     pythonPath: pythonPathReal ?? pythonPath,
-    available
+    available: nodeAvailable,
+    nodeAvailable,
+    pythonAvailable
   }
 }
 
@@ -385,14 +391,17 @@ function realpathIfExists(path: string) {
 
 function workspaceRuntimeEnv(): Record<string, string> {
   const rt = workspaceRuntimeInfo()
-  if (!rt.available) return {}
-  return {
+  if (!rt.nodeAvailable) return {}
+  const env: Record<string, string> = {
     ZSPARK_CODEX_RUNTIME_NODE: rt.nodePath,
     ZSPARK_CODEX_RUNTIME_NODE_MODULES: rt.nodeModulesPath,
-    ZSPARK_CODEX_RUNTIME_PYTHON: rt.pythonPath,
     NODE_PATH: [rt.nodeModulesPath, process.env.NODE_PATH].filter(Boolean).join(delimiter),
     PATH: `${dirname(rt.nodePath)}${delimiter}${process.env.PATH ?? ''}`
   }
+  if (rt.pythonAvailable) {
+    env.ZSPARK_CODEX_RUNTIME_PYTHON = rt.pythonPath
+  }
+  return env
 }
 
 function rotateLogIfLarge(path: string) {

@@ -585,12 +585,15 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
     return /\b(presentation|presentations|pptx?|powerpoint|slides?)\b/i.test(text)
   })
   const presentationSkillDir = dirname(presentationSkill?.path)
+  const pythonRuntimeLine = rt.pythonAvailable
+    ? `- Python executable: ${rt.pythonPath}`
+    : `- Python executable: ${rt.pythonPath} (not found; use Node.js runtime unless a Python-only helper is required)`
   const lines = [
     'Zspark local runtime for the selected Office skill:',
     `- Node.js executable: ${rt.nodePath}`,
     `- Node.js packages: ${rt.nodeModulesPath}`,
-    `- Python executable: ${rt.pythonPath}`,
-    'Use these bundled dependencies for documents, spreadsheets, and presentations.',
+    pythonRuntimeLine,
+    'Use these bundled Node.js dependencies for presentations and other Node-based artifact helpers. Use Python only when the selected skill/helper requires it.',
     'Hard delivery contract: create an actual editable artifact file in the workspace. A prose specification is a failure unless a real command fails and you report that command error.',
     'Before using @oai/artifact-tool from an output work directory, run this preflight pattern:',
     `  mkdir -p "$WORKSPACE" && cd "$WORKSPACE" && ln -sfn "${rt.nodeModulesPath}" node_modules`,
@@ -2947,6 +2950,9 @@ function DesktopApp() {
   const runtimeCwd = runtime.cwd ?? runtime.workspaceRoot
   const runtimeProvider = runtime.provider?.model ?? runtime.model
   const runtimeProviderName = runtime.modelProvider ?? (runtime.provider ? 'zspark' : undefined)
+  const artifactRuntimeStatus = runtime.workspaceRuntime?.available
+    ? (runtime.workspaceRuntime.pythonAvailable ? 'runtime ready' : 'node ready, python missing')
+    : 'runtime missing'
   const streamingAgentId = currentTurn.current ? agentForTurn.current.get(currentTurn.current.turnId) : undefined
   const activeSharedWorkspaceName = sharedWorkspaces.find((workspace) => workspace.id === activeSharedWorkspace)?.name
   const activeSharedSessionTitle = sharedSessions.find((session) => session.id === activeSharedSession)?.title
@@ -3264,7 +3270,7 @@ function DesktopApp() {
           <div className="kv"><span className="k">Model</span><span className="v">{runtimeProvider ?? '—'}</span></div>
           <div className="kv"><span className="k">Provider</span><span className="v">{runtimeProviderName ?? '—'}</span></div>
           <div className="kv"><span className="k">Wire API</span><span className="v">{runtime.provider?.wireApi ?? 'responses'}</span></div>
-          <div className="kv"><span className="k">Artifacts</span><span className="v">{runtime.workspaceRuntime?.available ? 'runtime ready' : 'runtime missing'}</span></div>
+          <div className="kv"><span className="k">Artifacts</span><span className="v">{artifactRuntimeStatus}</span></div>
           <div className="kv"><span className="k">Sandbox</span><span className="v">{formatSandboxPolicy(runtime.sandbox, runtime.permissionProfile)}</span></div>
           <div className="kv"><span className="k">Approval</span><span className="v">{formatApprovalPolicy(runtime.approvalPolicy)}</span></div>
           {runtime.activePermissionProfile?.id && <div className="kv"><span className="k">Profile</span><span className="v">{runtime.activePermissionProfile.id}</span></div>}
