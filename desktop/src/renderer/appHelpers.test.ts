@@ -82,4 +82,25 @@ describe('blocksFromSharedSnapshot', () => {
     expect(out).toHaveLength(1)
     expect(out[0].type).toBe('user')
   })
+  test('drops malformed known block types before rendering', () => {
+    const out = blocksFromSharedSnapshot({
+      blocks: [
+        { type: 'files', id: 'bad', turnId: 't1', title: 'files' },
+        { type: 'turn', id: 'bad-turn', turnId: 't1' },
+        { type: 'agent', id: 'ok', text: 'done' }
+      ] as any
+    })
+    expect(out).toEqual([{ type: 'agent', id: 'ok', text: 'done', turnId: undefined, memoryCitation: null }])
+  })
+  test('normalizes nested file and activity arrays', () => {
+    const out = blocksFromSharedSnapshot({
+      blocks: [
+        { type: 'files', id: 'f', turnId: 't1', title: 'files', files: [{ id: 'x', name: 'a.txt', path: '/tmp/a.txt', source: 'bad', status: 'bad', updatedAt: 1 }] },
+        { type: 'turn', id: 'turn', turnId: 't1', collapsed: false, startedAt: 1, activities: [{ id: 'a', kind: 'command', title: 'Ran', status: 'running', startedAt: 1 }, { id: 2, title: 'bad' }] }
+      ] as any
+    })
+    expect(out).toHaveLength(2)
+    expect(out[0]).toMatchObject({ type: 'files', files: [{ source: 'change', status: 'missing' }] })
+    expect(out[1]).toMatchObject({ type: 'turn', activities: [{ id: 'a', kind: 'command', status: 'running' }] })
+  })
 })

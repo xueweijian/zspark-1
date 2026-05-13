@@ -3,6 +3,8 @@
  * Every function here is testable in isolation.
  */
 import type {
+  Activity,
+  ApprovalRequest,
   Block,
   SharedArtifact,
   SharedSession,
@@ -75,15 +77,160 @@ export function titleFromBlocks(blocks: Block[]): string {
   return (title || 'New shared chat').slice(0, 120)
 }
 
+function boundedString(value: unknown, limit: number): string | null {
+  if (typeof value !== 'string') return null
+  return value.slice(0, limit)
+}
+
+function optionalBoundedString(value: unknown, limit: number): string | undefined {
+  return value == null ? undefined : boundedString(value, limit) ?? undefined
+}
+
+function finiteNumber(value: unknown, fallback = 0): number {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+const ACTIVITY_KINDS = new Set(['reasoning', 'command', 'file', 'tool', 'web', 'memory'])
+const ACTION_KINDS = new Set(['read', 'write', 'list', 'search', 'run', 'build', 'verify', 'tool', 'file'])
+const ACTIVITY_STATUSES = new Set(['running', 'done', 'failed'])
+const FILE_SOURCES = new Set(['attachment', 'change'])
+const FILE_STATUSES = new Set(['attached', 'created', 'modified', 'deleted', 'missing'])
+const APPROVAL_KINDS = new Set(['command', 'fileChange', 'permissions'])
+const APPROVAL_STATUSES = new Set(['pending', 'sending', 'approved', 'denied', 'resolved'])
+
+function normalizeSnapshotActivity(activity: any): Activity | null {
+  if (!activity || typeof activity !== 'object') return null
+  const id = boundedString(activity.id, 240)
+  const title = boundedString(activity.title, 500)
+  if (!id || !title) return null
+  return {
+    id,
+    kind: ACTIVITY_KINDS.has(activity.kind) ? activity.kind : 'reasoning',
+    title,
+    detail: optionalBoundedString(activity.detail, 6000),
+    actionKind: ACTION_KINDS.has(activity.actionKind) ? activity.actionKind : undefined,
+    target: optionalBoundedString(activity.target, 1200),
+    status: ACTIVITY_STATUSES.has(activity.status) ? activity.status : 'done',
+    startedAt: finiteNumber(activity.startedAt, Date.now()),
+    endedAt: activity.endedAt == null ? undefined : finiteNumber(activity.endedAt)
+  }
+}
+
+function normalizeSnapshotWorkspaceFile(file: any): WorkspaceFile | null {
+  if (!file || typeof file !== 'object') return null
+  const id = boundedString(file.id, 240)
+  const name = boundedString(file.name, 240)
+  const path = boundedString(file.path, 1400)
+  if (!id || !name || !path) return null
+  return {
+    id,
+    name,
+    path,
+    source: FILE_SOURCES.has(file.source) ? file.source : 'change',
+    status: FILE_STATUSES.has(file.status) ? file.status : 'missing',
+    detail: optionalBoundedString(file.detail, 1000),
+    updatedAt: finiteNumber(file.updatedAt, Date.now()),
+    sharedArtifact: file.sharedArtifact && typeof file.sharedArtifact === 'object'
+      ? {
+          workspaceId: String(file.sharedArtifact.workspaceId ?? '').slice(0, 160),
+          sessionId: String(file.sharedArtifact.sessionId ?? '').slice(0, 160),
+          artifactId: String(file.sharedArtifact.artifactId ?? '').slice(0, 160),
+          sizeBytes: file.sharedArtifact.sizeBytes == null ? undefined : finiteNumber(file.sharedArtifact.sizeBytes)
+        }
+      : undefined
+  }
+}
+
+function normalizeSnapshotApprovalRequest(request: any): ApprovalRequest | null {
+  if (!request || typeof request !== 'object') return null
+  const key = boundedString(request.key, 240)
+  const method = boundedString(request.method, 160)
+  const blockId = boundedString(request.blockId, 240)
+  const threadId = boundedString(request.threadId, 240)
+  const turnId = boundedString(request.turnId, 240)
+  const itemId = boundedString(request.itemId, 240)
+  const title = boundedString(request.title, 500)
+  const description = boundedString(request.description, 1000)
+  if (!key || !method || !blockId || !threadId || !turnId || !itemId || !title || !description) return null
+  return {
+    id: typeof request.id === 'number' || typeof request.id === 'string' ? request.id : key,
+    key,
+    kind: APPROVAL_KINDS.has(request.kind) ? request.kind : 'permissions',
+    method,
+    blockId,
+    threadId,
+    turnId,
+    itemId,
+    title,
+    description,
+    detail: optionalBoundedString(request.detail, 3000),
+    commandPreview: optionalBoundedString(request.commandPreview, 3000),
+    cwd: optionalBoundedString(request.cwd, 1200),
+    reason: optionalBoundedString(request.reason, 1000),
+    paths: Array.isArray(request.paths) ? request.paths.map((path: any) => String(path).slice(0, 1200)).slice(0, 200) : [],
+    params: request.params,
+    status: APPROVAL_STATUSES.has(request.status) ? request.status : 'resolved',
+    startedAt: finiteNumber(request.startedAt, Date.now())
+  }
+}
+
+function normalizeSnapshotBlock(block: any): Block | null {
+  if (!block || typeof block !== 'object') return null
+  const id = boundedString(block.id, 240)
+  if (!id) return null
+  if (block.type === 'user') {
+    const text = boundedString(block.text, 200_000)
+    if (text == null) return null
+    return { type: 'user', id, text, turnId: optionalBoundedString(block.turnId, 240), input: Array.isArray(block.input) ? normalizeInputItemsForResubmit(block.input).slice(0, 200) : undefined }
+  }
+  if (block.type === 'agent') {
+    const text = boundedString(block.text, 1_000_000)
+    if (text == null) return null
+    return { type: 'agent', id, text, turnId: optionalBoundedString(block.turnId, 240), memoryCitation: block.memoryCitation ?? null }
+  }
+  if (block.type === 'files') {
+    const turnId = boundedString(block.turnId, 240)
+    const title = boundedString(block.title, 500)
+    if (!turnId || !title || !Array.isArray(block.files)) return null
+    return {
+      type: 'files',
+      id,
+      turnId,
+      title,
+      files: block.files.map(normalizeSnapshotWorkspaceFile).filter((file: WorkspaceFile | null): file is WorkspaceFile => Boolean(file)).slice(0, 300),
+      subtitle: optionalBoundedString(block.subtitle, 1000),
+      tone: block.tone === 'warn' ? 'warn' : block.tone === 'normal' ? 'normal' : undefined
+    }
+  }
+  if (block.type === 'approval') {
+    const turnId = boundedString(block.turnId, 240)
+    const request = normalizeSnapshotApprovalRequest(block.request)
+    if (!turnId || !request) return null
+    return { type: 'approval', id, turnId, request }
+  }
+  if (block.type === 'turn') {
+    const turnId = boundedString(block.turnId, 240)
+    if (!turnId || !Array.isArray(block.activities)) return null
+    return {
+      type: 'turn',
+      id,
+      turnId,
+      activities: block.activities.map(normalizeSnapshotActivity).filter((activity: Activity | null): activity is Activity => Boolean(activity)).slice(0, 1000),
+      collapsed: Boolean(block.collapsed),
+      finalMessageId: optionalBoundedString(block.finalMessageId, 240),
+      startedAt: finiteNumber(block.startedAt, Date.now()),
+      endedAt: block.endedAt == null ? undefined : finiteNumber(block.endedAt)
+    }
+  }
+  return null
+}
+
 export function blocksFromSharedSnapshot(snapshot?: SharedSessionSnapshot | null): Block[] {
   const blocks = Array.isArray(snapshot?.blocks) ? snapshot.blocks : []
-  return blocks.filter((block: any) => (
-    block?.type === 'user' ||
-    block?.type === 'agent' ||
-    block?.type === 'files' ||
-    block?.type === 'approval' ||
-    block?.type === 'turn'
-  ))
+  return blocks
+    .map(normalizeSnapshotBlock)
+    .filter((block: Block | null): block is Block => Boolean(block))
 }
 
 export function formatUserInputContent(content: any[]): string {

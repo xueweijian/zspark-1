@@ -1,4 +1,5 @@
 import { app, shell } from 'electron'
+import { realpathSync } from 'node:fs'
 import { extname, isAbsolute, relative, resolve } from 'node:path'
 
 /**
@@ -20,12 +21,22 @@ export function allowedLocalPathRoots(workspaceRoot: string): string[] {
   return [workspaceRoot, app.getPath('downloads')]
 }
 
+function realpathIfAvailable(path: string): string {
+  try {
+    return realpathSync(path)
+  } catch {
+    return resolve(path)
+  }
+}
+
 export function resolveAllowedLocalPath(workspaceRoot: string, filePath: string): string {
   const normalized = isAbsolute(filePath) ? resolve(filePath) : resolve(workspaceRoot, filePath)
-  if (!allowedLocalPathRoots(workspaceRoot).some((root) => isInsidePath(root, normalized))) {
-    throw new Error('Path is outside the allowed zspark workspace/download directories')
+  const roots = allowedLocalPathRoots(workspaceRoot).map(realpathIfAvailable)
+  const realPath = realpathSync(normalized)
+  if (!roots.some((root) => isInsidePath(root, realPath))) {
+    throw new Error('Path resolves outside the allowed zspark workspace/download directories')
   }
-  return normalized
+  return realPath
 }
 
 export async function openExternalUrl(rawUrl: string): Promise<void> {

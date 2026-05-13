@@ -11,16 +11,131 @@ interface SessionParams {
   sessionId?: string
 }
 
+class SnapshotConflictError extends Error {
+  constructor(readonly revision: number | null) {
+    super('shared session snapshot changed')
+  }
+}
+
+const JsonRpcIdSchema = z.union([z.string().max(200), z.number()])
+const ActivityKindSchema = z.enum(['reasoning', 'command', 'file', 'tool', 'web', 'memory'])
+const ActivityActionKindSchema = z.enum(['read', 'write', 'list', 'search', 'run', 'build', 'verify', 'tool', 'file'])
+const ActivitySchema = z.object({
+  id: z.string().max(240),
+  kind: ActivityKindSchema,
+  title: z.string().max(500),
+  detail: z.string().max(6000).optional(),
+  actionKind: ActivityActionKindSchema.optional(),
+  target: z.string().max(1200).optional(),
+  status: z.enum(['running', 'done', 'failed']),
+  startedAt: z.number(),
+  endedAt: z.number().optional()
+}).passthrough()
+
+const WorkspaceFileSchema = z.object({
+  id: z.string().max(240),
+  name: z.string().max(240),
+  path: z.string().max(1400),
+  source: z.enum(['attachment', 'change']),
+  status: z.enum(['attached', 'created', 'modified', 'deleted', 'missing']),
+  detail: z.string().max(1000).optional(),
+  updatedAt: z.number(),
+  sharedArtifact: z.object({
+    workspaceId: z.string().max(160),
+    sessionId: z.string().max(160),
+    artifactId: z.string().max(160),
+    sizeBytes: z.number().optional()
+  }).optional()
+}).passthrough()
+
+const ApprovalRequestSchema = z.object({
+  id: JsonRpcIdSchema,
+  key: z.string().max(240),
+  kind: z.enum(['command', 'fileChange', 'permissions']),
+  method: z.string().max(160),
+  blockId: z.string().max(240),
+  threadId: z.string().max(240),
+  turnId: z.string().max(240),
+  itemId: z.string().max(240),
+  title: z.string().max(500),
+  description: z.string().max(1000),
+  detail: z.string().max(3000).optional(),
+  commandPreview: z.string().max(3000).optional(),
+  cwd: z.string().max(1200).optional(),
+  reason: z.string().max(1000).optional(),
+  paths: z.array(z.string().max(1200)).max(200),
+  params: z.unknown().optional(),
+  status: z.enum(['pending', 'sending', 'approved', 'denied', 'resolved']),
+  startedAt: z.number()
+}).passthrough()
+
+const TurnInputItemSchema = z.object({
+  type: z.enum(['text', 'image', 'localImage', 'skill', 'mention'])
+}).passthrough()
+
+const SnapshotBlockSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('user'),
+    id: z.string().max(240),
+    text: z.string().max(200_000),
+    turnId: z.string().max(240).optional(),
+    input: z.array(TurnInputItemSchema).max(200).optional()
+  }).passthrough(),
+  z.object({
+    type: z.literal('agent'),
+    id: z.string().max(240),
+    text: z.string().max(1_000_000),
+    turnId: z.string().max(240).optional(),
+    memoryCitation: z.unknown().optional().nullable()
+  }).passthrough(),
+  z.object({
+    type: z.literal('files'),
+    id: z.string().max(240),
+    turnId: z.string().max(240),
+    title: z.string().max(500),
+    files: z.array(WorkspaceFileSchema).max(300),
+    subtitle: z.string().max(1000).optional(),
+    tone: z.enum(['normal', 'warn']).optional()
+  }).passthrough(),
+  z.object({
+    type: z.literal('approval'),
+    id: z.string().max(240),
+    turnId: z.string().max(240),
+    request: ApprovalRequestSchema
+  }).passthrough(),
+  z.object({
+    type: z.literal('turn'),
+    id: z.string().max(240),
+    turnId: z.string().max(240),
+    activities: z.array(ActivitySchema).max(1000),
+    collapsed: z.boolean(),
+    finalMessageId: z.string().max(240).optional(),
+    startedAt: z.number(),
+    endedAt: z.number().optional()
+  }).passthrough()
+])
+
+const SharedSessionSnapshotSchema = z.object({
+  version: z.number().optional(),
+  title: z.string().max(160).optional(),
+  localThreadId: z.string().max(160).nullable().optional(),
+  blocks: z.array(SnapshotBlockSchema).max(800).optional(),
+  artifacts: z.array(z.unknown()).max(200).optional(),
+  updatedAt: z.number().optional(),
+  revision: z.number().nullable().optional()
+}).passthrough()
+
 const CreateSessionBody = z.object({
   title: z.string().max(160).optional(),
   localThreadId: z.string().max(160).optional(),
-  snapshot: z.unknown().optional()
+  snapshot: SharedSessionSnapshotSchema.optional()
 })
 
 const UpdateSessionBody = z.object({
   title: z.string().max(160).optional(),
   localThreadId: z.string().max(160).nullable().optional(),
-  snapshot: z.unknown().optional()
+  snapshot: SharedSessionSnapshotSchema.optional(),
+  baseRevision: z.number().nullable().optional()
 })
 
 async function ensureWorkspaceAccess(req: FastifyRequest, workspaceId: string) {
@@ -41,30 +156,59 @@ async function sessionBelongsToWorkspace(sessionId: string, workspaceId: string)
   return Boolean(result.rowCount)
 }
 
+function snapshotWithRevision(content: unknown, revision: number) {
+  if (!content || typeof content !== 'object' || Array.isArray(content)) return null
+  return { ...content, revision }
+}
+
 async function latestSnapshot(sessionId: string) {
   if (!pool) return null
   const result = await pool.query(
     `
-      SELECT content
+      SELECT id, content
       FROM messages
       WHERE session_id = $1 AND role = 'snapshot'
-      ORDER BY created_at DESC
+      ORDER BY id DESC
       LIMIT 1
     `,
     [sessionId]
   )
-  return result.rows[0]?.content ?? null
+  const row = result.rows[0]
+  return row ? snapshotWithRevision(row.content, Number(row.id)) : null
 }
 
-async function writeSnapshot(client: PoolClient, sessionId: string, snapshot: unknown) {
-  if (snapshot === undefined) return
-  await client.query(
+async function latestSnapshotRevision(client: PoolClient, sessionId: string) {
+  const result = await client.query(
+    `
+      SELECT id
+      FROM messages
+      WHERE session_id = $1 AND role = 'snapshot'
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [sessionId]
+  )
+  return result.rows[0]?.id == null ? null : Number(result.rows[0].id)
+}
+
+async function writeSnapshot(client: PoolClient, sessionId: string, snapshot: z.infer<typeof SharedSessionSnapshotSchema> | undefined, baseRevision?: number | null) {
+  if (snapshot === undefined) return null
+  await client.query('SELECT id FROM sessions WHERE id = $1 FOR UPDATE', [sessionId])
+  const currentRevision = await latestSnapshotRevision(client, sessionId)
+  if (baseRevision !== undefined && currentRevision !== baseRevision) {
+    throw new SnapshotConflictError(currentRevision)
+  }
+  const content = { ...snapshot }
+  delete content.revision
+  const result = await client.query(
     `
       INSERT INTO messages (session_id, role, content)
       VALUES ($1, 'snapshot', $2::jsonb)
+      RETURNING id
     `,
-    [sessionId, JSON.stringify(snapshot)]
+    [sessionId, JSON.stringify(content)]
   )
+  return Number(result.rows[0].id)
 }
 
 export async function registerSessionRoutes(app: FastifyInstance) {
@@ -112,9 +256,9 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         `,
         [id, owner, sessionTitle(body.title, req), workspaceId, body.localThreadId ?? null]
       )
-      await writeSnapshot(client, id, body.snapshot)
+      const snapshotRevision = await writeSnapshot(client, id, body.snapshot)
       await client.query('COMMIT')
-      return reply.code(201).send({ session: result.rows[0] })
+      return reply.code(201).send({ session: result.rows[0], snapshotRevision })
     } catch (err) {
       await client.query('ROLLBACK')
       throw err
@@ -173,11 +317,14 @@ export async function registerSessionRoutes(app: FastifyInstance) {
         `,
         [sessionId, workspaceId, hasTitle, title, hasLocalThreadId, body.localThreadId ?? null]
       )
-      await writeSnapshot(client, sessionId, body.snapshot)
+      const snapshotRevision = await writeSnapshot(client, sessionId, body.snapshot, body.baseRevision)
       await client.query('COMMIT')
-      return { session: result.rows[0] }
+      return { session: result.rows[0], snapshotRevision }
     } catch (err) {
       await client.query('ROLLBACK')
+      if (err instanceof SnapshotConflictError) {
+        return reply.code(409).send({ error: err.message, revision: err.revision })
+      }
       throw err
     } finally {
       client.release()

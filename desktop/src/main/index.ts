@@ -57,11 +57,11 @@ let bridgeClose: (() => void) | null = null
 let settingsLoadIssue: string | null = null
 
 const PROVIDER_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/models']
-const DEFAULT_ENTRA_TENANT_ID = process.env.ZSPARK_TENANT_ID ?? 'ae266ff5-076f-4eb1-b91b-788a04d2abe0'
-const DEFAULT_ENTRA_CLIENT_ID = process.env.ZSPARK_CLIENT_ID ?? '47a35772-7d8d-4308-9730-7f1b836dc40c'
-const DEFAULT_ENTRA_API_SCOPE = process.env.ZSPARK_API_SCOPE ?? `api://${DEFAULT_ENTRA_CLIENT_ID}/access_as_user`
-const DEFAULT_ENTRA_AUTHORITY = process.env.ZSPARK_AUTHORITY ?? `https://login.partner.microsoftonline.cn/${DEFAULT_ENTRA_TENANT_ID}`
-const DEFAULT_WORKSPACE_SERVER_URL = process.env.ZSPARK_SERVER_URL ?? 'http://143.64.174.225:8787'
+const DEFAULT_ENTRA_TENANT_ID = process.env.ZSPARK_TENANT_ID ?? ''
+const DEFAULT_ENTRA_CLIENT_ID = process.env.ZSPARK_CLIENT_ID ?? ''
+const DEFAULT_ENTRA_API_SCOPE = process.env.ZSPARK_API_SCOPE ?? (DEFAULT_ENTRA_CLIENT_ID ? `api://${DEFAULT_ENTRA_CLIENT_ID}/access_as_user` : '')
+const DEFAULT_ENTRA_AUTHORITY = process.env.ZSPARK_AUTHORITY ?? (DEFAULT_ENTRA_TENANT_ID ? `https://login.partner.microsoftonline.cn/${DEFAULT_ENTRA_TENANT_ID}` : '')
+const DEFAULT_WORKSPACE_SERVER_URL = process.env.ZSPARK_SERVER_URL ?? ''
 
 const SETTINGS_PATH = join(app.getPath('userData'), 'zspark-settings.json')
 const WORKSPACE_ROOT = resolveWorkspaceRoot(process.cwd())
@@ -137,6 +137,9 @@ function settingsWarnings(s: AppSettings) {
   if ((s.enterpriseAuth as any)?.encryptedAccessToken && !s.enterpriseAuth?.accessToken) {
     warnings.push('The saved Entra token cannot be decrypted on this machine. Sign in again before using shared workspaces.')
   }
+  if (isRemoteHttpEnterpriseUrl(s.enterprise?.serverUrl)) {
+    warnings.push('Shared workspace server is using plain HTTP. This is acceptable for a controlled demo or private tunnel, but use HTTPS before customer or production use.')
+  }
   return warnings
 }
 
@@ -186,6 +189,36 @@ function effectiveEnterpriseConfig(settings = loadSettings()): EnterpriseConfig 
 
 function normalizeEnterpriseServerUrl(rawUrl: string): string {
   return rawUrl.trim().replace(/\/+$/, '')
+}
+
+function isLoopbackHost(hostname: string) {
+  const host = hostname.toLowerCase()
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]'
+}
+
+function isRemoteHttpEnterpriseUrl(rawUrl?: string) {
+  if (!rawUrl) return false
+  try {
+    const url = new URL(rawUrl)
+    return url.protocol === 'http:' && !isLoopbackHost(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+function validateEnterpriseServerUrl(rawUrl: string): string {
+  const normalized = normalizeEnterpriseServerUrl(rawUrl)
+  if (!normalized) return ''
+  let url: URL
+  try {
+    url = new URL(normalized)
+  } catch {
+    throw new Error('Shared workspace server URL is invalid')
+  }
+  if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+    throw new Error('Shared workspace server must use HTTP or HTTPS')
+  }
+  return normalized
 }
 
 function tokenIsUsable(auth?: EnterpriseAuth) {
@@ -250,7 +283,16 @@ async function enterpriseFetchResponse(path: string, init: RequestInit = {}) {
     return { ok: false, status: 401, error: 'Sign in to shared workspaces first.' }
   }
   const config = effectiveEnterpriseConfig(settings)
-  const response = await fetch(`${config.serverUrl}${path}`, {
+  let serverUrl: string
+  try {
+    serverUrl = validateEnterpriseServerUrl(config.serverUrl)
+  } catch (err: any) {
+    return { ok: false, status: 400, error: err?.message ?? String(err) }
+  }
+  if (!serverUrl) {
+    return { ok: false, status: 400, error: 'Shared workspace server URL is not configured.' }
+  }
+  const response = await fetch(`${serverUrl}${path}`, {
     ...init,
     headers: {
       ...(init.body ? { 'content-type': 'application/json' } : {}),
@@ -263,6 +305,20 @@ async function enterpriseFetchResponse(path: string, init: RequestInit = {}) {
 
 function resolveAllowedLocalPath(filePath: string) {
   return resolveAllowedLocalPathRaw(WORKSPACE_ROOT, filePath)
+}
+
+function resolveAllowedSkillPath(filePath: string) {
+  const requested = realpathSync(filePath)
+  const skills = discoverLocalSkills(WORKSPACE_ROOT).skills
+  const allowed = skills.some((skill) => {
+    try {
+      return realpathSync(skill.path) === requested
+    } catch {
+      return false
+    }
+  })
+  if (!allowed) throw new Error('Skill file is not in the discovered Codex skill list')
+  return requested
 }
 
 function resolveCodexBinary(): string {
@@ -584,6 +640,11 @@ ipcMain.handle('settings:save', async (_e, partial: AppSettings) => {
       ...effectiveEnterpriseConfig(cur),
       ...next.enterprise
     }
+    try {
+      next.enterprise.serverUrl = validateEnterpriseServerUrl(next.enterprise.serverUrl ?? '')
+    } catch (err: any) {
+      return { ok: false, error: err?.message ?? String(err), warnings: settingsWarnings(cur) }
+    }
   }
   saveSettings(next)
   if (partial.provider) {
@@ -608,6 +669,14 @@ ipcMain.handle('enterprise:login', async () => {
   try {
     const settings = loadSettings()
     const config = effectiveEnterpriseConfig(settings)
+    try {
+      validateEnterpriseServerUrl(config.serverUrl)
+    } catch (err: any) {
+      return { ok: false, error: err?.message ?? String(err) }
+    }
+    if (!config.serverUrl || !config.tenantId || !config.clientId || !config.apiScope || !config.authority) {
+      return { ok: false, error: 'Shared workspace Entra configuration is incomplete. Open Settings and fill Server URL, Tenant ID, Client ID, API Scope, and Authority.' }
+    }
     settings.enterprise = config
     saveSettings(settings)
 
@@ -799,6 +868,18 @@ ipcMain.handle('path:open', async (_e, filePath: string) => {
   try {
     if (!filePath) return { ok: false, error: 'Missing file path' }
     const safePath = resolveAllowedLocalPath(filePath)
+    ensureShellOpenAllowed(safePath)
+    const error = await shell.openPath(safePath)
+    return error ? { ok: false, error } : { ok: true }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
+})
+
+ipcMain.handle('skill:open', async (_e, filePath: string) => {
+  try {
+    if (!filePath) return { ok: false, error: 'Missing skill path' }
+    const safePath = resolveAllowedSkillPath(filePath)
     ensureShellOpenAllowed(safePath)
     const error = await shell.openPath(safePath)
     return error ? { ok: false, error } : { ok: true }

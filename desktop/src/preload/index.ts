@@ -6,6 +6,7 @@ const api = {
   pickAttachments: () => ipcRenderer.invoke('attachments:pick'),
   getRuntimeInfo: () => ipcRenderer.invoke('runtime:get'),
   discoverLocalSkills: () => ipcRenderer.invoke('skills:localAvailability'),
+  openSkillPath: (path: string) => ipcRenderer.invoke('skill:open', path),
   openPath: (path: string) => ipcRenderer.invoke('path:open', path),
   revealPath: (path: string) => ipcRenderer.invoke('path:reveal', path),
   downloadPath: (path: string) => ipcRenderer.invoke('path:download', path),

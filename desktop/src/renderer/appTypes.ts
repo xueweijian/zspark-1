@@ -139,12 +139,14 @@ export interface SharedSessionSnapshot {
   blocks?: Block[]
   artifacts?: SharedArtifact[]
   updatedAt?: number
+  revision?: number | null
 }
 
 export interface SharedSessionMutation {
   title?: string
   localThreadId?: string | null
   snapshot?: SharedSessionSnapshot
+  baseRevision?: number | null
 }
 
 export interface SharedArtifact {

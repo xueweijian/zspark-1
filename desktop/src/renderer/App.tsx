@@ -149,6 +149,7 @@ declare global {
       pickAttachments: () => Promise<PickAttachmentsResult>
       getRuntimeInfo: () => Promise<RuntimeHostInfo>
       discoverLocalSkills: () => Promise<DiscoverLocalSkillsResult>
+      openSkillPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       openPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       revealPath: (path: string) => Promise<{ ok: boolean; error?: string }>
       downloadPath: (path: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; error?: string }>
@@ -156,7 +157,7 @@ declare global {
       openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>
       scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => Promise<ArtifactScanResult>
       getSettings: () => Promise<AppSettingsView>
-      saveSettings: (s: any) => Promise<{ ok: boolean; warnings?: string[] }>
+      saveSettings: (s: any) => Promise<{ ok: boolean; warnings?: string[]; error?: string }>
       enterpriseStatus: () => Promise<EnterpriseStatus>
       enterpriseLogin: () => Promise<{ ok: boolean; status?: EnterpriseStatus; error?: string }>
       enterpriseLogout: () => Promise<EnterpriseStatus>
@@ -164,9 +165,9 @@ declare global {
       enterpriseWorkspaces: () => Promise<{ ok: boolean; workspaces?: SharedWorkspace[]; status?: number; error?: string }>
       enterpriseCreateWorkspace: (name?: string) => Promise<{ ok: boolean; workspace?: SharedWorkspace; status?: number; error?: string }>
       enterpriseSessions: (workspaceId: string) => Promise<{ ok: boolean; sessions?: SharedSession[]; status?: number; error?: string }>
-      enterpriseCreateSession: (workspaceId: string, body?: SharedSessionMutation) => Promise<{ ok: boolean; session?: SharedSession; status?: number; error?: string }>
+      enterpriseCreateSession: (workspaceId: string, body?: SharedSessionMutation) => Promise<{ ok: boolean; session?: SharedSession; snapshotRevision?: number | null; status?: number; error?: string }>
       enterpriseReadSession: (workspaceId: string, sessionId: string) => Promise<{ ok: boolean; session?: SharedSession; snapshot?: SharedSessionSnapshot; status?: number; error?: string }>
-      enterpriseUpdateSession: (workspaceId: string, sessionId: string, body?: SharedSessionMutation) => Promise<{ ok: boolean; session?: SharedSession; status?: number; error?: string }>
+      enterpriseUpdateSession: (workspaceId: string, sessionId: string, body?: SharedSessionMutation) => Promise<{ ok: boolean; session?: SharedSession; snapshotRevision?: number | null; status?: number; error?: string }>
       enterpriseDeleteSession: (workspaceId: string, sessionId: string) => Promise<{ ok: boolean; status?: number; error?: string }>
       enterpriseArtifacts: (workspaceId: string, sessionId: string) => Promise<{ ok: boolean; artifacts?: SharedArtifact[]; status?: number; error?: string }>
       enterpriseUploadArtifact: (workspaceId: string, sessionId: string, filePath: string, meta?: { name?: string; mimeType?: string; turnId?: string }) => Promise<{ ok: boolean; artifact?: SharedArtifact; status?: number; error?: string }>
@@ -772,7 +773,12 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
     setSaving(true)
     const result = await window.zspark.saveSettings({ provider: form, enterprise })
     setWarnings(result.warnings ?? [])
-    setSaving(false); onClose()
+    setSaving(false)
+    if (!result.ok) {
+      setWarnings([result.error ?? 'Settings could not be saved', ...(result.warnings ?? [])])
+      return
+    }
+    onClose()
   }
   return (
     <div className="modal-bg">
@@ -912,6 +918,7 @@ function DesktopApp() {
   const lastPersistedActivityKey = useRef('')
   const sharedSyncTimer = useRef<number | null>(null)
   const lastSharedSnapshotKey = useRef('')
+  const activeSharedSnapshotRevision = useRef<number | null>(null)
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
   const submitInFlight = useRef(false)
@@ -1012,6 +1019,7 @@ function DesktopApp() {
           if (activeSharedWorkspaceRef.current && !workspaces.some((workspace) => workspace.id === activeSharedWorkspaceRef.current)) {
             activeSharedWorkspaceRef.current = null
             activeSharedSessionRef.current = null
+            activeSharedSnapshotRevision.current = null
             setActiveSharedWorkspace(null)
             setActiveSharedSession(null)
             setSharedSessions([])
@@ -1028,6 +1036,7 @@ function DesktopApp() {
         setSharedSessions([])
         activeSharedWorkspaceRef.current = null
         activeSharedSessionRef.current = null
+        activeSharedSnapshotRevision.current = null
         setActiveSharedWorkspace(null)
         setActiveSharedSession(null)
       }
@@ -1079,6 +1088,7 @@ function DesktopApp() {
     resetLiveTurnState()
     activeSharedWorkspaceRef.current = workspaceId
     activeSharedSessionRef.current = null
+    activeSharedSnapshotRevision.current = null
     setActiveSharedWorkspace(workspaceId)
     setActiveSharedSession(null)
     setThread(null)
@@ -1097,6 +1107,7 @@ function DesktopApp() {
     resetLiveTurnState()
     activeSharedWorkspaceRef.current = null
     activeSharedSessionRef.current = null
+    activeSharedSnapshotRevision.current = null
     setActiveSharedWorkspace(null)
     setActiveSharedSession(null)
     setSharedSessions([])
@@ -1138,6 +1149,7 @@ function DesktopApp() {
       setSharedSessions([])
       activeSharedWorkspaceRef.current = null
       activeSharedSessionRef.current = null
+      activeSharedSnapshotRevision.current = null
       setActiveSharedWorkspace(null)
       setActiveSharedSession(null)
       toast('info', 'Signed out of shared workspaces')
@@ -2188,9 +2200,17 @@ function DesktopApp() {
       void window.zspark.enterpriseUpdateSession(activeSharedWorkspace, activeSharedSession, {
         title,
         localThreadId,
+        baseRevision: activeSharedSnapshotRevision.current,
         snapshot
       }).then((result) => {
-        if (!result.ok) return
+        if (!result.ok) {
+          if (result.status === 409) {
+            setEnterpriseError('This shared session changed on another device. Reopen it before sending more changes.')
+            toast('warn', 'Shared session changed elsewhere. Reopen it before continuing.')
+          }
+          return
+        }
+        activeSharedSnapshotRevision.current = result.snapshotRevision ?? activeSharedSnapshotRevision.current
         lastSharedSnapshotKey.current = snapshotKey
         setSharedSessions((prev) => prev.map((session) => (
           session.id === activeSharedSession
@@ -2326,6 +2346,8 @@ function DesktopApp() {
       })
       if (!result.ok || !result.session) throw new Error(result.error ?? 'Could not create shared session')
       activeSharedSessionRef.current = result.session.id
+      activeSharedSnapshotRevision.current = result.snapshotRevision ?? null
+      lastSharedSnapshotKey.current = JSON.stringify({ activeSharedWorkspace: workspaceId, activeSharedSession: result.session.id, localThreadId, title: 'New shared chat', blocks: [] })
       setActiveSharedSession(result.session.id)
       setSharedSessions((prev) => [result.session!, ...prev.filter((session) => session.id !== result.session!.id)])
       return { sessionId: result.session.id, localThreadId }
@@ -2349,6 +2371,8 @@ function DesktopApp() {
       if (seq !== switchThreadSeq.current) return
       if (!result.ok || !result.session) throw new Error(result.error ?? 'Could not open shared session')
       activeSharedSessionRef.current = id
+      activeSharedSnapshotRevision.current = result.snapshot?.revision ?? null
+      lastSharedSnapshotKey.current = ''
       setActiveSharedSession(id)
       setPanel(null)
       const snapshotBlocks = blocksFromSharedSnapshot(result.snapshot)
@@ -2390,7 +2414,11 @@ function DesktopApp() {
         setThread(nextThreadId)
         await window.zspark.enterpriseUpdateSession(workspaceId, id, {
           localThreadId: nextThreadId,
+          baseRevision: activeSharedSnapshotRevision.current,
           snapshot: { version: 1, blocks: snapshotBlocks, localThreadId: nextThreadId, title: result.session.title ?? undefined, updatedAt: Date.now() }
+        }).then((update) => {
+          if (!update.ok) throw new Error(update.error ?? 'Could not bind shared session to this runtime')
+          activeSharedSnapshotRevision.current = update.snapshotRevision ?? activeSharedSnapshotRevision.current
         })
         setSharedSessions((prev) => prev.map((session) => (
           session.id === id ? { ...session, local_thread_id: nextThreadId } : session
@@ -2430,6 +2458,7 @@ function DesktopApp() {
           switchThreadSeq.current += 1
           resetLiveTurnState()
           activeSharedSessionRef.current = null
+          activeSharedSnapshotRevision.current = null
           setActiveSharedSession(null)
           setThread(null)
           setBlocks([])
@@ -2507,7 +2536,7 @@ function DesktopApp() {
   const openSkillPath = async (path?: string) => {
     if (!path) return
     try {
-      const result = await window.zspark.openPath(path)
+      const result = await window.zspark.openSkillPath(path)
       if (!result.ok) toast('error', result.error ?? 'Could not open skill file')
     } catch (err: any) {
       toast('error', err?.message ?? String(err))

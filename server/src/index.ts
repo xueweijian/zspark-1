@@ -53,8 +53,8 @@ async function main() {
   await app.register(cors, { origin: corsOrigin(env), credentials: true })
   await app.register(websocket)
 
-  app.addHook('onRequest', entraAuth(env))
   registerRateLimit(app, env)
+  app.addHook('onRequest', entraAuth(env))
 
   app.get('/healthz', async () => ({ ok: true, service: 'zspark-server' }))
 
