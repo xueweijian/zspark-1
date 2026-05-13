@@ -1404,7 +1404,7 @@ function DesktopApp() {
           id: b.id || blockId,
           collapsed: false,
           endedAt: undefined,
-          status: 'running',
+          status: 'running' as const,
           activities: hasThinking ? b.activities : [activity, ...b.activities]
         }
       })
@@ -1417,7 +1417,7 @@ function DesktopApp() {
           turnId,
           collapsed: false,
           startedAt,
-          status: 'running',
+          status: 'running' as const,
           activities: [activity]
         }
       ], turnId)

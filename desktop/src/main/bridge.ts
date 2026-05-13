@@ -113,7 +113,9 @@ function responseHeaders(stream: boolean) {
     : { 'content-type': 'application/json' }
 }
 
-
+function reasoningItem(itemId: string) {
+  return { id: itemId, type: 'reasoning', summary: [], content: [] }
+}
 
 function writeResponseFailed(res: ServerResponse, ctx: ResponseContext, message: string) {
   if (!responseWritable(res)) return
@@ -145,13 +147,14 @@ function writeJsonError(res: ServerResponse, statusCode: number, message: string
 function emitChatJsonAsResponsesSse(res: ServerResponse, ctx: ResponseContext, json: any) {
   const result = chatMessageResult(json)
   let nextOutputIndex = 1
+  let reasoningItemId: string | null = null
   if (result.reasoning) {
-    const reasoningItemId = genId('rs')
+    reasoningItemId = genId('rs')
     const outputIndex = nextOutputIndex++
     sseWrite(res, 'response.output_item.added', {
       type: 'response.output_item.added',
       output_index: outputIndex,
-      item: { id: reasoningItemId, type: 'reasoning', summary: [], content: [] }
+      item: reasoningItem(reasoningItemId)
     })
     sseWrite(res, 'response.reasoning_summary_text.delta', {
       type: 'response.reasoning_summary_text.delta',
@@ -163,7 +166,7 @@ function emitChatJsonAsResponsesSse(res: ServerResponse, ctx: ResponseContext, j
     sseWrite(res, 'response.output_item.done', {
       type: 'response.output_item.done',
       output_index: outputIndex,
-      item: { id: reasoningItemId, type: 'reasoning', summary: [], content: [] }
+      item: reasoningItem(reasoningItemId)
     })
   }
 
@@ -201,6 +204,7 @@ function emitChatJsonAsResponsesSse(res: ServerResponse, ctx: ResponseContext, j
 
   const output = [
     messageItem(ctx, result.text, 'completed'),
+    ...(reasoningItemId ? [reasoningItem(reasoningItemId)] : []),
     ...result.toolCalls.map(functionCallItem)
   ]
   sseWrite(res, 'response.output_item.done', {
@@ -225,6 +229,7 @@ function emitChatJsonAsResponsesSse(res: ServerResponse, ctx: ResponseContext, j
 
 function writeChatJsonAsResponsesJson(res: ServerResponse, ctx: ResponseContext, json: any) {
   const result = chatMessageResult(json)
+  const reasoningItemId = result.reasoning ? genId('rs') : null
   if (!responseWritable(res)) return
   res.writeHead(200, responseHeaders(false))
   endIfOpen(res, JSON.stringify({
@@ -235,6 +240,7 @@ function writeChatJsonAsResponsesJson(res: ServerResponse, ctx: ResponseContext,
     status: 'completed',
     output: [
       messageItem(ctx, result.text, 'completed'),
+      ...(reasoningItemId ? [reasoningItem(reasoningItemId)] : []),
       ...result.toolCalls.map(functionCallItem)
     ],
     usage: responsesUsageFromChat(json.usage)
@@ -387,7 +393,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
         sseWrite(res, 'response.output_item.done', {
           type: 'response.output_item.done',
           output_index: reasoningOutputIndex ?? 1,
-          item: { id: reasoningItemId, type: 'reasoning', summary: [], content: [] }
+          item: reasoningItem(reasoningItemId)
         })
       }
       for (const e of toolCalls.values()) {
@@ -404,6 +410,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
       })
       const output = [
         messageItem(ctx, textAcc, 'completed'),
+        ...(reasoningOpen ? [reasoningItem(reasoningItemId)] : []),
         ...Array.from(toolCalls.values()).map(functionCallItem)
       ]
       const status = finishReason && finishReason !== 'stop' && finishReason !== 'tool_calls' && finishReason !== 'function_call'
@@ -467,7 +474,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
             sseWrite(res, 'response.output_item.added', {
               type: 'response.output_item.added',
               output_index: reasoningOutputIndex,
-              item: { id: reasoningItemId, type: 'reasoning', summary: [], content: [] }
+              item: reasoningItem(reasoningItemId)
             })
             nextOutputIndex++
           }

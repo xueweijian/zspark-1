@@ -169,6 +169,114 @@ describe('chat responses bridge', () => {
     expect(events.find((event) => event.type === 'response.completed')?.response.output[0].content[0].text).toBe('hello from json')
   })
 
+  test('includes JSON chat reasoning in streamed completed output before tool calls', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      jsonResponse(res, 200, {
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            reasoning_content: 'checking command',
+            tool_calls: [{ id: 'call_1', function: { name: 'shell', arguments: '{"cmd":"pwd"}' } }]
+          }
+        }]
+      })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: true,
+      input: 'hi'
+    })
+
+    const events = parseSseEvents(response.body)
+    const completed = events.find((event) => event.type === 'response.completed')
+    const output = completed?.response.output ?? []
+
+    expect(response.status).toBe(200)
+    expect(output.map((item: any) => item.type)).toEqual(['message', 'reasoning', 'function_call'])
+    expect(output[1]?.id).toMatch(/^rs_/)
+    expect(output[2]).toMatchObject({
+      type: 'function_call',
+      call_id: 'call_1',
+      name: 'shell',
+      arguments: '{"cmd":"pwd"}'
+    })
+  })
+
+  test('includes non-stream JSON chat reasoning in completed output before tool calls', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      jsonResponse(res, 200, {
+        choices: [{
+          message: {
+            role: 'assistant',
+            content: '',
+            reasoning_content: 'checking command',
+            tool_calls: [{ id: 'call_1', function: { name: 'shell', arguments: '{}' } }]
+          }
+        }]
+      })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: 'hi'
+    })
+
+    const json = JSON.parse(response.body)
+
+    expect(response.status).toBe(200)
+    expect(json.output.map((item: any) => item.type)).toEqual(['message', 'reasoning', 'function_call'])
+    expect(json.output[1]?.id).toMatch(/^rs_/)
+    expect(json.output[2]).toMatchObject({
+      type: 'function_call',
+      call_id: 'call_1',
+      name: 'shell',
+      arguments: '{}'
+    })
+  })
+
+  test('includes streamed chat reasoning in completed output before tool calls', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: 'checking command' } }] })}\n\n`)
+      res.write(`data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'shell', arguments: '{}' } }] } }] })}\n\n`)
+      res.write('data: [DONE]\n\n')
+      res.end()
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: true,
+      input: 'hi'
+    })
+
+    const events = parseSseEvents(response.body)
+    const completed = events.find((event) => event.type === 'response.completed')
+    const output = completed?.response.output ?? []
+
+    expect(response.status).toBe(200)
+    expect(events.some((event) => event.type === 'response.output_item.done' && event.item?.type === 'reasoning')).toBe(true)
+    expect(output.map((item: any) => item.type)).toEqual(['message', 'reasoning', 'function_call'])
+    expect(output[1]?.id).toMatch(/^rs_/)
+    expect(output[2]).toMatchObject({
+      type: 'function_call',
+      call_id: 'call_1',
+      name: 'shell',
+      arguments: '{}'
+    })
+  })
+
   test('surfaces upstream chat errors as Responses failed events', async () => {
     const upstream = await startUpstream((_req, res) => {
       jsonResponse(res, 400, { error: { message: 'tools are not supported by this model' } })
