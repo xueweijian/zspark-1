@@ -29,6 +29,8 @@ const UploadArtifactBody = z.object({
   contentBase64: z.string().min(1)
 })
 
+const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/
+
 function safeFileName(name: string) {
   return name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 180) || 'artifact'
 }
@@ -47,6 +49,11 @@ async function writeArtifactFile(root: string, id: string, content: Buffer) {
   await mkdir(dirname(filePath), { recursive: true })
   await writeFile(filePath, content, { mode: 0o600 })
   return filePath
+}
+
+function decodeBase64Strict(value: string) {
+  if (!BASE64_RE.test(value)) return null
+  return Buffer.from(value, 'base64')
 }
 
 function artifactMetadata(row: any) {
@@ -111,11 +118,11 @@ export async function registerArtifactRoutes(app: FastifyInstance, env: Artifact
     const body = parsed.data
 
     let content: Buffer
-    try {
-      content = Buffer.from(body.contentBase64, 'base64')
-    } catch {
+    const decoded = decodeBase64Strict(body.contentBase64)
+    if (!decoded) {
       return reply.code(400).send({ error: 'contentBase64 is not valid base64' })
     }
+    content = decoded
     if (!content.length) return reply.code(400).send({ error: 'artifact is empty' })
     if (content.length > MAX_ARTIFACT_BYTES) {
       return reply.code(413).send({ error: 'artifact too large', limit: MAX_ARTIFACT_BYTES })

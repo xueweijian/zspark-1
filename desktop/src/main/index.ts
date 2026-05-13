@@ -3,7 +3,7 @@ import type { OpenDialogOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from 'node:path'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync, realpathSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { PublicClientApplication } from '@azure/msal-node'
@@ -364,16 +364,33 @@ function workspaceRuntimeInfo() {
   // Reject any runtime path that escapes the cache root, so a malicious
   // symlink can't be used to silently prepend an attacker-controlled
   // directory to PATH.
-  const insideRoot =
-    isInsidePath(runtimeRoot, nodePath) &&
-    isInsidePath(runtimeRoot, nodeModulesPath) &&
-    isInsidePath(runtimeRoot, pythonPath)
+  const runtimeRootReal = realpathIfExists(runtimeRoot)
+  const nodePathReal = realpathIfExists(nodePath)
+  const nodeModulesPathReal = realpathIfExists(nodeModulesPath)
+  const pythonPathReal = realpathIfExists(pythonPath)
+  const insideRoot = Boolean(
+    runtimeRootReal &&
+    nodePathReal &&
+    nodeModulesPathReal &&
+    pythonPathReal &&
+    isInsidePath(runtimeRootReal, nodePathReal) &&
+    isInsidePath(runtimeRootReal, nodeModulesPathReal) &&
+    isInsidePath(runtimeRootReal, pythonPathReal)
+  )
   const available = insideRoot && existsSync(nodePath) && existsSync(nodeModulesPath) && existsSync(pythonPath)
   return {
-    nodePath,
-    nodeModulesPath,
-    pythonPath,
+    nodePath: nodePathReal ?? nodePath,
+    nodeModulesPath: nodeModulesPathReal ?? nodeModulesPath,
+    pythonPath: pythonPathReal ?? pythonPath,
     available
+  }
+}
+
+function realpathIfExists(path: string) {
+  try {
+    return realpathSync(path)
+  } catch {
+    return null
   }
 }
 
@@ -546,16 +563,17 @@ async function killCodex(child: ChildProcessWithoutNullStreams | null): Promise<
   if (!child || child.killed || child.exitCode !== null) return
   await new Promise<void>((resolveExit) => {
     let done = false
+    let forceKillTimer: ReturnType<typeof setTimeout> | null = null
     const finish = () => {
       if (done) return
       done = true
-      clearTimeout(forceKillTimer)
+      if (forceKillTimer) clearTimeout(forceKillTimer)
       resolveExit()
     }
     child.once('exit', finish)
     child.once('error', finish)
     try { child.kill() } catch { finish(); return }
-    const forceKillTimer = setTimeout(() => {
+    forceKillTimer = setTimeout(() => {
       try { child.kill('SIGKILL') } catch {}
       // SIGKILL guarantees an exit shortly; give the listener one more tick.
       setTimeout(finish, 250)
