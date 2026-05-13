@@ -531,6 +531,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
     let nextOutputIndex = 1 // 0 is the message item
     let completed = false
     let usage: ReturnType<typeof responsesUsageFromChat> | undefined
+    let finishReason: string | null = null
     const decoder = new StringDecoder('utf8')
     let waitingForDrain = false
 
@@ -570,11 +571,20 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
         messageItem(ctx, textAcc, 'completed'),
         ...Array.from(toolCalls.values()).map(functionCallItem)
       ]
+      const status = finishReason && finishReason !== 'stop' && finishReason !== 'tool_calls' && finishReason !== 'function_call'
+        ? 'incomplete'
+        : 'completed'
+      const stopReason = finishReason === 'length'
+        ? 'max_output_tokens'
+        : finishReason === 'content_filter'
+          ? 'content_filter'
+          : undefined
       sseWrite(res, 'response.completed', {
         type: 'response.completed',
         response: {
           id: responseId, object: 'response', created_at: createdAt, model: payload.model,
-          status: 'completed',
+          status,
+          ...(stopReason ? { incomplete_details: { reason: stopReason } } : {}),
           output,
           usage
         }
@@ -589,10 +599,16 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
       buf = frames.pop() ?? ''
       for (const frame of frames) {
         if (completed) return
+        // Per the SSE spec, only one leading SPACE after `data:` is removed;
+        // `.trim()` over-eagerly strips intra-JSON whitespace and corrupts
+        // payloads where strings end with significant trailing spaces.
         const data = frame
           .split(/\r?\n/)
           .filter((l) => l.startsWith('data:'))
-          .map((l) => l.slice(5).trim())
+          .map((l) => {
+            const tail = l.slice(5)
+            return tail.startsWith(' ') ? tail.slice(1) : tail
+          })
           .join('\n')
         if (!data) continue
         if (data === '[DONE]') { finalize(); return }
@@ -602,7 +618,11 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
         if (chunkUsage) usage = chunkUsage
         // Some providers (Azure-OpenAI) emit a `prompt_filter_results` only chunk
         if (!evt.choices || evt.choices.length === 0) continue
-        const delta = evt.choices[0]?.delta ?? {}
+        const choice = evt.choices[0] ?? {}
+        const delta = choice.delta ?? {}
+        if (typeof choice.finish_reason === 'string' && choice.finish_reason) {
+          finishReason = choice.finish_reason
+        }
         // 1. reasoning_content
         const reasoning = delta.reasoning_content
         if (typeof reasoning === 'string' && reasoning.length) {

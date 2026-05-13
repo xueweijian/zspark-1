@@ -14,7 +14,20 @@ const NotifyBody = z.object({
 })
 
 const DEFAULT_WEBHOOK_HOSTS = ['*.webhook.office.com', '*.webhook.office365.com', 'outlook.office.com']
+const DELIVERED_ID_LIMIT = 10_000
+// LRU eviction order: a Set's insertion order lets us drop the oldest entry
+// without flushing the entire dedupe history (which would otherwise re-open a
+// replay window every time the limit was hit).
 const deliveredActivityIds = new Set<string>()
+
+function rememberDeliveredActivity(activityId: string) {
+  deliveredActivityIds.add(activityId)
+  while (deliveredActivityIds.size > DELIVERED_ID_LIMIT) {
+    const oldest = deliveredActivityIds.values().next().value
+    if (oldest === undefined) break
+    deliveredActivityIds.delete(oldest)
+  }
+}
 
 /**
  * Microsoft Teams integration entry points.
@@ -43,11 +56,13 @@ export async function registerTeamsRoutes(app: FastifyInstance, env: TeamsEnv) {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ text }),
+      // 'manual' prevents redirect-based SSRF where an allowlisted host
+      // 302s to an internal address (e.g. 169.254.169.254 metadata).
+      redirect: 'manual',
       signal: AbortSignal.timeout(10_000)
     })
     if (activityId && r.ok) {
-      deliveredActivityIds.add(activityId)
-      if (deliveredActivityIds.size > 10_000) deliveredActivityIds.clear()
+      rememberDeliveredActivity(activityId)
     }
     return { delivered: r.ok, status: r.status }
   })

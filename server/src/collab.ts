@@ -3,15 +3,21 @@ import * as Y from 'yjs'
 import { setupWSConnection } from './yws.js'
 import { canAccessWorkspace } from './workspaces.js'
 
-const docs = new Map<string, Y.Doc>()
+interface RoomEntry {
+  doc: Y.Doc
+  destroyed: boolean
+}
+
+const docs = new Map<string, RoomEntry>()
 
 export function getDoc(name: string) {
-  let d = docs.get(name)
-  if (!d) {
-    d = new Y.Doc()
-    docs.set(name, d)
+  let entry = docs.get(name)
+  if (!entry || entry.destroyed) {
+    const doc = new Y.Doc()
+    entry = { doc, destroyed: false }
+    docs.set(name, entry)
   }
-  return d
+  return entry.doc
 }
 
 export async function registerCollabRoutes(app: FastifyInstance) {
@@ -36,8 +42,14 @@ export async function registerCollabRoutes(app: FastifyInstance) {
       doc,
       gc: true,
       onEmpty: () => {
-        ;(doc as any)._zsparkAwareness?.destroy?.()
+        const entry = docs.get(room)
+        // Reconnects between scheduling and execution can already have
+        // attached new clients to the same doc — only tear it down if the
+        // entry we hold is still the live one and nothing new joined.
+        if (!entry || entry.doc !== doc || entry.destroyed) return
+        entry.destroyed = true
         docs.delete(room)
+        ;(doc as any)._zsparkAwareness?.destroy?.()
         doc.destroy()
       }
     })

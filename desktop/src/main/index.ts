@@ -64,6 +64,9 @@ const CODEX_RUNTIME_NODE = join(CODEX_RUNTIME_DEPS_DIR, 'node', 'bin', process.p
 const CODEX_RUNTIME_NODE_MODULES = join(CODEX_RUNTIME_DEPS_DIR, 'node', 'node_modules')
 const CODEX_RUNTIME_PYTHON = join(CODEX_RUNTIME_DEPS_DIR, 'python', 'bin', process.platform === 'win32' ? 'python.exe' : 'python3')
 const MAX_CODEX_LOG_BYTES = 8 * 1024 * 1024
+// Server enforces a 50 MB artifact size + 70 MB JSON body cap; keep the
+// renderer-side guard below the JSON cap (base64 inflates ~1.37×).
+const MAX_ARTIFACT_UPLOAD_BYTES = 50 * 1024 * 1024
 const BRIDGE_API_KEY = randomBytes(32).toString('hex')
 
 function resolveWorkspaceRoot(start: string): string {
@@ -307,6 +310,28 @@ async function openExternalUrl(rawUrl: string) {
   await shell.openExternal(url.toString())
 }
 
+// Files explicitly allowed to be opened with the OS default handler from a
+// path:open IPC. Anything else (executables, scripts, .app bundles, …) is
+// blocked so a compromised renderer can't launch arbitrary binaries.
+const SHELL_OPEN_ALLOWED_EXTENSIONS = new Set([
+  '.txt', '.md', '.markdown', '.csv', '.json', '.log', '.html', '.htm', '.xml',
+  '.pdf',
+  '.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.avif', '.svg',
+  '.doc', '.docx', '.ppt', '.pptx', '.xls', '.xlsx',
+  '.mp3', '.wav', '.flac', '.mp4', '.mov', '.webm',
+  '.zip'
+])
+
+function ensureShellOpenAllowed(filePath: string) {
+  const ext = extname(filePath).toLowerCase()
+  if (!ext) {
+    throw new Error('Files without an extension cannot be opened from zspark')
+  }
+  if (!SHELL_OPEN_ALLOWED_EXTENSIONS.has(ext)) {
+    throw new Error(`Opening ${ext} files from zspark is not allowed`)
+  }
+}
+
 function resolveCodexBinary(): string {
   const dev = join(__dirname, '..', '..', '..', 'codex-rs', 'target', 'release',
     process.platform === 'win32' ? 'codex.exe' : 'codex')
@@ -332,11 +357,22 @@ function normalizeProviderBaseUrl(rawBaseUrl: string): string {
 }
 
 function workspaceRuntimeInfo() {
-  const available = existsSync(CODEX_RUNTIME_NODE) && existsSync(CODEX_RUNTIME_NODE_MODULES) && existsSync(CODEX_RUNTIME_PYTHON)
+  const runtimeRoot = resolve(CODEX_RUNTIME_DEPS_DIR)
+  const nodePath = resolve(CODEX_RUNTIME_NODE)
+  const nodeModulesPath = resolve(CODEX_RUNTIME_NODE_MODULES)
+  const pythonPath = resolve(CODEX_RUNTIME_PYTHON)
+  // Reject any runtime path that escapes the cache root, so a malicious
+  // symlink can't be used to silently prepend an attacker-controlled
+  // directory to PATH.
+  const insideRoot =
+    isInsidePath(runtimeRoot, nodePath) &&
+    isInsidePath(runtimeRoot, nodeModulesPath) &&
+    isInsidePath(runtimeRoot, pythonPath)
+  const available = insideRoot && existsSync(nodePath) && existsSync(nodeModulesPath) && existsSync(pythonPath)
   return {
-    nodePath: CODEX_RUNTIME_NODE,
-    nodeModulesPath: CODEX_RUNTIME_NODE_MODULES,
-    pythonPath: CODEX_RUNTIME_PYTHON,
+    nodePath,
+    nodeModulesPath,
+    pythonPath,
     available
   }
 }
@@ -459,6 +495,13 @@ function spawnCodex() {
   rotateLogIfLarge(logPath)
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' })
   logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(providerArgs)} ===\n`)
+  let logStreamClosed = false
+  const closeLogStream = (suffix: string) => {
+    if (logStreamClosed) return
+    logStreamClosed = true
+    try { logStream.write(suffix) } catch {}
+    try { logStream.end() } catch {}
+  }
   const child = spawn(bin, [...providerArgs, 'app-server'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     cwd: WORKSPACE_ROOT,
@@ -477,15 +520,54 @@ function spawnCodex() {
     logStream.write(formatCodexLogChunk('stderr', s))
     mainWindow?.webContents.send('codex:stderr', s)
   })
+  child.on('error', (err) => {
+    // Spawn-time failure (ENOENT, EACCES, ...). The 'exit' handler may not
+    // fire, so we have to release the log fd and notify the renderer here.
+    closeLogStream(`[error] ${err?.message ?? String(err)}\n`)
+    if (codex === child) {
+      codex = null
+      mainWindow?.webContents.send('codex:exit', null)
+    }
+  })
   child.on('exit', (code) => {
-    logStream.write(`[exit] ${code}\n`)
-    logStream.end()
+    closeLogStream(`[exit] ${code}\n`)
     if (codex === child) {
       codex = null
       mainWindow?.webContents.send('codex:exit', code)
     }
   })
   mainWindow?.webContents.send('codex:spawned')
+  return child
+}
+
+const CODEX_KILL_GRACE_MS = 4_000
+
+async function killCodex(child: ChildProcessWithoutNullStreams | null): Promise<void> {
+  if (!child || child.killed || child.exitCode !== null) return
+  await new Promise<void>((resolveExit) => {
+    let done = false
+    const finish = () => {
+      if (done) return
+      done = true
+      clearTimeout(forceKillTimer)
+      resolveExit()
+    }
+    child.once('exit', finish)
+    child.once('error', finish)
+    try { child.kill() } catch { finish(); return }
+    const forceKillTimer = setTimeout(() => {
+      try { child.kill('SIGKILL') } catch {}
+      // SIGKILL guarantees an exit shortly; give the listener one more tick.
+      setTimeout(finish, 250)
+    }, CODEX_KILL_GRACE_MS)
+  })
+}
+
+async function restartCodex() {
+  const old = codex
+  codex = null
+  await killCodex(old)
+  spawnCodex()
 }
 
 function createWindow() {
@@ -526,9 +608,8 @@ ipcMain.handle('codex:send', (_e, line: string) => {
   return true
 })
 
-ipcMain.handle('codex:restart', () => {
-  codex?.kill()
-  spawnCodex()
+ipcMain.handle('codex:restart', async () => {
+  await restartCodex()
   return true
 })
 
@@ -538,7 +619,7 @@ ipcMain.handle('settings:get', () => {
   return safeSettingsView(s)
 })
 
-ipcMain.handle('settings:save', (_e, partial: AppSettings) => {
+ipcMain.handle('settings:save', async (_e, partial: AppSettings) => {
   // If the renderer sends back the masked key, keep the existing one.
   const cur = loadSettings()
   const next: AppSettings = { ...cur, ...partial }
@@ -555,9 +636,10 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => {
   }
   saveSettings(next)
   if (partial.provider) {
-    // Restart codex with new provider so the change takes effect immediately.
-    codex?.kill()
-    spawnCodex()
+    // Restart codex with new provider so the change takes effect immediately,
+    // but wait for the old child to exit so the next spawn doesn't race a
+    // still-alive process for stdin / log fd.
+    await restartCodex()
   }
   return { ok: true, warnings: settingsWarnings(next) }
 })
@@ -681,6 +763,9 @@ ipcMain.handle('enterprise:uploadArtifact', (_e, workspaceId: string, sessionId:
     if (!existsSync(safePath)) return { ok: false, error: 'File does not exist' }
     const stat = statSync(safePath)
     if (!stat.isFile()) return { ok: false, error: 'Path is not a file' }
+    if (stat.size > MAX_ARTIFACT_UPLOAD_BYTES) {
+      return { ok: false, error: `File exceeds the ${Math.round(MAX_ARTIFACT_UPLOAD_BYTES / (1024 * 1024))} MB upload limit` }
+    }
     const content = readFileSync(safePath)
     return enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts`, {
       method: 'POST',
@@ -763,6 +848,7 @@ ipcMain.handle('path:open', async (_e, filePath: string) => {
   try {
     if (!filePath) return { ok: false, error: 'Missing file path' }
     const safePath = resolveAllowedLocalPath(filePath)
+    ensureShellOpenAllowed(safePath)
     const error = await shell.openPath(safePath)
     return error ? { ok: false, error } : { ok: true }
   } catch (err: any) {
@@ -847,7 +933,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', () => {
-  codex?.kill()
+  void killCodex(codex)
   bridgeClose?.()
   if (process.platform !== 'darwin') app.quit()
 })

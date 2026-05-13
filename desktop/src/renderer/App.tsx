@@ -632,7 +632,10 @@ function Markdown({ text }: { text: string }) {
     const normalized = normalizeMarkdownForDisplay(text || '')
     const sanitized = DOMPurify.sanitize(marked.parse(normalized, { async: false }) as string, {
       ADD_ATTR: ['target', 'rel'],
-      ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i
+      // Only allow http(s)/mailto, fragments, and relative paths. The previous
+      // regex was too permissive — anything whose first character was not a–z
+      // (e.g. encoded `%` schemes) slipped through.
+      ALLOWED_URI_REGEXP: /^(?:https?:|mailto:|#|\/|\.{1,2}\/)/i
     })
     return secureMarkdownLinks(sanitized)
   }, [text])
@@ -640,8 +643,13 @@ function Markdown({ text }: { text: string }) {
     const link = (event.target as Element | null)?.closest?.('a[href]')
     const href = link?.getAttribute('href') ?? ''
     if (!link) return
+    if (!/^(https?:|mailto:)/i.test(href)) {
+      // Block unknown / unsafe schemes (e.g. `javascript:`, `file:`). Safe
+      // schemes (relative URLs, fragments) are left to the browser default.
+      if (href && !/^(?:#|\/|\.{1,2}\/)/.test(href)) event.preventDefault()
+      return
+    }
     event.preventDefault()
-    if (!/^(https?:|mailto:)/i.test(href)) return
     void window.zspark.openExternalUrl(href)
   }
   return <div className="md" onClick={onClick} onAuxClick={onClick} dangerouslySetInnerHTML={{ __html: html }} />
@@ -1788,8 +1796,10 @@ function DesktopApp() {
 
   const toast = (kind: ToastKind, text: string) => {
     const id = `t-${Date.now()}-${Math.random()}`
-    setToasts((p) => [...p, { id, kind, text }])
-    if (kind !== 'error') setTimeout(() => dismiss(id), 4000)
+    // Cap on-screen toasts to keep the corner stack readable, and auto-dismiss
+    // every kind (errors stay longer but no longer pile up forever).
+    setToasts((p) => [...p, { id, kind, text }].slice(-8))
+    setTimeout(() => dismiss(id), kind === 'error' ? 12000 : 4000)
   }
   const dismiss = (id: string) => setToasts((p) => p.filter((t) => t.id !== id))
   const clearComposerText = () => {
@@ -2944,7 +2954,12 @@ function DesktopApp() {
     const offStdout = window.zspark.onStdout((chunk) => {
       buf.current += chunk
       if (buf.current.length > MAX_STDOUT_BUFFER_CHARS) {
-        buf.current = buf.current.slice(-MAX_STDOUT_BUFFER_CHARS)
+        // Drop the leading garbage *up to* the next newline so the next parse
+        // starts on a clean line boundary. Slicing the raw tail used to leave
+        // a half-line at the head, which then failed JSON.parse silently and
+        // dropped a real frame on the floor.
+        const safeNl = buf.current.indexOf('\n', buf.current.length - MAX_STDOUT_BUFFER_CHARS)
+        buf.current = safeNl === -1 ? '' : buf.current.slice(safeNl + 1)
       }
       let nl: number
       while ((nl = buf.current.indexOf('\n')) !== -1) {

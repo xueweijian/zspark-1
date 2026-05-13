@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { createReadStream, existsSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdir, unlink, writeFile } from 'node:fs/promises'
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
 import { z } from 'zod'
@@ -125,29 +125,36 @@ export async function registerArtifactRoutes(app: FastifyInstance, env: Artifact
     const name = safeFileName(body.name?.trim() || 'artifact')
     const sha256 = createHash('sha256').update(content).digest('hex')
     const storagePath = await writeArtifactFile(root, id, content)
-    const result = await pool.query(
-      `
-        INSERT INTO artifacts (
-          id, workspace_id, session_id, created_by, name, mime_type,
-          size_bytes, sha256, local_path, turn_id, storage_path, content
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)
-        RETURNING id, workspace_id, session_id, name, mime_type, size_bytes, sha256, local_path, turn_id, created_at
-      `,
-      [
-        id,
-        workspaceId,
-        sessionId,
-        displayPrincipal(req),
-        name,
-        body.mimeType?.trim() || null,
-        content.length,
-        sha256,
-        body.localPath || null,
-        body.turnId || null,
-        storagePath
-      ]
-    )
+    let result
+    try {
+      result = await pool.query(
+        `
+          INSERT INTO artifacts (
+            id, workspace_id, session_id, created_by, name, mime_type,
+            size_bytes, sha256, local_path, turn_id, storage_path, content
+          )
+          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, NULL)
+          RETURNING id, workspace_id, session_id, name, mime_type, size_bytes, sha256, local_path, turn_id, created_at
+        `,
+        [
+          id,
+          workspaceId,
+          sessionId,
+          displayPrincipal(req),
+          name,
+          body.mimeType?.trim() || null,
+          content.length,
+          sha256,
+          body.localPath || null,
+          body.turnId || null,
+          storagePath
+        ]
+      )
+    } catch (err) {
+      // Avoid orphan files on disk if the row insert fails.
+      await unlink(storagePath).catch(() => {})
+      throw err
+    }
     await pool.query('UPDATE sessions SET updated_at = now() WHERE id = $1 AND workspace_id = $2', [sessionId, workspaceId])
     await pool.query('UPDATE workspaces SET updated_at = now() WHERE id = $1', [workspaceId])
     return reply.code(201).send({ artifact: artifactMetadata(result.rows[0]) })
