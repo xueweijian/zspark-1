@@ -37,7 +37,8 @@ export type ActivityInfo = {
 }
 
 export type ApprovalKind = 'command' | 'fileChange' | 'permissions'
-export type ApprovalStatus = 'pending' | 'sending' | 'approved' | 'denied' | 'resolved'
+export type ApprovalDecisionMode = 'approve' | 'approveAll' | 'deny'
+export type ApprovalStatus = 'pending' | 'sending' | 'approved' | 'approvedAll' | 'denied' | 'resolved'
 
 export interface ApprovalRequest {
   id: JsonRpcId

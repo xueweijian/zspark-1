@@ -13,7 +13,8 @@ import {
   scopeLabel,
   sharedArtifactPath,
   stripInternalPromptContext,
-  titleFromBlocks
+  titleFromBlocks,
+  upsertApprovalBlockByTurnOrder
 } from './appHelpers'
 
 describe('formatting', () => {
@@ -102,5 +103,27 @@ describe('blocksFromSharedSnapshot', () => {
     expect(out).toHaveLength(2)
     expect(out[0]).toMatchObject({ type: 'files', files: [{ source: 'change', status: 'missing' }] })
     expect(out[1]).toMatchObject({ type: 'turn', status: 'interrupted', activities: [{ id: 'a', kind: 'command', status: 'running' }] })
+  })
+})
+
+describe('upsertApprovalBlockByTurnOrder', () => {
+  test('adds newer approvals after older same-turn blocks', () => {
+    const blocks = [
+      { type: 'user', id: 'u', text: 'make a deck', turnId: 't1' },
+      { type: 'turn', id: 't', turnId: 't1', activities: [], collapsed: false, startedAt: 1 },
+      { type: 'approval', id: 'a1', turnId: 't1', request: { key: 'a1' } },
+      { type: 'agent', id: 'm', text: 'working', turnId: 't1' }
+    ] as any
+    const next = upsertApprovalBlockByTurnOrder(blocks, { type: 'approval', id: 'a2', turnId: 't1', request: { key: 'a2' } } as any)
+    expect(next.map((block) => block.id)).toEqual(['u', 't', 'a1', 'm', 'a2'])
+  })
+
+  test('replaces an existing approval in place', () => {
+    const blocks = [
+      { type: 'approval', id: 'old', turnId: 't1', request: { key: 'same', status: 'pending' } },
+      { type: 'approval', id: 'later', turnId: 't1', request: { key: 'later' } }
+    ] as any
+    const next = upsertApprovalBlockByTurnOrder(blocks, { type: 'approval', id: 'new', turnId: 't1', request: { key: 'same', status: 'approvedAll' } } as any)
+    expect(next.map((block) => block.id)).toEqual(['new', 'later'])
   })
 })

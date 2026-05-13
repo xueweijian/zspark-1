@@ -97,7 +97,7 @@ const ACTIVITY_STATUSES = new Set(['running', 'done', 'failed'])
 const FILE_SOURCES = new Set(['attachment', 'change'])
 const FILE_STATUSES = new Set(['attached', 'created', 'modified', 'deleted', 'missing'])
 const APPROVAL_KINDS = new Set(['command', 'fileChange', 'permissions'])
-const APPROVAL_STATUSES = new Set(['pending', 'sending', 'approved', 'denied', 'resolved'])
+const APPROVAL_STATUSES = new Set(['pending', 'sending', 'approved', 'approvedAll', 'denied', 'resolved'])
 const TURN_BLOCK_STATUSES = new Set(['running', 'completed', 'interrupted', 'failed'])
 
 function normalizeSnapshotActivity(activity: any): Activity | null {
@@ -233,6 +233,18 @@ export function blocksFromSharedSnapshot(snapshot?: SharedSessionSnapshot | null
   return blocks
     .map(normalizeSnapshotBlock)
     .filter((block: Block | null): block is Block => Boolean(block))
+}
+
+export function upsertApprovalBlockByTurnOrder(blocks: Block[], block: Extract<Block, { type: 'approval' }>): Block[] {
+  const existing = blocks.findIndex((candidate) => candidate.type === 'approval' && candidate.request.key === block.request.key)
+  if (existing !== -1) return blocks.map((candidate, index) => (index === existing ? block : candidate))
+
+  let insertAfter = -1
+  blocks.forEach((candidate, index) => {
+    if ('turnId' in candidate && candidate.turnId === block.turnId) insertAfter = index
+  })
+  if (insertAfter === -1) return [...blocks, block]
+  return [...blocks.slice(0, insertAfter + 1), block, ...blocks.slice(insertAfter + 1)]
 }
 
 export function formatUserInputContent(content: any[]): string {

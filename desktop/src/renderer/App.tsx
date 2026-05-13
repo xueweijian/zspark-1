@@ -30,12 +30,18 @@ import {
   shouldRecoverFromProviderRetry,
   type CompletedTurnWorkKind
 } from './turnRecovery'
+import {
+  approvalResponsePayload,
+  approvalStatusForDecision,
+  approvalStatusLabel
+} from './approvalHelpers'
 import type {
   Activity,
   ActivityActionKind,
   ActivityInfo,
   ActivityKind,
   AppSettingsView,
+  ApprovalDecisionMode,
   ApprovalKind,
   ApprovalRequest,
   ApprovalStatus,
@@ -103,7 +109,8 @@ import {
   skillStatusLabel,
   stripInternalPromptContext,
   titleFromBlocks,
-  turnIdFromParams
+  turnIdFromParams,
+  upsertApprovalBlockByTurnOrder
 } from './appHelpers'
 import {
   ACTIVITY_STORAGE_PREFIX,
@@ -396,27 +403,6 @@ function approvalKindForMethod(method: string): ApprovalKind | null {
   }
 }
 
-function approvalStatusLabel(status: ApprovalStatus) {
-  switch (status) {
-    case 'pending': return 'Needs approval'
-    case 'sending': return 'Sending decision'
-    case 'approved': return 'Approved'
-    case 'denied': return 'Denied'
-    case 'resolved': return 'No longer needed'
-  }
-}
-
-function approvalDecision(params: any, approved: boolean) {
-  if (!approved) {
-    const decisions = Array.isArray(params?.availableDecisions) ? params.availableDecisions : []
-    return decisions.includes('decline') ? 'decline' : decisions.includes('cancel') ? 'cancel' : 'decline'
-  }
-  const decisions = Array.isArray(params?.availableDecisions) ? params.availableDecisions : []
-  if (decisions.includes('accept')) return 'accept'
-  if (decisions.includes('acceptForSession')) return 'acceptForSession'
-  return 'accept'
-}
-
 function uniqueCompact(values: Array<string | undefined | null>) {
   const seen = new Set<string>()
   const out: string[] = []
@@ -452,21 +438,6 @@ function permissionSummary(permissions: any) {
   if (paths.length) parts.push(`${paths.length} filesystem path${paths.length === 1 ? '' : 's'}`)
   if (permissions?.network?.enabled) parts.push('network access')
   return parts.length ? parts.join(' and ') : 'extra access'
-}
-
-function grantedPermissionsFromRequest(permissions: any) {
-  const granted: any = {}
-  if (permissions?.network?.enabled) granted.network = { enabled: true }
-  const fs = permissions?.fileSystem
-  if (fs) {
-    const fileSystem: any = {}
-    if (Array.isArray(fs.read) && fs.read.length) fileSystem.read = fs.read
-    if (Array.isArray(fs.write) && fs.write.length) fileSystem.write = fs.write
-    if (Array.isArray(fs.entries) && fs.entries.length) fileSystem.entries = fs.entries
-    if (typeof fs.globScanMaxDepth === 'number') fileSystem.globScanMaxDepth = fs.globScanMaxDepth
-    if (Object.keys(fileSystem).length) granted.fileSystem = fileSystem
-  }
-  return granted
 }
 
 function approvalRequestFromServer(id: JsonRpcId, method: string, params: any): ApprovalRequest | null {
@@ -539,28 +510,18 @@ function approvalRequestFromServer(id: JsonRpcId, method: string, params: any): 
   }
 }
 
-function approvalResponsePayload(request: ApprovalRequest, approved: boolean) {
-  if (request.method === 'execCommandApproval' || request.method === 'applyPatchApproval') {
-    return { decision: approved ? 'approved' : 'denied' }
-  }
-  if (request.kind === 'permissions') {
-    return approved
-      ? { scope: 'turn', permissions: grantedPermissionsFromRequest(request.params?.permissions) }
-      : { scope: 'turn', permissions: {} }
-  }
-  return { decision: approvalDecision(request.params, approved) }
-}
-
 function ApprovalCard({
   request,
   onDecision
 }: {
   request: ApprovalRequest
-  onDecision: (request: ApprovalRequest, approved: boolean) => void
+  onDecision: (request: ApprovalRequest, mode: ApprovalDecisionMode) => void
 }) {
   const actionable = request.status === 'pending'
+  const compact = !actionable
+  const approvedAll = request.status === 'approvedAll'
   return (
-    <div className={`approval-card approval-${request.status}`}>
+    <div className={`approval-card approval-${request.status}${compact ? ' approval-compact' : ''}`}>
       <div className="approval-mark"><IconShield /></div>
       <div className="approval-content">
         <div className="approval-topline">
@@ -568,8 +529,9 @@ function ApprovalCard({
           <em>{approvalStatusLabel(request.status)}</em>
         </div>
         <div className="approval-title">{request.title}</div>
-        <div className="approval-desc">{request.description}</div>
-        {(request.reason || request.cwd || request.detail || request.commandPreview || request.paths.length > 0) && (
+        {!compact && <div className="approval-desc">{request.description}</div>}
+        {compact && approvedAll && <div className="approval-desc">Future matching actions can continue without another prompt.</div>}
+        {!compact && (request.reason || request.cwd || request.detail || request.commandPreview || request.paths.length > 0) && (
           <div className="approval-meta">
             {request.reason && <div><strong>Reason</strong><span>{request.reason}</span></div>}
             {request.cwd && <div><strong>Working folder</strong><span title={request.cwd}>{shortPath(request.cwd)}</span></div>}
@@ -580,10 +542,13 @@ function ApprovalCard({
             {request.commandPreview && <div className="approval-command"><strong>Command</strong><span>{request.commandPreview}</span></div>}
           </div>
         )}
-        <div className="approval-actions">
-          <button className="approval-approve" disabled={!actionable} onClick={() => onDecision(request, true)}>Approve</button>
-          <button className="approval-deny" disabled={!actionable} onClick={() => onDecision(request, false)}>Deny</button>
-        </div>
+        {actionable && (
+          <div className="approval-actions">
+            <button className="approval-approve" onClick={() => onDecision(request, 'approve')}>Approve</button>
+            <button className="approval-approve-all" onClick={() => onDecision(request, 'approveAll')}>Approve all</button>
+            <button className="approval-deny" onClick={() => onDecision(request, 'deny')}>Deny</button>
+          </div>
+        )}
       </div>
     </div>
   )
@@ -1550,21 +1515,14 @@ function DesktopApp() {
       })
     }
     setBlocks((bs) => {
-      const existing = bs.findIndex((b) => b.type === 'approval' && b.request.key === request.key)
-      const block: Block = { type: 'approval', id: request.blockId, turnId: request.turnId, request }
-      if (existing !== -1) return bs.map((b, index) => (index === existing ? block : b))
-
-      const turnIndex = bs.findIndex((b) => b.type === 'turn' && b.turnId === request.turnId)
-      if (turnIndex !== -1) return [...bs.slice(0, turnIndex + 1), block, ...bs.slice(turnIndex + 1)]
-      const userIndex = bs.findIndex((b) => b.type === 'user' && b.turnId === request.turnId)
-      if (userIndex !== -1) return [...bs.slice(0, userIndex + 1), block, ...bs.slice(userIndex + 1)]
-      return [...bs, block]
+      const block: Extract<Block, { type: 'approval' }> = { type: 'approval', id: request.blockId, turnId: request.turnId, request }
+      return upsertApprovalBlockByTurnOrder(bs, block)
     })
   }
   const resolveApprovalRequest = (requestId: JsonRpcId) => {
     const key = rpcKey(requestId)
     const request = approvalRequests.current.get(key)
-    if (!request || request.status === 'approved' || request.status === 'denied') return
+    if (!request || request.status === 'approved' || request.status === 'approvedAll' || request.status === 'denied') return
     setApprovalStatus(key, 'resolved')
   }
   const handleServerRequest = (id: JsonRpcId, method: string, params: any) => {
@@ -1583,18 +1541,19 @@ function DesktopApp() {
     upsertApprovalBlock(request)
     scrollToLatest('smooth')
   }
-  const respondApproval = async (request: ApprovalRequest, approved: boolean) => {
+  const respondApproval = async (request: ApprovalRequest, mode: ApprovalDecisionMode) => {
     if (request.status !== 'pending') return
     setApprovalStatus(request.key, 'sending')
     try {
-      const ok = await sendRpcResult(request.id, approvalResponsePayload(request, approved))
+      const ok = await sendRpcResult(request.id, approvalResponsePayload(request, mode))
       if (!ok) throw new Error('Codex process is not running')
-      setApprovalStatus(request.key, approved ? 'approved' : 'denied')
+      const status = approvalStatusForDecision(mode)
+      setApprovalStatus(request.key, status)
       if (request.turnId) {
         updateActivity(request.turnId, `a-approval-${request.key}`, {
-          status: approved ? 'done' : 'failed',
+          status: mode === 'deny' ? 'failed' : 'done',
           endedAt: Date.now(),
-          title: approved ? 'Approval granted' : 'Approval denied',
+          title: mode === 'approveAll' ? 'Approval granted for this session' : mode === 'approve' ? 'Approval granted' : 'Approval denied',
           detail: request.title
         })
       }
@@ -3107,7 +3066,7 @@ function DesktopApp() {
                   <ApprovalCard
                     key={b.id}
                     request={b.request}
-                    onDecision={(request, approved) => void respondApproval(request, approved)}
+                    onDecision={(request, mode) => void respondApproval(request, mode)}
                   />
                 )
               }

@@ -213,16 +213,23 @@ input,textarea,select{font:inherit}
 .approval-actions button:disabled{cursor:not-allowed;opacity:.55;transform:none}
 .approval-approve{background:#2563eb;color:#fff;box-shadow:0 8px 20px rgba(37,99,235,.18)}
 .approval-approve:hover:not(:disabled){background:#1d4ed8}
+.approval-approve-all{background:#0f172a;color:#fff;box-shadow:0 8px 20px rgba(15,23,42,.16)}
+.approval-approve-all:hover:not(:disabled){background:#020617}
 .approval-deny{background:#fff;color:#334155;border-color:#cbd5e1!important}
 .approval-deny:hover:not(:disabled){background:#f8fafc;border-color:#94a3b8!important}
-.approval-approved{border-color:#bbf7d0;background:linear-gradient(180deg,#f0fdf4 0%,#fff 78%);box-shadow:0 8px 22px rgba(22,163,74,.08)}
-.approval-approved .approval-mark{background:#16a34a;box-shadow:0 8px 20px rgba(22,163,74,.18)}
-.approval-approved .approval-topline,.approval-approved .approval-topline em{color:#15803d}
-.approval-approved .approval-topline em{background:#dcfce7}
+.approval-approved,.approval-approvedAll{border-color:#bbf7d0;background:linear-gradient(180deg,#f0fdf4 0%,#fff 78%);box-shadow:0 8px 22px rgba(22,163,74,.08)}
+.approval-approved .approval-mark,.approval-approvedAll .approval-mark{background:#16a34a;box-shadow:0 8px 20px rgba(22,163,74,.18)}
+.approval-approved .approval-topline,.approval-approved .approval-topline em,.approval-approvedAll .approval-topline,.approval-approvedAll .approval-topline em{color:#15803d}
+.approval-approved .approval-topline em,.approval-approvedAll .approval-topline em{background:#dcfce7}
 .approval-denied,.approval-resolved{border-color:#e4e4e7;background:#fff;box-shadow:none}
 .approval-denied .approval-mark,.approval-resolved .approval-mark{background:#71717a;box-shadow:none}
 .approval-denied .approval-topline,.approval-denied .approval-topline em,.approval-resolved .approval-topline,.approval-resolved .approval-topline em{color:#52525b}
 .approval-denied .approval-topline em,.approval-resolved .approval-topline em{background:#f4f4f5}
+.approval-compact{width:min(560px,100%);grid-template-columns:30px minmax(0,1fr);padding:8px 10px;border-radius:9px;box-shadow:none}
+.approval-compact .approval-mark{width:30px;height:30px;border-radius:8px;box-shadow:none}
+.approval-compact .approval-content{gap:2px}
+.approval-compact .approval-title{font-size:13px}
+.approval-compact .approval-desc{font-size:12px;line-height:1.35}
 @media (max-width:760px){.approval-card{grid-template-columns:1fr}.approval-mark{display:none}.approval-meta{grid-template-columns:1fr}.approval-actions button{flex:1;min-width:0}}
 
 /* Toast notifications */
