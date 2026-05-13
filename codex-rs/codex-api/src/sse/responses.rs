@@ -14,6 +14,7 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::BufRead;
 use std::path::Path;
 use std::sync::Arc;
@@ -137,6 +138,88 @@ struct ResponseCompleted {
     usage: Option<ResponseCompletedUsage>,
     #[serde(default)]
     end_turn: Option<bool>,
+}
+
+#[derive(Default)]
+pub(crate) struct CompletedOutputTracker {
+    seen_item_ids: HashSet<String>,
+    seen_items_without_ids: Vec<ResponseItem>,
+}
+
+impl CompletedOutputTracker {
+    pub(crate) fn record_output_item(&mut self, item: &ResponseItem) {
+        if let Some(id) = response_item_id(item) {
+            self.seen_item_ids.insert(id.to_string());
+        } else {
+            self.seen_items_without_ids.push(item.clone());
+        }
+    }
+
+    pub(crate) fn missing_output_items(
+        &mut self,
+        event: &ResponsesStreamEvent,
+    ) -> Vec<ResponseItem> {
+        if event.kind != "response.completed" {
+            return Vec::new();
+        }
+
+        let Some(output) = event
+            .response
+            .as_ref()
+            .and_then(|response| response.get("output"))
+        else {
+            return Vec::new();
+        };
+
+        let Ok(items) = serde_json::from_value::<Vec<ResponseItem>>(output.clone()) else {
+            debug!("failed to parse ResponseItems from response.completed output");
+            return Vec::new();
+        };
+
+        let mut missing = Vec::new();
+        for item in items {
+            if self.has_seen(&item) {
+                continue;
+            }
+            self.record_output_item(&item);
+            missing.push(item);
+        }
+        missing
+    }
+
+    fn has_seen(&self, item: &ResponseItem) -> bool {
+        if let Some(id) = response_item_id(item) {
+            self.seen_item_ids.contains(id)
+        } else {
+            self.seen_items_without_ids.iter().any(|seen| seen == item)
+        }
+    }
+}
+
+fn response_item_id(item: &ResponseItem) -> Option<&str> {
+    match item {
+        ResponseItem::Message { id: Some(id), .. }
+        | ResponseItem::FunctionCall { id: Some(id), .. }
+        | ResponseItem::ToolSearchCall { id: Some(id), .. }
+        | ResponseItem::LocalShellCall { id: Some(id), .. }
+        | ResponseItem::CustomToolCall { id: Some(id), .. }
+        | ResponseItem::WebSearchCall { id: Some(id), .. } => Some(id.as_str()),
+        ResponseItem::ImageGenerationCall { id, .. } => Some(id.as_str()),
+        ResponseItem::Reasoning { id, .. } if !id.is_empty() => Some(id.as_str()),
+        ResponseItem::Message { id: None, .. }
+        | ResponseItem::Reasoning { .. }
+        | ResponseItem::LocalShellCall { id: None, .. }
+        | ResponseItem::FunctionCall { id: None, .. }
+        | ResponseItem::ToolSearchCall { id: None, .. }
+        | ResponseItem::FunctionCallOutput { .. }
+        | ResponseItem::CustomToolCall { id: None, .. }
+        | ResponseItem::CustomToolCallOutput { .. }
+        | ResponseItem::ToolSearchOutput { .. }
+        | ResponseItem::WebSearchCall { id: None, .. }
+        | ResponseItem::Compaction { .. }
+        | ResponseItem::ContextCompaction { .. }
+        | ResponseItem::Other => None,
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -439,6 +522,7 @@ pub async fn process_sse(
     let mut stream = stream.eventsource();
     let mut response_error: Option<ApiError> = None;
     let mut last_server_model: Option<String> = None;
+    let mut completed_output_tracker = CompletedOutputTracker::default();
 
     loop {
         let start = Instant::now();
@@ -500,9 +584,24 @@ pub async fn process_sse(
             return;
         }
 
+        let missing_completed_output_items = completed_output_tracker.missing_output_items(&event);
         match process_responses_event(event) {
             Ok(Some(event)) => {
                 let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                if let ResponseEvent::OutputItemDone(item) = &event {
+                    completed_output_tracker.record_output_item(item);
+                }
+                if is_completed {
+                    for item in missing_completed_output_items {
+                        if tx_event
+                            .send(Ok(ResponseEvent::OutputItemDone(item)))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -727,6 +826,85 @@ mod tests {
             }
             other => panic!("unexpected third event: {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn process_sse_emits_missing_items_from_completed_output() {
+        let events = run_sse(vec![json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp1",
+                "output": [
+                    {
+                        "id": "rs_1",
+                        "type": "reasoning",
+                        "summary": [],
+                        "encrypted_content": "encrypted"
+                    },
+                    {
+                        "id": "fc_1",
+                        "type": "function_call",
+                        "name": "shell",
+                        "arguments": "{}",
+                        "call_id": "call_1"
+                    }
+                ]
+            }
+        })])
+        .await;
+
+        assert_eq!(events.len(), 3);
+        assert_matches!(
+            &events[0],
+            ResponseEvent::OutputItemDone(ResponseItem::Reasoning { id, .. }) if id == "rs_1"
+        );
+        assert_matches!(
+            &events[1],
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                id: Some(id),
+                call_id,
+                ..
+            }) if id == "fc_1" && call_id == "call_1"
+        );
+        assert_matches!(
+            &events[2],
+            ResponseEvent::Completed {
+                response_id,
+                token_usage: None,
+                end_turn: None,
+            } if response_id == "resp1"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_sse_does_not_duplicate_completed_output_items() {
+        let reasoning = json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "encrypted"
+        });
+        let events = run_sse(vec![
+            json!({
+                "type": "response.output_item.done",
+                "item": reasoning.clone()
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp1",
+                    "output": [reasoning]
+                }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 2);
+        assert_matches!(
+            &events[0],
+            ResponseEvent::OutputItemDone(ResponseItem::Reasoning { id, .. }) if id == "rs_1"
+        );
+        assert_matches!(&events[1], ResponseEvent::Completed { .. });
     }
 
     #[tokio::test]

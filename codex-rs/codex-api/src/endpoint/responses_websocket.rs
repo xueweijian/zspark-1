@@ -6,6 +6,7 @@ use crate::common::ResponsesWsRequest;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
+use crate::sse::CompletedOutputTracker;
 use crate::sse::ResponsesStreamEvent;
 use crate::sse::process_responses_event;
 use crate::telemetry::WebsocketTelemetry;
@@ -580,6 +581,7 @@ async fn run_websocket_response_stream(
     connection_reused: bool,
 ) -> Result<(), ApiError> {
     let mut last_server_model: Option<String> = None;
+    let mut completed_output_tracker = CompletedOutputTracker::default();
     send_websocket_request(
         ws_stream,
         request_body,
@@ -654,9 +656,20 @@ async fn run_websocket_response_stream(
                         "response event consumer dropped".to_string(),
                     ));
                 }
+                let missing_completed_output_items =
+                    completed_output_tracker.missing_output_items(&event);
                 match process_responses_event(event) {
                     Ok(Some(event)) => {
                         let is_completed = matches!(event, ResponseEvent::Completed { .. });
+                        if let ResponseEvent::OutputItemDone(item) = &event {
+                            completed_output_tracker.record_output_item(item);
+                        }
+                        if is_completed {
+                            for item in missing_completed_output_items {
+                                let _ =
+                                    tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                            }
+                        }
                         let _ = tx_event.send(Ok(event)).await;
                         if is_completed {
                             break;
