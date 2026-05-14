@@ -20,7 +20,6 @@ import {
   dirname,
   extractArtifactPathCandidates,
   findRecentArtifactForCandidate,
-  isDisplayArtifactPath,
   resolveWorkspacePath,
   type RecentArtifactLike
 } from './artifacts'
@@ -1232,19 +1231,12 @@ function DesktopApp() {
     files: WorkspaceFile[],
     options: { title?: string; subtitle?: string; tone?: 'normal' | 'warn' } = {}
   ) => {
-    const artifactFiles = files.filter((file) => (
-      file.status === 'missing' ||
-      (file.status !== 'deleted' && isDisplayArtifactPath(file.path))
-    ))
     const displayFiles = activeSharedWorkspaceRef.current
-      ? artifactFiles.filter((file) => file.sharedArtifact || file.status === 'missing')
-      : artifactFiles
+      ? files.filter((file) => file.sharedArtifact || file.status === 'missing')
+      : files
     if (displayFiles.length === 0) return
     const id = `files-${itemId}`
-    const filteredSomeFiles = displayFiles.length !== files.length
-    const title = !filteredSomeFiles && options.title
-      ? options.title
-      : `${displayFiles.length} file${displayFiles.length === 1 ? '' : 's'} ready`
+    const title = options.title ?? `${displayFiles.length} file${displayFiles.length === 1 ? '' : 's'} ready`
     for (const file of displayFiles) {
       if (file.status !== 'missing') shownArtifactPaths.current.add(file.path)
     }
@@ -1378,7 +1370,7 @@ function DesktopApp() {
     try {
       const result = await window.zspark.scanRecentArtifacts({
         sinceMs: Math.max(0, startedAt - 2000),
-        limit: 12
+        limit: 1
       })
       let files: WorkspaceFile[] = result.artifacts
         .filter((artifact) => !shownArtifactPaths.current.has(artifact.path))
@@ -2223,7 +2215,6 @@ function DesktopApp() {
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'file', title, actionKind: 'file' })
               const files = filesFromChanges(changes, runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot)
               upsertWorkspaceFiles(files)
-              upsertArtifactBlock(turnId, itemId, files)
               updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail, actionKind: 'file' })
               noteCompletedTurnWork(turnId, 'file')
             }

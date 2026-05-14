@@ -1,6 +1,5 @@
 const ARTIFACT_EXTENSION_RE = /\.(pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip)\b/i
 const PATH_TOKEN_RE = /`([^`\n\r]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))`|["']([^"'\n\r]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))["']|([^\s`"'<>()[\]{}，。；：、]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))/gi
-const SCRATCH_ARTIFACT_SEGMENTS = new Set(['assets', 'layout', 'preview', 'qa', 'slides'])
 
 export interface RecentArtifactLike {
   name: string
@@ -50,13 +49,6 @@ function pathBasename(path: string) {
   const normalized = normalizeArtifactPath(path)
   const index = normalized.lastIndexOf('/')
   return index >= 0 ? normalized.slice(index + 1) : normalized
-}
-
-export function isDisplayArtifactPath(path: string) {
-  const normalized = normalizeArtifactPath(path)
-  if (!looksLikeWorkspaceArtifact(normalized, true)) return false
-  const segments = normalized.split('/').map((segment) => segment.toLowerCase())
-  return !segments.some((segment) => SCRATCH_ARTIFACT_SEGMENTS.has(segment))
 }
 
 export function findRecentArtifactForCandidate(

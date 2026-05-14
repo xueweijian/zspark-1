@@ -50,4 +50,24 @@ describe('artifact scanning', () => {
 
     expect(scanRecentArtifacts(workspace, { sinceMs: afterOldDeck })).toEqual([])
   })
+
+  test('can return only the newest deliverable for chat fallback cards', () => {
+    const workspace = tempDir()
+    const outputDir = join(workspace, 'outputs', 'turn-1', 'documents', 'demo', 'output')
+    mkdirSync(outputDir, { recursive: true })
+    const olderDoc = join(outputDir, 'draft.docx')
+    const finalDoc = join(outputDir, 'final.docx')
+    writeFileSync(olderDoc, 'draft')
+    writeFileSync(finalDoc, 'final')
+    const oldDate = new Date(Date.now() - 60_000)
+    utimesSync(olderDoc, oldDate, oldDate)
+
+    expect(scanRecentArtifacts(workspace, { sinceMs: 0, limit: 1 })).toEqual([
+      expect.objectContaining({
+        name: 'final.docx',
+        path: finalDoc,
+        size: 5
+      })
+    ])
+  })
 })
