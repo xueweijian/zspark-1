@@ -42,6 +42,15 @@ import {
 interface UpstreamConfig {
   baseUrl: string  // e.g. http://40.162.41.233:8001/v1 or .../chat/completions
   apiKey: string
+  /**
+   * When set to 'responses' (or when baseUrl ends with `/responses`), the
+   * bridge forwards `/v1/responses` requests verbatim instead of translating
+   * to chat-completions. This preserves `reasoning` items so the upstream
+   * Responses API can pair function_call ↔ reasoning across turns (the
+   * Responses API rejects orphaned function_call items with
+   * "provided without its required 'reasoning' item").
+   */
+  mode?: 'chat' | 'responses'
 }
 
 let upstream: UpstreamConfig | null = null
@@ -90,7 +99,7 @@ const CHAT_COMPLETIONS_SUFFIX = '/chat/completions'
 const RESPONSES_SUFFIX = '/responses'
 const MODELS_SUFFIX = '/models'
 
-function buildUpstreamUrl(rawBaseUrl: string, endpoint: typeof CHAT_COMPLETIONS_SUFFIX | typeof MODELS_SUFFIX): URL {
+function buildUpstreamUrl(rawBaseUrl: string, endpoint: typeof CHAT_COMPLETIONS_SUFFIX | typeof MODELS_SUFFIX | typeof RESPONSES_SUFFIX): URL {
   const url = new URL(rawBaseUrl.trim())
   let path = url.pathname.replace(/\/+$/, '')
   // Strip endpoint suffixes idempotently — a poorly-typed base URL like
@@ -260,11 +269,184 @@ function writeChatJsonAsResponsesJson(res: ServerResponse, ctx: ResponseContext,
 }
 
 
+function isResponsesUpstream(cfg: UpstreamConfig): boolean {
+  if (cfg.mode === 'responses') return true
+  try {
+    const path = new URL(cfg.baseUrl.trim()).pathname.replace(/\/+$/, '')
+    return path.endsWith(RESPONSES_SUFFIX)
+  } catch {
+    return false
+  }
+}
+
+/**
+ * Parse the OpenAI Responses error message:
+ *   "Item 'fc_…' of type 'function_call' was provided without its
+ *    required 'reasoning' item: 'rs_…'."
+ * Returns the orphaned function_call id (fc_…) we should strip from the
+ * next attempt, or null if the error is something else.
+ */
+function extractOrphanedFunctionCallId(raw: string): string | null {
+  const match = raw.match(/Item '([^']+)' of type 'function_call' was provided without its required 'reasoning' item/)
+  return match ? match[1] : null
+}
+
+/**
+ * Drop a specific function_call (by id or call_id) and its paired
+ * function_call_output from `payload.input`. Used for retry-after-400
+ * recovery when upstream complains about an orphaned reasoning pair.
+ */
+function stripFunctionCall(payload: any, fcIdentifier: string): { payload: any; dropped: boolean } {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) {
+    return { payload, dropped: false }
+  }
+  const items: any[] = payload.input
+  const orphanedCallIds = new Set<string>()
+  let dropped = false
+  const filtered: any[] = []
+  for (const item of items) {
+    if (item?.type === 'function_call') {
+      const itemId = typeof item.id === 'string' ? item.id : null
+      const callId = typeof item.call_id === 'string' ? item.call_id : null
+      if (itemId === fcIdentifier || callId === fcIdentifier) {
+        if (callId) orphanedCallIds.add(callId)
+        dropped = true
+        continue
+      }
+    }
+    if (item?.type === 'function_call_output' && typeof item.call_id === 'string' && orphanedCallIds.has(item.call_id)) {
+      continue
+    }
+    filtered.push(item)
+  }
+  if (!dropped) return { payload, dropped: false }
+  return { payload: { ...payload, input: filtered }, dropped: true }
+}
+
+const MAX_RESPONSES_RETRY_ATTEMPTS = 4
+
+function sendResponsesRequest(
+  cfg: UpstreamConfig,
+  body: Buffer,
+  stream: boolean,
+  onResponse: (res: ClientResponse) => void,
+  onError: (err: Error) => void,
+  registerReq: (req: ClientRequest) => void
+) {
+  const u = buildUpstreamUrl(cfg.baseUrl, RESPONSES_SUFFIX)
+  const reqLib = requestLibForUrl(u)
+  const upstreamReq = reqLib({
+    hostname: u.hostname,
+    port: u.port || (u.protocol === 'https:' ? 443 : 80),
+    path: u.pathname + u.search,
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      authorization: `Bearer ${cfg.apiKey}`,
+      accept: stream ? 'text/event-stream' : 'application/json'
+    }
+  }, onResponse)
+  upstreamReq.setTimeout(UPSTREAM_TIMEOUT_MS, () => {
+    upstreamReq.destroy(new Error('upstream timeout'))
+  })
+  upstreamReq.on('error', onError)
+  registerReq(upstreamReq)
+  upstreamReq.write(body)
+  upstreamReq.end()
+}
+
+async function handleResponsesPassthrough(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cfg: UpstreamConfig,
+  body: Buffer
+) {
+  // Sniff the original payload once. We only ever rebuild it when we have
+  // to retry after a 400 reasoning-orphan rejection.
+  let payload: any = null
+  let stream = false
+  try {
+    payload = JSON.parse(body.toString('utf8'))
+    stream = payload?.stream === true
+  } catch {}
+
+  let upstreamDone = false
+  let activeReq: ClientRequest | null = null
+  const abortUpstream = () => {
+    if (!upstreamDone) activeReq?.destroy(new Error('downstream closed'))
+  }
+  req.on('aborted', abortUpstream)
+  res.on('close', () => {
+    if (!upstreamDone && !res.writableEnded) abortUpstream()
+  })
+
+  const attempt = (currentBody: Buffer, attemptIndex: number): void => {
+    sendResponsesRequest(
+      cfg,
+      currentBody,
+      stream,
+      (upstreamRes) => {
+        upstreamRes.on('end', () => { upstreamDone = true })
+        upstreamRes.on('close', () => { upstreamDone = true })
+        const status = upstreamRes.statusCode ?? 502
+        // Only intercept 400s — they're the only ones that carry the
+        // reasoning-orphan error. Buffer the body so we can sniff it.
+        if (status === 400 && payload && attemptIndex < MAX_RESPONSES_RETRY_ATTEMPTS) {
+          const chunks: Buffer[] = []
+          upstreamRes.on('data', (c) => chunks.push(c))
+          upstreamRes.on('end', () => {
+            const raw = Buffer.concat(chunks).toString('utf8')
+            const orphanId = extractOrphanedFunctionCallId(raw)
+            if (orphanId) {
+              const { payload: cleaned, dropped } = stripFunctionCall(payload, orphanId)
+              if (dropped) {
+                payload = cleaned
+                const nextBody = Buffer.from(JSON.stringify(cleaned), 'utf8')
+                attempt(nextBody, attemptIndex + 1)
+                return
+              }
+            }
+            // Couldn't recover — forward the original 400 verbatim.
+            if (responseWritable(res)) {
+              res.writeHead(status, upstreamRes.headers as any)
+              res.end(raw)
+            }
+          })
+          upstreamRes.on('error', () => {
+            if (responseWritable(res)) writeJsonError(res, 502, 'upstream error')
+          })
+          return
+        }
+        if (responseWritable(res)) {
+          res.writeHead(status, upstreamRes.headers as any)
+          upstreamRes.pipe(res)
+        } else {
+          upstreamRes.resume()
+        }
+      },
+      (err) => {
+        upstreamDone = true
+        if (String(err.message).includes('downstream closed')) return
+        if (responseWritable(res)) {
+          writeJsonError(res, 502, `upstream error: ${err.message}`)
+        }
+      },
+      (req) => { activeReq = req }
+    )
+  }
+
+  attempt(body, 0)
+}
+
 async function handleResponses(req: IncomingMessage, res: ServerResponse, authToken?: string) {
   if (!isAuthorized(req, authToken)) { writeJsonError(res, 401, 'unauthorized'); return }
   const cfg = upstream
   if (!cfg) { res.writeHead(503).end('upstream not configured'); return }
   const body = await readBody(req)
+  if (isResponsesUpstream(cfg)) {
+    await handleResponsesPassthrough(req, res, cfg, body)
+    return
+  }
   let payload: any
   try { payload = JSON.parse(body.toString('utf8')) } catch { res.writeHead(400).end('bad json'); return }
 

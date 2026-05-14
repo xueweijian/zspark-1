@@ -520,4 +520,77 @@ describe('chat responses bridge', () => {
     expect(added).toContain('"name":"do_thing"')
     expect(added).not.toContain('"name":""')
   })
+
+  test('forwards /v1/responses verbatim when upstream mode is responses (preserves reasoning items)', async () => {
+    const upstream = await startUpstream((req, res, body) => {
+      // Critical: the bridge must forward our `input[]` AS-IS so reasoning
+      // items (rs_*) stay paired with their function_call (fc_*). The
+      // Responses API rejects orphaned function_call items.
+      expect(req.url).toBe('/v1/responses')
+      expect(Array.isArray(body.input)).toBe(true)
+      const types = body.input.map((item: any) => item.type)
+      expect(types).toEqual(['reasoning', 'function_call', 'function_call_output', 'message'])
+      jsonResponse(res, 200, { id: 'resp_x', object: 'response', status: 'completed', output: [] })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key', mode: 'responses' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: [
+        { type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: 'thinking' }] },
+        { type: 'function_call', id: 'fc_1', call_id: 'call_1', name: 'shell', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_1', output: 'ok' },
+        { type: 'message', role: 'user', content: 'next' }
+      ]
+    }, { authorization: 'Bearer test-token-ignored-no-auth' })
+
+    expect(response.status).toBe(200)
+    expect(upstream.requests).toHaveLength(1)
+  })
+
+  test('retries Responses passthrough after dropping orphaned function_call on 400', async () => {
+    let callCount = 0
+    const upstream = await startUpstream((_req, res, body) => {
+      callCount++
+      if (callCount === 1) {
+        // First attempt: payload includes the orphaned fc_bad item.
+        const types = body.input.map((item: any) => item.type)
+        expect(types).toContain('function_call')
+        jsonResponse(res, 400, {
+          error: {
+            message: "Item 'fc_bad' of type 'function_call' was provided without its required 'reasoning' item: 'rs_missing'.",
+            type: 'invalid_request_error'
+          }
+        })
+        return
+      }
+      // Retry: bridge must have stripped fc_bad + its function_call_output.
+      const ids = body.input.filter((i: any) => i.type === 'function_call').map((i: any) => i.id)
+      expect(ids).not.toContain('fc_bad')
+      const outputCallIds = body.input.filter((i: any) => i.type === 'function_call_output').map((i: any) => i.call_id)
+      expect(outputCallIds).not.toContain('call_bad')
+      jsonResponse(res, 200, { id: 'resp_ok', object: 'response', status: 'completed', output: [] })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key', mode: 'responses' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: [
+        { type: 'function_call', id: 'fc_bad', call_id: 'call_bad', name: 'shell', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_bad', output: 'ok' },
+        { type: 'function_call', id: 'fc_good', call_id: 'call_good', name: 'shell', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_good', output: 'ok' },
+        { type: 'message', role: 'user', content: 'next' }
+      ]
+    })
+
+    expect(response.status).toBe(200)
+    expect(callCount).toBe(2)
+  })
 })

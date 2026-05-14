@@ -511,11 +511,18 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
   if (p.wireApi === 'chat') {
     // Pass the *normalized* base to the bridge so suffix stripping +
     // query-string handling stays consistent with what we tell codex.
-    setUpstream({ baseUrl: effectiveBase, apiKey: p.apiKey })
+    setUpstream({ baseUrl: effectiveBase, apiKey: p.apiKey, mode: 'chat' })
     effectiveBase = `http://127.0.0.1:${bridgePort ?? 0}/v1`
     effectiveKey = BRIDGE_API_KEY
   } else {
-    setUpstream(null)
+    // Route Responses-API providers through the bridge in passthrough
+    // mode. This keeps a single chokepoint for upstream traffic and —
+    // more importantly — guarantees we forward `input[]` verbatim
+    // (reasoning items included) so the Responses API never sees an
+    // orphaned function_call across turns.
+    setUpstream({ baseUrl: effectiveBase, apiKey: p.apiKey, mode: 'responses' })
+    effectiveBase = `http://127.0.0.1:${bridgePort ?? 0}/v1`
+    effectiveKey = BRIDGE_API_KEY
   }
 
   const args = [
