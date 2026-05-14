@@ -3,7 +3,7 @@ import type { OpenDialogOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
-import { copyFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync, realpathSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, openSync, fsyncSync, closeSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync, realpathSync } from 'node:fs'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { PublicClientApplication } from '@azure/msal-node'
@@ -151,9 +151,31 @@ function saveSettings(s: AppSettings) {
     delete out.enterpriseAuth.accessToken
   }
   const tmpPath = `${SETTINGS_PATH}.${process.pid}.${Date.now()}.tmp`
-  writeFileSync(tmpPath, JSON.stringify(out, null, 2), { mode: 0o600 })
+  // fsync the bytes before rename so a crash between write+rename can't
+  // leave a zero-byte settings file on next boot.
+  const fd = openSync(tmpPath, 'w', 0o600)
+  try {
+    writeFileSync(fd, JSON.stringify(out, null, 2))
+    try { fsyncSync(fd) } catch { /* fsync is best-effort on some FS */ }
+  } finally {
+    closeSync(fd)
+  }
   renameSync(tmpPath, SETTINGS_PATH)
   settingsLoadIssue = null
+}
+
+/**
+ * Serialize all settings mutations through a single in-process queue so two
+ * concurrent IPC handlers (e.g. provider save + enterprise logout) can't
+ * read-modify-write the same file and lose updates.
+ */
+let settingsMutationQueue: Promise<unknown> = Promise.resolve()
+function withSettingsLock<T>(fn: () => Promise<T> | T): Promise<T> {
+  const next = settingsMutationQueue.then(() => fn())
+  // Swallow rejections in the chain itself so one failed mutation doesn't
+  // poison every subsequent one. Callers still see the rejection on `next`.
+  settingsMutationQueue = next.catch(() => undefined)
+  return next
 }
 
 function defaultEnterpriseConfig(): EnterpriseConfig {
@@ -260,6 +282,12 @@ async function enterpriseRequest(path: string, init: RequestInit = {}) {
     body = { text: bodyText }
   }
   if (!response.ok) {
+    if (response.status === 401) {
+      // Surface 401 with a hint so the renderer can prompt re-login. We
+      // don't try to silently refresh here because MSAL device-code flow
+      // requires user interaction.
+      return { ok: false, status: 401, error: body?.error ?? 'Shared workspace session expired. Please sign in again.', authExpired: true }
+    }
     const error = [body?.error, body?.detail].filter(Boolean).join(': ')
     return { ok: false, status: response.status, error: error || bodyText }
   }
@@ -481,7 +509,9 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
   let effectiveBase = normalizeProviderBaseUrl(p.baseUrl)
   let effectiveKey = p.apiKey
   if (p.wireApi === 'chat') {
-    setUpstream({ baseUrl: p.baseUrl, apiKey: p.apiKey })
+    // Pass the *normalized* base to the bridge so suffix stripping +
+    // query-string handling stays consistent with what we tell codex.
+    setUpstream({ baseUrl: effectiveBase, apiKey: p.apiKey })
     effectiveBase = `http://127.0.0.1:${bridgePort ?? 0}/v1`
     effectiveKey = BRIDGE_API_KEY
   } else {
@@ -638,7 +668,7 @@ ipcMain.handle('settings:get', () => {
   return safeSettingsView(s)
 })
 
-ipcMain.handle('settings:save', async (_e, partial: AppSettings) => {
+ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(async () => {
   // If the renderer sends back the masked key, keep the existing one.
   const cur = loadSettings()
   const next: AppSettings = { ...cur, ...partial }
@@ -666,18 +696,18 @@ ipcMain.handle('settings:save', async (_e, partial: AppSettings) => {
     await restartCodex()
   }
   return { ok: true, warnings: settingsWarnings(next) }
-})
+}))
 
 ipcMain.handle('enterprise:status', () => enterpriseStatus())
 
-ipcMain.handle('enterprise:logout', () => {
+ipcMain.handle('enterprise:logout', () => withSettingsLock(() => {
   const settings = loadSettings()
   delete settings.enterpriseAuth
   saveSettings(settings)
   return enterpriseStatus(settings)
-})
+}))
 
-ipcMain.handle('enterprise:login', async () => {
+ipcMain.handle('enterprise:login', async () => withSettingsLock(async () => {
   try {
     const settings = loadSettings()
     const config = effectiveEnterpriseConfig(settings)
@@ -735,7 +765,7 @@ ipcMain.handle('enterprise:login', async () => {
       code: err?.errorCode ?? err?.code ?? null
     }
   }
-})
+}))
 
 function formatEnterpriseLoginError(err: any) {
   const raw = [err?.errorMessage, err?.message, err?.subError].filter(Boolean).join(' ')

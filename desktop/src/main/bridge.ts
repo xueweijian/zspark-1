@@ -93,11 +93,19 @@ const MODELS_SUFFIX = '/models'
 function buildUpstreamUrl(rawBaseUrl: string, endpoint: typeof CHAT_COMPLETIONS_SUFFIX | typeof MODELS_SUFFIX): URL {
   const url = new URL(rawBaseUrl.trim())
   let path = url.pathname.replace(/\/+$/, '')
-  for (const suffix of [CHAT_COMPLETIONS_SUFFIX, RESPONSES_SUFFIX, MODELS_SUFFIX]) {
-    if (path.endsWith(suffix)) {
-      path = path.slice(0, -suffix.length).replace(/\/+$/, '')
-      break
+  // Strip endpoint suffixes idempotently — a poorly-typed base URL like
+  // `…/v1/responses/chat/completions` should still resolve to the v1 root
+  // before we re-append the requested endpoint.
+  for (let i = 0; i < 3; i++) {
+    let stripped = false
+    for (const suffix of [CHAT_COMPLETIONS_SUFFIX, RESPONSES_SUFFIX, MODELS_SUFFIX]) {
+      if (path.endsWith(suffix)) {
+        path = path.slice(0, -suffix.length).replace(/\/+$/, '')
+        stripped = true
+        break
+      }
     }
+    if (!stripped) break
   }
   url.pathname = `${path}${endpoint}`
   return url
@@ -113,8 +121,12 @@ function responseHeaders(stream: boolean) {
     : { 'content-type': 'application/json' }
 }
 
-function reasoningItem(itemId: string) {
-  return { id: itemId, type: 'reasoning', summary: [], content: [] }
+function reasoningItem(itemId: string, text = '') {
+  // Persist the reasoning text in the item summary so consumers replaying
+  // the response (non-streaming JSON path, codex history snapshots) still
+  // see the model's chain-of-thought instead of an empty placeholder.
+  const summary = text ? [{ type: 'summary_text', text }] : []
+  return { id: itemId, type: 'reasoning', summary, content: [] }
 }
 
 function writeResponseFailed(res: ServerResponse, ctx: ResponseContext, message: string) {
@@ -166,7 +178,7 @@ function emitChatJsonAsResponsesSse(res: ServerResponse, ctx: ResponseContext, j
     sseWrite(res, 'response.output_item.done', {
       type: 'response.output_item.done',
       output_index: outputIndex,
-      item: reasoningItem(reasoningItemId)
+      item: reasoningItem(reasoningItemId, result.reasoning)
     })
   }
 
@@ -204,7 +216,7 @@ function emitChatJsonAsResponsesSse(res: ServerResponse, ctx: ResponseContext, j
 
   const output = [
     messageItem(ctx, result.text, 'completed'),
-    ...(reasoningItemId ? [reasoningItem(reasoningItemId)] : []),
+    ...(reasoningItemId ? [reasoningItem(reasoningItemId, result.reasoning)] : []),
     ...result.toolCalls.map(functionCallItem)
   ]
   sseWrite(res, 'response.output_item.done', {
@@ -240,7 +252,7 @@ function writeChatJsonAsResponsesJson(res: ServerResponse, ctx: ResponseContext,
     status: 'completed',
     output: [
       messageItem(ctx, result.text, 'completed'),
-      ...(reasoningItemId ? [reasoningItem(reasoningItemId)] : []),
+      ...(reasoningItemId ? [reasoningItem(reasoningItemId, result.reasoning)] : []),
       ...result.toolCalls.map(functionCallItem)
     ],
     usage: responsesUsageFromChat(json.usage)
@@ -256,7 +268,10 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
   let payload: any
   try { payload = JSON.parse(body.toString('utf8')) } catch { res.writeHead(400).end('bad json'); return }
 
-  const stream = payload.stream !== false  // default true
+  // Honor explicit stream booleans only; default to non-streaming when the
+  // caller didn't specify so we don't accidentally feed SSE to a JSON
+  // consumer (codex always sends `stream: true` for chat-loop turns).
+  const stream = payload.stream === true
   const chatTools = toolsToChat(payload.tools)
   const chatBody: any = {
     model: payload.model,
@@ -365,6 +380,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
 
     let buf = ''
     let textAcc = ''
+    let reasoningAcc = ''
     let reasoningOpen = false
     let reasoningItemId = genId('rs')
     let reasoningOutputIndex: number | null = null
@@ -393,10 +409,27 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
         sseWrite(res, 'response.output_item.done', {
           type: 'response.output_item.done',
           output_index: reasoningOutputIndex ?? 1,
-          item: reasoningItem(reasoningItemId)
+          item: reasoningItem(reasoningItemId, reasoningAcc)
         })
       }
       for (const e of toolCalls.values()) {
+        // Late-arriving names that didn't show up before the first delta:
+        // emit `output_item.added` now so codex still binds the call_id to
+        // the right tool name. The renderer treats matching ids as updates.
+        if (!e.added && e.name) {
+          sseWrite(res, 'response.output_item.added', {
+            type: 'response.output_item.added',
+            output_index: e.outputIndex,
+            item: { id: e.itemId, type: 'function_call', call_id: e.id, name: e.name, arguments: '' }
+          })
+          e.added = true
+          if (e.argsBuf) {
+            sseWrite(res, 'response.function_call_arguments.delta', {
+              type: 'response.function_call_arguments.delta',
+              item_id: e.itemId, output_index: e.outputIndex, delta: e.argsBuf
+            })
+          }
+        }
         sseWrite(res, 'response.output_item.done', {
           type: 'response.output_item.done',
           output_index: e.outputIndex,
@@ -410,7 +443,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
       })
       const output = [
         messageItem(ctx, textAcc, 'completed'),
-        ...(reasoningOpen ? [reasoningItem(reasoningItemId)] : []),
+        ...(reasoningOpen ? [reasoningItem(reasoningItemId, reasoningAcc)] : []),
         ...Array.from(toolCalls.values()).map(functionCallItem)
       ]
       const status = finishReason && finishReason !== 'stop' && finishReason !== 'tool_calls' && finishReason !== 'function_call'
@@ -478,6 +511,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
             })
             nextOutputIndex++
           }
+          reasoningAcc += reasoning
           sseWrite(res, 'response.reasoning_summary_text.delta', {
             type: 'response.reasoning_summary_text.delta',
             item_id: reasoningItemId, output_index: reasoningOutputIndex, summary_index: 0, delta: reasoning
@@ -492,27 +526,45 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
             item_id: itemId, output_index: 0, content_index: 0, delta: ctext
           })
         }
-        // 3. tool_calls
+        // 3. tool_calls — defer the `output_item.added` event until we have
+        // a non-empty function name. Some providers (vLLM tool-calling
+        // builds, Azure-OpenAI parallel tools) split id/name across early
+        // chunks; emitting `added` with an empty name binds codex's call_id
+        // to "" and breaks the tool-loop.
         if (Array.isArray(delta.tool_calls)) {
           for (const tc of delta.tool_calls) {
             const idx: number = tc.index ?? 0
             let entry = toolCalls.get(idx)
             if (!entry) {
-              entry = { id: tc.id ?? genId('call'), name: tc.function?.name ?? '', argsBuf: '', itemId: genId('fc'), outputIndex: nextOutputIndex++ }
+              entry = {
+                id: tc.id ?? genId('call'),
+                name: tc.function?.name ?? '',
+                argsBuf: '',
+                itemId: genId('fc'),
+                outputIndex: nextOutputIndex++,
+                added: false
+              }
               toolCalls.set(idx, entry)
+            }
+            if (tc.id && entry.id !== tc.id) entry.id = tc.id
+            if (tc.function?.name) entry.name = tc.function.name
+            const announce = !entry.added && entry.name
+            if (announce) {
               sseWrite(res, 'response.output_item.added', {
                 type: 'response.output_item.added',
                 output_index: entry.outputIndex,
                 item: { id: entry.itemId, type: 'function_call', call_id: entry.id, name: entry.name, arguments: '' }
               })
+              entry.added = true
             }
-            if (tc.function?.name && !entry.name) entry.name = tc.function.name
             if (typeof tc.function?.arguments === 'string') {
               entry.argsBuf += tc.function.arguments
-              sseWrite(res, 'response.function_call_arguments.delta', {
-                type: 'response.function_call_arguments.delta',
-                item_id: entry.itemId, output_index: entry.outputIndex, delta: tc.function.arguments
-              })
+              if (entry.added) {
+                sseWrite(res, 'response.function_call_arguments.delta', {
+                  type: 'response.function_call_arguments.delta',
+                  item_id: entry.itemId, output_index: entry.outputIndex, delta: tc.function.arguments
+                })
+              }
             }
           }
         }

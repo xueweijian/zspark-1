@@ -12,6 +12,12 @@ export interface FunctionCallState {
   argsBuf: string
   itemId: string
   outputIndex: number
+  /**
+   * Whether `response.output_item.added` has been emitted yet. Streaming
+   * tool-call accumulators defer the announce until they have a non-empty
+   * function name to avoid binding codex's call_id to "".
+   */
+  added?: boolean
 }
 
 export interface ResponseContext {

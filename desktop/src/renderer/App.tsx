@@ -904,6 +904,11 @@ function DesktopApp() {
   const lastPersistedActivityKey = useRef('')
   const sharedSyncTimer = useRef<number | null>(null)
   const lastSharedSnapshotKey = useRef('')
+  // Tracks the latest snapshotKey that has been scheduled. The `.then()`
+  // callback only commits its key if it still matches — otherwise a slow
+  // PATCH that resolves after a newer one would clobber the dedup state and
+  // make us re-emit the freshly-applied snapshot on the next render tick.
+  const inFlightSharedSnapshotKey = useRef('')
   const activeSharedSnapshotRevision = useRef<number | null>(null)
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
@@ -2258,6 +2263,7 @@ function DesktopApp() {
       const snapshot = { version: 1, blocks, localThreadId, title, updatedAt: Date.now() }
       const snapshotKey = JSON.stringify({ activeSharedWorkspace, activeSharedSession, localThreadId, title, blocks })
       if (snapshotKey === lastSharedSnapshotKey.current) return
+      inFlightSharedSnapshotKey.current = snapshotKey
       void window.zspark.enterpriseUpdateSession(activeSharedWorkspace, activeSharedSession, {
         title,
         localThreadId,
@@ -2272,7 +2278,12 @@ function DesktopApp() {
           return
         }
         activeSharedSnapshotRevision.current = result.snapshotRevision ?? activeSharedSnapshotRevision.current
-        lastSharedSnapshotKey.current = snapshotKey
+        // Only commit dedup key if no newer snapshot was scheduled while we
+        // were waiting on the network — otherwise we'd briefly think the
+        // newer state had already been sent.
+        if (inFlightSharedSnapshotKey.current === snapshotKey) {
+          lastSharedSnapshotKey.current = snapshotKey
+        }
         setSharedSessions((prev) => prev.map((session) => (
           session.id === activeSharedSession
             ? { ...session, ...(result.session ?? {}), title, local_thread_id: localThreadId }

@@ -52,4 +52,21 @@ describe('resolveAllowedLocalPath', () => {
 
     expect(() => resolveAllowedLocalPath(workspace, link)).toThrow(/resolves outside/)
   })
+
+  test('allows future paths under workspace whose file does not yet exist', () => {
+    const workspace = tempRoot()
+    mockElectron.downloads = tempRoot()
+    const future = join(workspace, 'output', 'deep', 'not-yet.pptx')
+    // realpath of the workspace directory should still anchor the result.
+    const resolved = resolveAllowedLocalPath(workspace, future)
+    expect(resolved.startsWith(realpathSync(workspace))).toBe(true)
+    expect(resolved.endsWith(join('output', 'deep', 'not-yet.pptx'))).toBe(true)
+  })
+
+  test('rejects future paths whose existing ancestor is outside allowed roots', () => {
+    const workspace = tempRoot()
+    mockElectron.downloads = tempRoot()
+    const escape = join(tempRoot(), 'elsewhere', 'unborn.txt')
+    expect(() => resolveAllowedLocalPath(workspace, escape)).toThrow(/resolves outside/)
+  })
 })

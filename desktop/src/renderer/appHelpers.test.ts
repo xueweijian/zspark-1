@@ -128,6 +128,22 @@ describe('blocksFromSharedSnapshot', () => {
     expect(out[0]).toMatchObject({ type: 'files', files: [{ source: 'change', status: 'missing' }] })
     expect(out[1]).toMatchObject({ type: 'turn', status: 'interrupted', activities: [{ id: 'a', kind: 'command', status: 'running' }] })
   })
+  test('preserves activity startedAt instead of resetting to now on replay', () => {
+    const out = blocksFromSharedSnapshot({
+      blocks: [
+        { type: 'turn', id: 'turn', turnId: 't1', collapsed: false, startedAt: 1700000000000, activities: [
+          { id: 'good', kind: 'command', title: 'Ran', status: 'done', startedAt: 1700000000000, endedAt: 1700000001000 },
+          { id: 'unparsable', kind: 'command', title: 'Lost', status: 'done', startedAt: 'never' as any }
+        ] }
+      ] as any
+    })
+    expect(out).toHaveLength(1)
+    const turn = out[0] as any
+    expect(turn.activities[0].startedAt).toBe(1700000000000)
+    // unparsable timestamps fall back to 0 instead of "now" so the UI can
+    // detect-and-skip them rather than displaying a fake live duration.
+    expect(turn.activities[1].startedAt).toBe(0)
+  })
 })
 
 describe('upsertApprovalBlockByTurnOrder', () => {

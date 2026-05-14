@@ -464,4 +464,60 @@ describe('chat responses bridge', () => {
     expect(response.status).toBe(200)
     expect(upstream.requests[0]?.path).toBe('/v1/models')
   })
+
+  test('treats omitted stream flag as non-streaming JSON', async () => {
+    const upstream = await startUpstream((_req, res, body) => {
+      // Caller did not set `stream`; bridge must not request SSE upstream.
+      expect(body.stream).toBe(false)
+      jsonResponse(res, 200, {
+        choices: [{ message: { content: 'plain' } }]
+      })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      input: 'hi'
+    })
+    expect(response.status).toBe(200)
+    expect(responseText(response.body)).toBe('plain')
+  })
+
+  test('defers function_call output_item.added until function name arrives', async () => {
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      // First chunk: id only, no name. Second chunk: name appears. Third: args.
+      res.write(`data: ${JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ index: 0, id: 'call_1' }] } }]
+      })}\n\n`)
+      res.write(`data: ${JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ index: 0, function: { name: 'do_thing' } }] } }]
+      })}\n\n`)
+      res.write(`data: ${JSON.stringify({
+        choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: '{"x":1}' } }] }, finish_reason: 'tool_calls' }]
+      })}\n\n`)
+      res.write('data: [DONE]\n\n')
+      res.end()
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: true,
+      input: 'go'
+    })
+    expect(response.status).toBe(200)
+
+    // Find the function_call output_item.added event in the SSE stream and
+    // confirm the announce frame carries the real function name (not '').
+    const events = response.body.split(/\n\n/).filter((line) => line.startsWith('event:'))
+    const added = events.find((evt) => /response\.output_item\.added/.test(evt) && /function_call/.test(evt))
+    expect(added).toBeDefined()
+    expect(added).toContain('"name":"do_thing"')
+    expect(added).not.toContain('"name":""')
+  })
 })

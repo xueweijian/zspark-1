@@ -30,7 +30,7 @@ const ActivitySchema = z.object({
   status: z.enum(['running', 'done', 'failed']),
   startedAt: z.number(),
   endedAt: z.number().optional()
-}).passthrough()
+}).strict()
 
 const WorkspaceFileSchema = z.object({
   id: z.string().max(240),
@@ -45,8 +45,23 @@ const WorkspaceFileSchema = z.object({
     sessionId: z.string().max(160),
     artifactId: z.string().max(160),
     sizeBytes: z.number().optional()
-  }).optional()
-}).passthrough()
+  }).strict().optional()
+}).strict()
+
+// Cap raw approval params: codex can stash arbitrarily-large objects under
+// `request.params` (full command output, file diffs, …). Persisting them
+// untrimmed lets a peer balloon the snapshot until the body limit kicks in,
+// killing every subsequent PATCH silently. Re-stringify with a hard ceiling.
+const ApprovalParamsSchema = z.unknown().transform((value) => {
+  if (value === undefined) return undefined
+  try {
+    const json = JSON.stringify(value)
+    if (json.length <= 32_000) return value
+    return { truncated: true, preview: json.slice(0, 32_000) }
+  } catch {
+    return undefined
+  }
+})
 
 const ApprovalRequestSchema = z.object({
   id: JsonRpcIdSchema,
@@ -64,10 +79,10 @@ const ApprovalRequestSchema = z.object({
   cwd: z.string().max(1200).optional(),
   reason: z.string().max(1000).optional(),
   paths: z.array(z.string().max(1200)).max(200),
-  params: z.unknown().optional(),
+  params: ApprovalParamsSchema.optional(),
   status: z.enum(['pending', 'sending', 'approved', 'denied', 'resolved']),
   startedAt: z.number()
-}).passthrough()
+}).strict()
 
 const TurnInputItemSchema = z.object({
   type: z.enum(['text', 'image', 'localImage', 'skill', 'mention'])
@@ -80,14 +95,14 @@ const SnapshotBlockSchema = z.discriminatedUnion('type', [
     text: z.string().max(200_000),
     turnId: z.string().max(240).optional(),
     input: z.array(TurnInputItemSchema).max(200).optional()
-  }).passthrough(),
+  }).strict(),
   z.object({
     type: z.literal('agent'),
     id: z.string().max(240),
     text: z.string().max(1_000_000),
     turnId: z.string().max(240).optional(),
     memoryCitation: z.unknown().optional().nullable()
-  }).passthrough(),
+  }).strict(),
   z.object({
     type: z.literal('files'),
     id: z.string().max(240),
@@ -96,13 +111,13 @@ const SnapshotBlockSchema = z.discriminatedUnion('type', [
     files: z.array(WorkspaceFileSchema).max(300),
     subtitle: z.string().max(1000).optional(),
     tone: z.enum(['normal', 'warn']).optional()
-  }).passthrough(),
+  }).strict(),
   z.object({
     type: z.literal('approval'),
     id: z.string().max(240),
     turnId: z.string().max(240),
     request: ApprovalRequestSchema
-  }).passthrough(),
+  }).strict(),
   z.object({
     type: z.literal('turn'),
     id: z.string().max(240),
@@ -112,7 +127,7 @@ const SnapshotBlockSchema = z.discriminatedUnion('type', [
     finalMessageId: z.string().max(240).optional(),
     startedAt: z.number(),
     endedAt: z.number().optional()
-  }).passthrough()
+  }).strict()
 ])
 
 const SharedSessionSnapshotSchema = z.object({
@@ -195,7 +210,15 @@ async function writeSnapshot(client: PoolClient, sessionId: string, snapshot: z.
   if (snapshot === undefined) return null
   await client.query('SELECT id FROM sessions WHERE id = $1 FOR UPDATE', [sessionId])
   const currentRevision = await latestSnapshotRevision(client, sessionId)
-  if (baseRevision !== undefined && currentRevision !== baseRevision) {
+  // Treat `null` and `undefined` as "no prior revision known" so a freshly
+  // opened session whose client never received a revision yet doesn't 409
+  // on its first PATCH. Conflict only when both sides have a revision and
+  // the numbers disagree.
+  const baseAdvertised = baseRevision === undefined ? null : baseRevision
+  const conflict = baseRevision !== undefined &&
+    !(baseAdvertised === null && currentRevision === null) &&
+    baseAdvertised !== currentRevision
+  if (conflict) {
     throw new SnapshotConflictError(currentRevision)
   }
   const content = { ...snapshot }

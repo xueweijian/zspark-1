@@ -113,7 +113,7 @@ function normalizeSnapshotActivity(activity: any): Activity | null {
     actionKind: ACTION_KINDS.has(activity.actionKind) ? activity.actionKind : undefined,
     target: optionalBoundedString(activity.target, 1200),
     status: ACTIVITY_STATUSES.has(activity.status) ? activity.status : 'done',
-    startedAt: finiteNumber(activity.startedAt, Date.now()),
+    startedAt: finiteNumber(activity.startedAt, 0),
     endedAt: activity.endedAt == null ? undefined : finiteNumber(activity.endedAt)
   }
 }

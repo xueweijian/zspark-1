@@ -1,6 +1,6 @@
 import { app, shell } from 'electron'
 import { realpathSync } from 'node:fs'
-import { extname, isAbsolute, relative, resolve } from 'node:path'
+import { dirname, extname, isAbsolute, relative, resolve, sep } from 'node:path'
 
 /**
  * Path-safety helpers for IPC handlers in the Electron main process.
@@ -29,10 +29,36 @@ function realpathIfAvailable(path: string): string {
   }
 }
 
+/**
+ * Resolve `realpathSync` for the deepest existing ancestor of `path` and
+ * re-attach the missing tail. Lets us validate paths to files that haven't
+ * been written yet (codex artifact streaming, fresh download targets) while
+ * still defeating symlink-escape attacks on every existing segment.
+ */
+function realpathOfDeepestExistingAncestor(path: string): string {
+  let dir = path
+  const tail: string[] = []
+  while (true) {
+    try {
+      const real = realpathSync(dir)
+      return tail.length ? resolve(real, ...tail.reverse()) : real
+    } catch {
+      const parent = dirname(dir)
+      if (parent === dir) {
+        // Reached filesystem root with no realpath success — fall back to
+        // a syntactic resolve so callers still get a sane absolute path.
+        return resolve(path)
+      }
+      tail.push(dir.slice(parent.length).replace(new RegExp(`^${sep}`), ''))
+      dir = parent
+    }
+  }
+}
+
 export function resolveAllowedLocalPath(workspaceRoot: string, filePath: string): string {
   const normalized = isAbsolute(filePath) ? resolve(filePath) : resolve(workspaceRoot, filePath)
   const roots = allowedLocalPathRoots(workspaceRoot).map(realpathIfAvailable)
-  const realPath = realpathSync(normalized)
+  const realPath = realpathOfDeepestExistingAncestor(normalized)
   if (!roots.some((root) => isInsidePath(root, realPath))) {
     throw new Error('Path resolves outside the allowed zspark workspace/download directories')
   }
