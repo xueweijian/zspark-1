@@ -299,28 +299,39 @@ function isFunctionCallMatch(item: any, fcIdentifier: string): boolean {
   return item.id === fcIdentifier || item.call_id === fcIdentifier
 }
 
-function hasReasoningItem(payload: any, reasoningId: string): boolean {
-  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) return false
-  return payload.input.some((item: any) => item?.type === 'reasoning' && item.id === reasoningId)
+function reasoningItemHasModelPayload(item: any): boolean {
+  if (item?.type !== 'reasoning') return false
+  if (typeof item.encrypted_content === 'string' && item.encrypted_content.length > 0) return true
+  if (Array.isArray(item.summary) && item.summary.length > 0) return true
+  return Array.isArray(item.content) && item.content.length > 0
 }
 
-function insertMissingReasoningItem(
+function moveExistingReasoningBeforeFunctionCall(
   payload: any,
   fcIdentifier: string,
   reasoningId: string
-): { payload: any; inserted: boolean } {
+): { payload: any; moved: boolean } {
   if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) {
-    return { payload, inserted: false }
+    return { payload, moved: false }
   }
-  if (hasReasoningItem(payload, reasoningId)) return { payload, inserted: false }
-  const index = payload.input.findIndex((item: any) => isFunctionCallMatch(item, fcIdentifier))
-  if (index < 0) return { payload, inserted: false }
   const input = [...payload.input]
-  input.splice(index, 0, reasoningItem(reasoningId))
-  return { payload: { ...payload, input }, inserted: true }
+  const reasoningIndex = input.findIndex((item: any) => item?.type === 'reasoning' && item.id === reasoningId)
+  const callIndex = input.findIndex((item: any) => isFunctionCallMatch(item, fcIdentifier))
+  if (reasoningIndex < 0 || callIndex < 0) return { payload, moved: false }
+  const reasoning = input[reasoningIndex]
+  if (!reasoningItemHasModelPayload(reasoning)) return { payload, moved: false }
+  if (reasoningIndex === callIndex - 1) return { payload, moved: false }
+  input.splice(reasoningIndex, 1)
+  const adjustedCallIndex = reasoningIndex < callIndex ? callIndex - 1 : callIndex
+  input.splice(adjustedCallIndex, 0, reasoning)
+  return { payload: { ...payload, input }, moved: true }
 }
 
-function stripFunctionCall(payload: any, fcIdentifier: string): { payload: any; dropped: boolean } {
+function stripFunctionCall(
+  payload: any,
+  fcIdentifier: string,
+  reasoningId?: string | null
+): { payload: any; dropped: boolean } {
   if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) {
     return { payload, dropped: false }
   }
@@ -336,6 +347,7 @@ function stripFunctionCall(payload: any, fcIdentifier: string): { payload: any; 
   if (!dropped) return { payload, dropped: false }
   const filtered = items.filter((item) => {
     if (isFunctionCallMatch(item, fcIdentifier)) return false
+    if (reasoningId && item?.type === 'reasoning' && item.id === reasoningId) return false
     if (item?.type === 'function_call_output' && typeof item.call_id === 'string' && orphanedCallIds.has(item.call_id)) {
       return false
     }
@@ -348,15 +360,15 @@ function recoverOrphanedFunctionCall(
   payload: any,
   error: OrphanedFunctionCallError
 ): { payload: any; recovered: boolean } {
-  if (error.reasoningId && !hasReasoningItem(payload, error.reasoningId)) {
-    const inserted = insertMissingReasoningItem(payload, error.functionCallId, error.reasoningId)
-    if (inserted.inserted) return { payload: inserted.payload, recovered: true }
+  if (error.reasoningId) {
+    const moved = moveExistingReasoningBeforeFunctionCall(payload, error.functionCallId, error.reasoningId)
+    if (moved.moved) return { payload: moved.payload, recovered: true }
   }
-  const stripped = stripFunctionCall(payload, error.functionCallId)
+  const stripped = stripFunctionCall(payload, error.functionCallId, error.reasoningId)
   return { payload: stripped.payload, recovered: stripped.dropped }
 }
 
-const MAX_RESPONSES_RETRY_ATTEMPTS = 4
+const MAX_RESPONSES_RETRY_ATTEMPTS = 16
 
 function sendResponsesRequest(
   cfg: UpstreamConfig,

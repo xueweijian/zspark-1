@@ -16,7 +16,13 @@ import {
   type SkillCategory
 } from './skillCatalog'
 import { normalizeMarkdownForDisplay } from './markdown'
-import { dirname, extractArtifactPathCandidates, resolveWorkspacePath } from './artifacts'
+import {
+  dirname,
+  extractArtifactPathCandidates,
+  findRecentArtifactForCandidate,
+  resolveWorkspacePath,
+  type RecentArtifactLike
+} from './artifacts'
 import { formatApprovalPolicy, formatSandboxPolicy, shortPath } from './runtimeDisplay'
 import { shouldSuppressServerWarning } from './serverWarnings'
 import {
@@ -280,6 +286,15 @@ function artifactDownloadLabel(path: string) {
   return ext ? `Download ${ext}` : 'Download'
 }
 
+async function scanRecentArtifactCandidates(limit = 48): Promise<RecentArtifactLike[]> {
+  try {
+    const result = await window.zspark.scanRecentArtifacts({ sinceMs: 0, limit })
+    return result.artifacts ?? []
+  } catch {
+    return []
+  }
+}
+
 function MessageArtifactButtons({
   candidates,
   runtime,
@@ -306,6 +321,11 @@ function MessageArtifactButtons({
     const verify = async () => {
       const seen = new Set<string>()
       const verified: Array<{ path: string; name: string; shared?: boolean }> = []
+      let recentArtifacts: RecentArtifactLike[] | null = null
+      const resolveRecentArtifact = async (candidate: string) => {
+        if (!recentArtifacts) recentArtifacts = await scanRecentArtifactCandidates()
+        return findRecentArtifactForCandidate(candidate, recentArtifacts)
+      }
       for (const candidate of candidates.slice(0, 8)) {
         const sharedFile = findSharedWorkspaceFileForPath(sharedFiles, candidate)
         if (sharedFile) {
@@ -316,13 +336,22 @@ function MessageArtifactButtons({
           if (verified.length >= 4) break
           continue
         }
+        let found = false
         for (const path of candidateWorkspacePaths(candidate, runtime)) {
           if (!path || seen.has(path)) continue
           seen.add(path)
           const stat = await window.zspark.statPath(path)
           if (!stat.exists || !stat.isFile) continue
           verified.push({ path, name: basename(path) })
+          found = true
           break
+        }
+        if (!found) {
+          const recentArtifact = await resolveRecentArtifact(candidate)
+          if (recentArtifact && !seen.has(recentArtifact.path)) {
+            seen.add(recentArtifact.path)
+            verified.push({ path: recentArtifact.path, name: recentArtifact.name })
+          }
         }
         if (verified.length >= 4) break
       }
@@ -1215,8 +1244,21 @@ function DesktopApp() {
     }
     setBlocks((bs) => {
       const next = { type: 'files' as const, id, turnId, title, files: displayFiles, subtitle: options.subtitle, tone: options.tone ?? 'normal' }
-      if (bs.some((b) => b.id === id)) return bs.map((b) => (b.id === id ? next : b))
-      return [...bs, next]
+      const resolvedFiles = displayFiles.filter((file) => file.status !== 'missing')
+      const resolvedPaths = new Set(resolvedFiles.map((file) => file.path))
+      const resolvedNames = new Set(resolvedFiles.map((file) => basename(file.path).toLowerCase()))
+      const withoutResolvedMissing = bs.flatMap((block) => {
+        if (block.type !== 'files' || block.tone !== 'warn' || !resolvedFiles.length) return [block]
+        const unresolved = block.files.filter((file) => {
+          if (file.status !== 'missing') return true
+          return !resolvedPaths.has(file.path) && !resolvedNames.has(basename(file.path).toLowerCase())
+        })
+        return unresolved.length ? [{ ...block, files: unresolved }] : []
+      })
+      if (withoutResolvedMissing.some((b) => b.id === id)) {
+        return withoutResolvedMissing.map((b) => (b.id === id ? next : b))
+      }
+      return [...withoutResolvedMissing, next]
     })
   }
 
@@ -1350,6 +1392,11 @@ function DesktopApp() {
       ? await refreshSharedArtifactsForActiveSession(false)
       : []
     const sharedFiles = [...refreshedSharedFiles, ...workspaceFilesRef.current]
+    let recentArtifacts: RecentArtifactLike[] | null = null
+    const resolveRecentArtifact = async (candidate: string) => {
+      if (!recentArtifacts) recentArtifacts = await scanRecentArtifactCandidates()
+      return findRecentArtifactForCandidate(candidate, recentArtifacts)
+    }
     await Promise.all(candidates.map(async (candidate, index) => {
       const sharedFile = findSharedWorkspaceFileForPath(sharedFiles, candidate)
       if (sharedFile) {
@@ -1372,6 +1419,18 @@ function DesktopApp() {
           break
         }
         stat = possibleStat
+      }
+      if (!stat.exists || !stat.isFile) {
+        const recentArtifact = await resolveRecentArtifact(candidate)
+        if (recentArtifact) {
+          path = recentArtifact.path
+          stat = {
+            exists: true,
+            isFile: true,
+            size: recentArtifact.size,
+            mtimeMs: recentArtifact.mtimeMs
+          }
+        }
       }
       const file: WorkspaceFile = {
         id: `claim-${now}-${index}`,
@@ -1419,6 +1478,11 @@ function DesktopApp() {
       ? await refreshSharedArtifactsForActiveSession(false)
       : []
     const sharedFiles = [...refreshedSharedFiles, ...workspaceFilesRef.current]
+    let recentArtifacts: RecentArtifactLike[] | null = null
+    const resolveRecentArtifact = async (candidate: string) => {
+      if (!recentArtifacts) recentArtifacts = await scanRecentArtifactCandidates()
+      return findRecentArtifactForCandidate(candidate, recentArtifacts)
+    }
     for (const candidate of candidates) {
       const sharedFile = findSharedWorkspaceFileForPath(sharedFiles, candidate)
       if (sharedFile) {
@@ -1429,6 +1493,7 @@ function DesktopApp() {
         })
         continue
       }
+      let found = false
       for (const path of candidateWorkspacePaths(candidate, runtimeRef.current)) {
         const stat = await window.zspark.statPath(path)
         if (!stat.exists || !stat.isFile) continue
@@ -1441,8 +1506,21 @@ function DesktopApp() {
           detail: `Verified from assistant output${stat.size ? ` (${fmtBytes(stat.size)})` : ''}`,
           updatedAt: stat.mtimeMs ?? now
         })
+        found = true
         break
       }
+      if (found) continue
+      const recentArtifact = await resolveRecentArtifact(candidate)
+      if (!recentArtifact) continue
+      files.push({
+        id: `inline-${agentBlock.id}-${files.length}-${now}`,
+        name: recentArtifact.name,
+        path: recentArtifact.path,
+        source: 'change',
+        status: 'created',
+        detail: `Verified from recent outputs${recentArtifact.size ? ` (${fmtBytes(recentArtifact.size)})` : ''}`,
+        updatedAt: recentArtifact.mtimeMs
+      })
     }
 
     if (!files.length) return

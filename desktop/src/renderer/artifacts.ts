@@ -1,6 +1,13 @@
 const ARTIFACT_EXTENSION_RE = /\.(pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip)\b/i
 const PATH_TOKEN_RE = /`([^`\n\r]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))`|["']([^"'\n\r]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))["']|([^\s`"'<>()[\]{}，。；：、]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))/gi
 
+export interface RecentArtifactLike {
+  name: string
+  path: string
+  size: number
+  mtimeMs: number
+}
+
 function stripTrailingPunctuation(path: string) {
   return path.replace(/[),.;:，。；：、]+$/g, '')
 }
@@ -30,6 +37,37 @@ export function isAbsolutePath(path: string) {
 export function resolveWorkspacePath(path: string, base?: string) {
   if (!path || isAbsolutePath(path) || !base) return path
   return `${base.replace(/[\\/]+$/, '')}/${path}`
+}
+
+function normalizeArtifactPath(path: string) {
+  return stripTrailingPunctuation(path.trim()).replace(/\\/g, '/').replace(/\/+/g, '/')
+}
+
+function pathBasename(path: string) {
+  const normalized = normalizeArtifactPath(path)
+  const index = normalized.lastIndexOf('/')
+  return index >= 0 ? normalized.slice(index + 1) : normalized
+}
+
+export function findRecentArtifactForCandidate(
+  candidate: string,
+  artifacts: RecentArtifactLike[]
+): RecentArtifactLike | null {
+  const normalizedCandidate = normalizeArtifactPath(candidate).toLowerCase()
+  if (!normalizedCandidate) return null
+
+  const suffixMatch = artifacts.find((artifact) => {
+    const normalizedArtifactPath = normalizeArtifactPath(artifact.path).toLowerCase()
+    return normalizedArtifactPath === normalizedCandidate || normalizedArtifactPath.endsWith(`/${normalizedCandidate}`)
+  })
+  if (suffixMatch) return suffixMatch
+
+  const candidateName = pathBasename(normalizedCandidate)
+  if (!candidateName) return null
+  return artifacts.find((artifact) => (
+    pathBasename(artifact.path).toLowerCase() === candidateName ||
+    artifact.name.trim().toLowerCase() === candidateName
+  )) ?? null
 }
 
 export function dirname(path?: string) {

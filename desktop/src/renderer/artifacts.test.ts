@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { dirname, extractArtifactPathCandidates, resolveWorkspacePath } from './artifacts'
+import { dirname, extractArtifactPathCandidates, findRecentArtifactForCandidate, resolveWorkspacePath } from './artifacts'
 
 describe('artifact helpers', () => {
   test('extracts workspace artifact paths from assistant text', () => {
@@ -22,5 +22,19 @@ describe('artifact helpers', () => {
 
   test('returns a portable dirname from a skill path', () => {
     expect(dirname('/Users/me/skills/presentations/SKILL.md')).toBe('/Users/me/skills/presentations')
+  })
+
+  test('matches recent artifacts by suffix or basename for relative output claims', () => {
+    const artifact = {
+      name: 'Year-End-Review.pptx',
+      path: '/repo/outputs/manual-year-end/presentations/year-end/output/Year-End-Review.pptx',
+      size: 123,
+      mtimeMs: 456
+    }
+    const artifacts = [artifact]
+
+    expect(findRecentArtifactForCandidate('output/Year-End-Review.pptx', artifacts)).toEqual(artifact)
+    expect(findRecentArtifactForCandidate('outputs/final/Year-End-Review.pptx', artifacts)).toEqual(artifact)
+    expect(findRecentArtifactForCandidate('outputs/final/Missing.pptx', artifacts)).toBeNull()
   })
 })
