@@ -2,6 +2,7 @@ import { describe, expect, test } from 'vitest'
 import {
   filterSkillCatalog,
   inferSkillCategory,
+  isOfficeArtifactGenerationRequest,
   recommendedSkillNamesForAttachment,
   suggestedPromptForAttachments
 } from './skillCatalog'
@@ -42,5 +43,14 @@ describe('skill catalog helpers', () => {
       mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       kind: 'file'
     }])).toContain('表格')
+  })
+
+  test('detects office artifact generation requests without treating analysis as generation', () => {
+    expect(isOfficeArtifactGenerationRequest('给我生成一页年终总结ppt')).toBe(true)
+    expect(isOfficeArtifactGenerationRequest('export the results as a Word docx')).toBe(true)
+    expect(isOfficeArtifactGenerationRequest('请分析这份演示文稿')).toBe(false)
+    expect(isOfficeArtifactGenerationRequest('请读取这个 PDF 总结要点')).toBe(false)
+    expect(isOfficeArtifactGenerationRequest('请做成一页总结', [{ name: 'presentations' }])).toBe(false)
+    expect(isOfficeArtifactGenerationRequest('请做成一页 PPT', [{ name: 'presentations' }])).toBe(true)
   })
 })

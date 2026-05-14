@@ -10,6 +10,7 @@ import {
 import {
   filterSkillCatalog,
   inferSkillCategory,
+  isOfficeArtifactGenerationRequest,
   recommendedSkillNamesForAttachment,
   skillCategoryOptions,
   suggestedPromptForAttachments,
@@ -621,7 +622,13 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
   const rt = runtime.workspaceRuntime
   if (!rt?.available) {
     return [
-      'Selected Office skill requirement: produce an actual editable artifact file in the workspace. Do not answer with only a specification unless a runtime/setup blocker is real and explicitly observed.'
+      [
+        'Zspark local artifact runtime is unavailable for the selected Office skill.',
+        `- Expected Node executable: ${rt?.nodePath ?? 'not reported'}`,
+        `- Expected Node packages: ${rt?.nodeModulesPath ?? 'not reported'}`,
+        '- Do not claim an editable Office artifact was generated.',
+        '- If the user asked to create or edit a PPTX/DOCX/XLSX/PDF artifact, report this runtime blocker instead of inventing an output path.'
+      ].join('\n')
     ]
   }
 
@@ -658,6 +665,17 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
   return [
     lines.join('\n')
   ]
+}
+
+function officeArtifactRuntimeBlocker(text: string, skills: SkillMeta[], runtime: RuntimeInfo): string | null {
+  if (!isOfficeArtifactGenerationRequest(text, skills)) return null
+  const rt = runtime.workspaceRuntime
+  if (rt?.available) return null
+  return [
+    'Artifact runtime is missing, so Zspark cannot create editable Office artifacts on this machine.',
+    `Expected Node: ${rt?.nodePath ?? 'not reported'}`,
+    `Expected packages: ${rt?.nodeModulesPath ?? 'not reported'}`
+  ].join('\n')
 }
 
 function executionSafetyContext(prompt: string): string[] {
@@ -2931,6 +2949,12 @@ function DesktopApp() {
       return
     }
     if ((!rawText && currentAttachments.length === 0 && currentSkills.length === 0 && providedInput.length === 0) || !ready) return
+    const text = rawText || (currentAttachments.length ? suggestedPromptForAttachments(currentAttachments) : '')
+    const runtimeBlocker = officeArtifactRuntimeBlocker(text, currentSkills, runtimeRef.current)
+    if (runtimeBlocker) {
+      toast('error', runtimeBlocker)
+      return
+    }
     let targetThreadId = thread
     if (activeSharedWorkspaceRef.current && !activeSharedSessionRef.current) {
       const created = await createSharedSession()
@@ -2941,7 +2965,6 @@ function DesktopApp() {
     setSubmitting(true)
     stickToBottom.current = true
     setShowJumpToLatest(false)
-    const text = rawText || (currentAttachments.length ? suggestedPromptForAttachments(currentAttachments) : '')
     const shouldClearComposer = fromComposer || options.clearComposer === true
     if (shouldClearComposer) {
       clearComposerText()

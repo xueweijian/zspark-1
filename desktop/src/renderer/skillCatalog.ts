@@ -33,6 +33,8 @@ const RESEARCH_RE = /\b(browser|browse|web|search|research|docs?|openai-docs|com
 const CREATIVE_RE = /\b(image|imagegen|visual|bitmap|illustration|mockup)\b/i
 const AUTOMATION_RE = /\b(automation|automations|schedule|recurring|cron|workflow|monitor|babysit)\b/i
 const DEVELOPER_RE = /\b(code|coding|developer|programming|frontend|backend|react|next\.?js|typescript|javascript|node|express|rust|tui|git|pull request|pr\b|ci\b|test|testing|bug|issue|review|security|stripe|supabase|shadcn|api route|database|postgres|bazel)\b/i
+const OFFICE_ARTIFACT_RE = /\b(document|documents|docx?|word|presentation|presentations|slides?|pptx?|powerpoint|spreadsheet|spreadsheets|xlsx?|xls|excel|csv|tsv|pdf|deck)\b|ppt|幻灯片|演示文稿|演示|文档|表格|工作簿/i
+const ARTIFACT_CREATE_RE = /\b(create|generate|make|build|export|produce|draft|write|render|convert|edit|modify|redline)\b|生成|创建|制作|做一?|导出|产出|整理成|转换成|改写成|编辑|修改|润色|输出/i
 
 function catalogText(skill: SkillCatalogEntry): string {
   return [
@@ -71,6 +73,15 @@ export function skillCategoryMatches(skill: SkillCatalogEntry, category: SkillCa
   const inferred = inferSkillCategory(skill)
   if (category === 'work') return inferred !== 'developer'
   return inferred === category
+}
+
+export function isOfficeArtifactGenerationRequest(text: string, skills: SkillCatalogEntry[] = []): boolean {
+  const hasOfficeSkill = skills.some((skill) => inferSkillCategory(skill) === 'office')
+  const prompt = text.trim()
+  if (!prompt && !hasOfficeSkill) return false
+  const asksForOfficeArtifact = OFFICE_ARTIFACT_RE.test(prompt)
+  const asksToCreateArtifact = ARTIFACT_CREATE_RE.test(prompt)
+  return asksForOfficeArtifact && (asksToCreateArtifact || hasOfficeSkill)
 }
 
 export function filterSkillCatalog(
