@@ -368,6 +368,73 @@ function recoverOrphanedFunctionCall(
   return { payload: stripped.payload, recovered: stripped.dropped }
 }
 
+function sanitizeResponsesInputForUpstream(payload: any): { payload: any; changed: boolean } {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) {
+    return { payload, changed: false }
+  }
+
+  let changed = false
+  const droppedCallIds = new Set<string>()
+  const input: any[] = payload.input
+  let sanitized: any[] = []
+
+  for (let i = 0; i < input.length; i++) {
+    const item = input[i]
+    if (item?.type !== 'function_call') {
+      sanitized.push(item)
+      continue
+    }
+
+    const previous = sanitized[sanitized.length - 1]
+    if (reasoningItemHasModelPayload(previous)) {
+      sanitized.push(item)
+      continue
+    }
+
+    const next = input[i + 1]
+    if (reasoningItemHasModelPayload(next)) {
+      sanitized.push(next, item)
+      i += 1
+      changed = true
+      continue
+    }
+
+    const hasEmptyPreviousReasoning = previous?.type === 'reasoning' && !reasoningItemHasModelPayload(previous)
+    const hasEmptyNextReasoning = next?.type === 'reasoning' && !reasoningItemHasModelPayload(next)
+    if (!hasEmptyPreviousReasoning && !hasEmptyNextReasoning) {
+      sanitized.push(item)
+      continue
+    }
+
+    if (hasEmptyPreviousReasoning) {
+      sanitized.pop()
+      changed = true
+    }
+    if (hasEmptyNextReasoning) {
+      i += 1
+      changed = true
+    }
+    if (typeof item.call_id === 'string') droppedCallIds.add(item.call_id)
+    changed = true
+  }
+
+  if (droppedCallIds.size) {
+    sanitized = sanitized.filter((item) => {
+      if (
+        (item?.type === 'function_call_output' || item?.type === 'custom_tool_call_output') &&
+        typeof item.call_id === 'string' &&
+        droppedCallIds.has(item.call_id)
+      ) {
+        changed = true
+        return false
+      }
+      return true
+    })
+  }
+
+  return changed ? { payload: { ...payload, input: sanitized }, changed: true } : { payload, changed: false }
+}
+
 const MAX_RESPONSES_RETRY_ATTEMPTS = 16
 
 function sendResponsesRequest(
@@ -414,6 +481,14 @@ async function handleResponsesPassthrough(
     payload = JSON.parse(body.toString('utf8'))
     stream = payload?.stream === true
   } catch {}
+  let initialBody = body
+  if (payload) {
+    const sanitized = sanitizeResponsesInputForUpstream(payload)
+    if (sanitized.changed) {
+      payload = sanitized.payload
+      initialBody = Buffer.from(JSON.stringify(payload), 'utf8')
+    }
+  }
 
   let upstreamDone = false
   let activeReq: ClientRequest | null = null
@@ -487,7 +562,7 @@ async function handleResponsesPassthrough(
     )
   }
 
-  attempt(body, 0)
+  attempt(initialBody, 0)
 }
 
 async function handleResponses(req: IncomingMessage, res: ServerResponse, authToken?: string) {

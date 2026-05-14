@@ -12,9 +12,10 @@ function stripTrailingPunctuation(path: string) {
   return path.replace(/[),.;:，。；：、]+$/g, '')
 }
 
-function looksLikeWorkspaceArtifact(path: string) {
+function looksLikeWorkspaceArtifact(path: string, allowBareName = false) {
   if (/^https?:\/\//i.test(path)) return false
   if (!ARTIFACT_EXTENSION_RE.test(path)) return false
+  if (allowBareName) return true
   return path.startsWith('/') || path.startsWith('.') || path.includes('/') || path.includes('\\')
 }
 
@@ -23,7 +24,8 @@ export function extractArtifactPathCandidates(text: string): string[] {
   const result: string[] = []
   for (const match of text.matchAll(PATH_TOKEN_RE)) {
     const candidate = stripTrailingPunctuation(String(match[1] ?? match[2] ?? match[3] ?? '').trim())
-    if (!candidate || !looksLikeWorkspaceArtifact(candidate) || seen.has(candidate)) continue
+    const quoted = match[1] != null || match[2] != null
+    if (!candidate || !looksLikeWorkspaceArtifact(candidate, quoted) || seen.has(candidate)) continue
     seen.add(candidate)
     result.push(candidate)
   }

@@ -242,8 +242,6 @@ function ActivityDuration({ startedAt, endedAt }: { startedAt: number; endedAt?:
 
 marked.setOptions({ gfm: true, breaks: true })
 
-marked.setOptions({ gfm: true, breaks: true })
-
 function secureMarkdownLinks(html: string) {
   return html.replace(/<a\s+([^>]*?)>/gi, (_match, attrs) => {
     let nextAttrs = String(attrs)

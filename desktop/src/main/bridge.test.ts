@@ -551,13 +551,11 @@ describe('chat responses bridge', () => {
     expect(upstream.requests).toHaveLength(1)
   })
 
-  test('retries Responses passthrough after moving existing reasoning before function_call on 400', async () => {
+  test('retries Responses passthrough after moving required reasoning before function_call on 400', async () => {
     let callCount = 0
     const upstream = await startUpstream((_req, res, body) => {
       callCount++
       if (callCount === 1) {
-        // First attempt: payload includes the function_call before its real
-        // reasoning item, which the Responses API rejects.
         const types = body.input.map((item: any) => item.type)
         expect(types).toContain('function_call')
         jsonResponse(res, 400, {
@@ -590,6 +588,7 @@ describe('chat responses bridge', () => {
       model: 'test-model',
       stream: false,
       input: [
+        { type: 'reasoning', id: 'rs_other', summary: [], encrypted_content: 'other-reasoning' },
         { type: 'function_call', id: 'fc_bad', call_id: 'call_bad', name: 'shell', arguments: '{}' },
         { type: 'reasoning', id: 'rs_missing', summary: [], encrypted_content: 'encrypted-reasoning' },
         { type: 'function_call_output', call_id: 'call_bad', output: 'ok' },
@@ -636,6 +635,7 @@ describe('chat responses bridge', () => {
       model: 'test-model',
       stream: false,
       input: [
+        { type: 'reasoning', id: 'rs_other', summary: [], encrypted_content: 'other-reasoning' },
         { type: 'function_call', id: 'fc_0497a6a51676d315006a04b2a368f481959456a49df72b0bdb', call_id: 'call_bad', name: 'shell', arguments: '{}' },
         { type: 'reasoning', id: 'rs_0497a6a51676d315006a04b2a275448195a9df3a0571e729f1', summary: [], content: [] },
         { type: 'function_call_output', call_id: 'call_bad', output: 'ok' },
@@ -647,5 +647,68 @@ describe('chat responses bridge', () => {
 
     expect(response.status).toBe(200)
     expect(callCount).toBe(2)
+  })
+
+  test('pre-sanitizes adjacent empty reasoning placeholders before forwarding Responses passthrough', async () => {
+    const upstream = await startUpstream((_req, res, body) => {
+      const ids = body.input.filter((i: any) => i.type === 'function_call').map((i: any) => i.id)
+      expect(ids).not.toContain('fc_bad')
+      expect(ids).toContain('fc_good')
+      const outputCallIds = body.input.filter((i: any) => i.type === 'function_call_output').map((i: any) => i.call_id)
+      expect(outputCallIds).not.toContain('call_bad')
+      expect(outputCallIds).toContain('call_good')
+      const reasoningIds = body.input.filter((i: any) => i.type === 'reasoning').map((i: any) => i.id)
+      expect(reasoningIds).not.toContain('rs_empty')
+      jsonResponse(res, 200, { id: 'resp_ok', object: 'response', status: 'completed', output: [] })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key', mode: 'responses' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: [
+        { type: 'function_call', id: 'fc_bad', call_id: 'call_bad', name: 'shell', arguments: '{}' },
+        { type: 'reasoning', id: 'rs_empty', summary: [], content: [] },
+        { type: 'function_call_output', call_id: 'call_bad', output: 'ok' },
+        { type: 'reasoning', id: 'rs_good', summary: [], encrypted_content: 'encrypted-reasoning' },
+        { type: 'function_call', id: 'fc_good', call_id: 'call_good', name: 'shell', arguments: '{}' },
+        { type: 'function_call_output', call_id: 'call_good', output: 'ok' },
+        { type: 'message', role: 'user', content: 'next' }
+      ]
+    })
+
+    expect(response.status).toBe(200)
+    expect(upstream.requests).toHaveLength(1)
+  })
+
+  test('pre-sanitizes misplaced reusable reasoning before forwarding Responses passthrough', async () => {
+    const upstream = await startUpstream((_req, res, body) => {
+      const input = body.input
+      const reasoningIndex = input.findIndex((i: any) => i.type === 'reasoning' && i.id === 'rs_late')
+      const callIndex = input.findIndex((i: any) => i.type === 'function_call' && i.id === 'fc_bad')
+      expect(reasoningIndex).toBeGreaterThanOrEqual(0)
+      expect(callIndex).toBe(reasoningIndex + 1)
+      expect(input[reasoningIndex]?.encrypted_content).toBe('encrypted-reasoning')
+      jsonResponse(res, 200, { id: 'resp_ok', object: 'response', status: 'completed', output: [] })
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key', mode: 'responses' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: false,
+      input: [
+        { type: 'function_call', id: 'fc_bad', call_id: 'call_bad', name: 'shell', arguments: '{}' },
+        { type: 'reasoning', id: 'rs_late', summary: [], encrypted_content: 'encrypted-reasoning' },
+        { type: 'function_call_output', call_id: 'call_bad', output: 'ok' },
+        { type: 'message', role: 'user', content: 'next' }
+      ]
+    })
+
+    expect(response.status).toBe(200)
+    expect(upstream.requests).toHaveLength(1)
   })
 })

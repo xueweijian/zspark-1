@@ -5,12 +5,14 @@ describe('artifact helpers', () => {
   test('extracts workspace artifact paths from assistant text', () => {
     const text = [
       'Final file: `outputs/manual/presentations/demo/output/Jinko.pptx`',
+      'Short verified file: `PPO-RL.pptx`',
       'Preview path: "/tmp/zspark/preview/contact-sheet.png".',
       'Not a local artifact: source.pptx or https://example.com/deck.pptx'
     ].join('\n')
 
     expect(extractArtifactPathCandidates(text)).toEqual([
       'outputs/manual/presentations/demo/output/Jinko.pptx',
+      'PPO-RL.pptx',
       '/tmp/zspark/preview/contact-sheet.png'
     ])
   })
