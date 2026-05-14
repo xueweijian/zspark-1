@@ -80,9 +80,11 @@ const ApprovalRequestSchema = z.object({
   reason: z.string().max(1000).optional(),
   paths: z.array(z.string().max(1200)).max(200),
   params: ApprovalParamsSchema.optional(),
-  status: z.enum(['pending', 'sending', 'approved', 'denied', 'resolved']),
+  status: z.enum(['pending', 'sending', 'approved', 'approvedAll', 'denied', 'resolved']),
   startedAt: z.number()
 }).strict()
+
+const TurnBlockStatusSchema = z.enum(['running', 'completed', 'interrupted', 'failed'])
 
 const TurnInputItemSchema = z.object({
   type: z.enum(['text', 'image', 'localImage', 'skill', 'mention'])
@@ -126,7 +128,8 @@ const SnapshotBlockSchema = z.discriminatedUnion('type', [
     collapsed: z.boolean(),
     finalMessageId: z.string().max(240).optional(),
     startedAt: z.number(),
-    endedAt: z.number().optional()
+    endedAt: z.number().optional(),
+    status: TurnBlockStatusSchema.optional()
   }).strict()
 ])
 

@@ -49,7 +49,8 @@ function realpathOfDeepestExistingAncestor(path: string): string {
         // a syntactic resolve so callers still get a sane absolute path.
         return resolve(path)
       }
-      tail.push(dir.slice(parent.length).replace(new RegExp(`^${sep}`), ''))
+      const segment = dir.slice(parent.length)
+      tail.push(segment.startsWith(sep) ? segment.slice(sep.length) : segment)
       dir = parent
     }
   }

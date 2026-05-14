@@ -909,6 +909,10 @@ function DesktopApp() {
   // PATCH that resolves after a newer one would clobber the dedup state and
   // make us re-emit the freshly-applied snapshot on the next render tick.
   const inFlightSharedSnapshotKey = useRef('')
+  // Shared snapshots are revisioned on the server. Keep local PATCHes in
+  // order so a newer render uses the revision returned by the previous PATCH
+  // instead of racing it and reporting a false conflict.
+  const sharedSnapshotSyncQueue = useRef<Promise<void>>(Promise.resolve())
   const activeSharedSnapshotRevision = useRef<number | null>(null)
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
@@ -2264,12 +2268,15 @@ function DesktopApp() {
       const snapshotKey = JSON.stringify({ activeSharedWorkspace, activeSharedSession, localThreadId, title, blocks })
       if (snapshotKey === lastSharedSnapshotKey.current) return
       inFlightSharedSnapshotKey.current = snapshotKey
-      void window.zspark.enterpriseUpdateSession(activeSharedWorkspace, activeSharedSession, {
-        title,
-        localThreadId,
-        baseRevision: activeSharedSnapshotRevision.current,
-        snapshot
-      }).then((result) => {
+      const nextSync = sharedSnapshotSyncQueue.current.catch(() => undefined).then(async () => {
+        if (activeSharedWorkspaceRef.current !== activeSharedWorkspace || activeSharedSessionRef.current !== activeSharedSession) return
+        if (snapshotKey === lastSharedSnapshotKey.current) return
+        const result = await window.zspark.enterpriseUpdateSession(activeSharedWorkspace, activeSharedSession, {
+          title,
+          localThreadId,
+          baseRevision: activeSharedSnapshotRevision.current,
+          snapshot
+        })
         if (!result.ok) {
           if (result.status === 409) {
             setEnterpriseError('This shared session changed on another device. Reopen it before sending more changes.')
@@ -2290,6 +2297,8 @@ function DesktopApp() {
             : session
         )))
       })
+      sharedSnapshotSyncQueue.current = nextSync.catch(() => undefined)
+      void nextSync
     }, 800)
     return () => {
       if (sharedSyncTimer.current) window.clearTimeout(sharedSyncTimer.current)
