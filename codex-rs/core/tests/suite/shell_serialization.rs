@@ -117,6 +117,106 @@ fn configure_shell_model(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn completed_reasoning_and_function_call_are_replayed_before_tool_output() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let server = start_mock_server().await;
+    let test = configure_shell_model(
+        test_codex(),
+        ShellModelOutput::Shell,
+        /*include_apply_patch_tool*/ false,
+    )
+    .build(&server)
+    .await?;
+
+    let call_id = "call-responses-history-order";
+    let arguments = json!({
+        "command": ["/bin/echo", "responses history order"],
+        "timeout_ms": 2_000,
+    })
+    .to_string();
+    let function_call = json!({
+        "id": "fc_responses_history_order",
+        "type": "function_call",
+        "call_id": call_id,
+        "name": "shell",
+        "arguments": arguments,
+    });
+    let reasoning = json!({
+        "id": "rs_responses_history_order",
+        "type": "reasoning",
+        "encrypted_content": "encrypted-reasoning",
+    });
+
+    let first_response = sse(vec![
+        ev_response_created("resp-1"),
+        json!({
+            "type": "response.output_item.done",
+            "item": function_call.clone(),
+        }),
+        json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp-1",
+                "output": [reasoning, function_call],
+                "usage": {
+                    "input_tokens": 0,
+                    "input_tokens_details": null,
+                    "output_tokens": 0,
+                    "output_tokens_details": null,
+                    "total_tokens": 0
+                }
+            }
+        }),
+    ]);
+    let second_response = sse(vec![
+        ev_assistant_message("msg-1", "done"),
+        ev_completed("resp-2"),
+    ]);
+    let responses = mount_sse_sequence(&server, vec![first_response, second_response]).await;
+
+    test.submit_turn_with_permission_profile(
+        "run the responses history order command",
+        PermissionProfile::Disabled,
+    )
+    .await?;
+
+    let requests = responses.requests();
+    assert_eq!(requests.len(), 2);
+    let input = requests[1].input();
+
+    let reasoning_index = input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("reasoning")
+                && item.get("id").and_then(Value::as_str) == Some("rs_responses_history_order")
+        })
+        .expect("reasoning item should be replayed in the follow-up request");
+    let function_call_index = input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call")
+                && item.get("id").and_then(Value::as_str) == Some("fc_responses_history_order")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .expect("function_call item should be replayed in the follow-up request");
+    let function_output_index = input
+        .iter()
+        .position(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some(call_id)
+        })
+        .expect("function_call_output item should be replayed in the follow-up request");
+
+    assert!(
+        reasoning_index < function_call_index && function_call_index < function_output_index,
+        "expected reasoning -> function_call -> function_call_output in follow-up input, got {input:#?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[test_case(ShellModelOutput::Shell)]
 #[test_case(ShellModelOutput::LocalShell)]
 async fn shell_output_stays_json_without_freeform_apply_patch(

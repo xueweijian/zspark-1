@@ -150,6 +150,43 @@ async fn responses_websocket_streams_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_request_preserves_response_item_ids() {
+    skip_if_no_network!();
+
+    let server = start_websocket_server(vec![vec![vec![
+        ev_response_created("resp-1"),
+        ev_completed("resp-1"),
+    ]]])
+    .await;
+
+    let harness = websocket_harness(&server).await;
+    let mut client_session = harness.client.new_session();
+    let prompt = prompt_with_input(vec![
+        ResponseItem::Reasoning {
+            id: "rs_ws_context".to_string(),
+            summary: Vec::new(),
+            content: None,
+            encrypted_content: Some("encrypted-reasoning".to_string()),
+        },
+        ResponseItem::FunctionCall {
+            id: Some("fc_ws_context".to_string()),
+            name: "shell".to_string(),
+            namespace: None,
+            arguments: "{}".to_string(),
+            call_id: "call_ws_context".to_string(),
+        },
+    ]);
+
+    stream_until_complete(&mut client_session, &harness, &prompt).await;
+
+    let connection = server.single_connection();
+    let body = connection.first().expect("missing request").body_json();
+
+    assert_eq!(body["input"][0]["id"].as_str(), Some("rs_ws_context"));
+    assert_eq!(body["input"][1]["id"].as_str(), Some("fc_ws_context"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_streams_without_feature_flag_when_provider_supports_websockets() {
     skip_if_no_network!();
 

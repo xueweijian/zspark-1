@@ -671,9 +671,9 @@ pub async fn process_sse(
                             .send(Ok(ResponseEvent::OutputItemDone(item)))
                             .await
                             .is_err()
-                        {
-                            return;
-                        }
+                    {
+                        return;
+                    }
                     continue;
                 }
                 if is_completed {
