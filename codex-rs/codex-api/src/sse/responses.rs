@@ -144,10 +144,25 @@ struct ResponseCompleted {
 pub(crate) struct CompletedOutputTracker {
     emitted_item_ids: HashSet<String>,
     emitted_items_without_ids: Vec<ResponseItem>,
+    pending_added_reasoning_items: Vec<ResponseItem>,
     pending_output_items: Vec<ResponseItem>,
 }
 
 impl CompletedOutputTracker {
+    pub(crate) fn output_item_added(&mut self, item: &ResponseItem) {
+        if !matches!(item, ResponseItem::Reasoning { .. })
+            || self.has_emitted(item)
+            || self
+                .pending_added_reasoning_items
+                .iter()
+                .any(|pending| same_response_item(pending, item))
+        {
+            return;
+        }
+
+        self.pending_added_reasoning_items.push(item.clone());
+    }
+
     pub(crate) fn output_item_done(&mut self, item: ResponseItem) -> Option<ResponseItem> {
         if should_delay_until_completed(&item) {
             self.pending_output_items.push(item);
@@ -179,19 +194,21 @@ impl CompletedOutputTracker {
             .as_ref()
             .and_then(|response| response.get("output"))
         else {
-            return self.take_pending_output_items();
+            return self.take_pending_items();
         };
 
         let Some(output_values) = output.as_array() else {
             debug!("response.completed output was not an array");
-            return self.take_pending_output_items();
+            return self.take_pending_items();
         };
 
+        let completed_items: Vec<ResponseItem> = output_values
+            .iter()
+            .filter_map(|value| parse_completed_output_item(value.clone()))
+            .collect();
         let mut emit = Vec::new();
-        for value in output_values {
-            let Some(item) = parse_completed_output_item(value.clone()) else {
-                continue;
-            };
+        emit.extend(self.take_pending_added_reasoning_missing_from(&completed_items));
+        for item in completed_items {
             if self.has_emitted(&item) {
                 continue;
             }
@@ -200,14 +217,58 @@ impl CompletedOutputTracker {
             emit.push(item);
         }
 
+        emit.extend(self.take_pending_added_reasoning_items());
         emit.extend(self.take_pending_output_items());
 
+        emit
+    }
+
+    fn take_pending_items(&mut self) -> Vec<ResponseItem> {
+        let mut emit = self.take_pending_added_reasoning_items();
+        emit.extend(self.take_pending_output_items());
         emit
     }
 
     fn take_pending_output_items(&mut self) -> Vec<ResponseItem> {
         let mut emit = Vec::new();
         for item in std::mem::take(&mut self.pending_output_items) {
+            if self.has_emitted(&item) {
+                continue;
+            }
+            self.record_emitted_item(&item);
+            emit.push(item);
+        }
+        emit
+    }
+
+    fn take_pending_added_reasoning_missing_from(
+        &mut self,
+        completed_items: &[ResponseItem],
+    ) -> Vec<ResponseItem> {
+        let mut emit = Vec::new();
+        let mut still_pending = Vec::new();
+        for item in std::mem::take(&mut self.pending_added_reasoning_items) {
+            if self.has_emitted(&item) {
+                continue;
+            }
+            if completed_items
+                .iter()
+                .any(|completed| same_response_item(completed, &item))
+            {
+                still_pending.push(item);
+                continue;
+            }
+
+            self.record_emitted_item(&item);
+            emit.push(item);
+        }
+        self.pending_added_reasoning_items = still_pending;
+        emit
+    }
+
+    fn take_pending_added_reasoning_items(&mut self) -> Vec<ResponseItem> {
+        let mut emit = Vec::new();
+        for item in std::mem::take(&mut self.pending_added_reasoning_items) {
             if self.has_emitted(&item) {
                 continue;
             }
@@ -241,6 +302,13 @@ impl CompletedOutputTracker {
             .iter()
             .position(|pending| pending == item)
             .map(|index| self.pending_output_items.remove(index))
+    }
+}
+
+fn same_response_item(a: &ResponseItem, b: &ResponseItem) -> bool {
+    match (response_item_id(a), response_item_id(b)) {
+        (Some(a_id), Some(b_id)) => a_id == b_id,
+        _ => a == b,
     }
 }
 
@@ -687,6 +755,9 @@ pub async fn process_sse(
                         }
                     }
                 }
+                if let ResponseEvent::OutputItemAdded(item) = &event {
+                    completed_output_tracker.output_item_added(item);
+                }
                 if tx_event.send(Ok(event)).await.is_err() {
                     return;
                 }
@@ -1004,6 +1075,103 @@ mod tests {
                 call_id,
                 ..
             }) if id == "fc_1" && call_id == "call_1"
+        );
+        assert_matches!(&events[2], ResponseEvent::Completed { .. });
+    }
+
+    #[tokio::test]
+    async fn process_sse_preserves_added_reasoning_when_completed_output_omits_it() {
+        let reasoning = json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": []
+        });
+        let function_call = json!({
+            "id": "fc_1",
+            "type": "function_call",
+            "name": "shell",
+            "arguments": "{}",
+            "call_id": "call_1"
+        });
+        let events = run_sse(vec![
+            json!({
+                "type": "response.output_item.added",
+                "item": reasoning
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": function_call.clone()
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp1",
+                    "output": [function_call]
+                }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 4);
+        assert_matches!(
+            &events[0],
+            ResponseEvent::OutputItemAdded(ResponseItem::Reasoning { id, .. }) if id == "rs_1"
+        );
+        assert_matches!(
+            &events[1],
+            ResponseEvent::OutputItemDone(ResponseItem::Reasoning { id, .. }) if id == "rs_1"
+        );
+        assert_matches!(
+            &events[2],
+            ResponseEvent::OutputItemDone(ResponseItem::FunctionCall {
+                id: Some(id),
+                call_id,
+                ..
+            }) if id == "fc_1" && call_id == "call_1"
+        );
+        assert_matches!(&events[3], ResponseEvent::Completed { .. });
+    }
+
+    #[tokio::test]
+    async fn process_sse_prefers_completed_reasoning_over_added_placeholder() {
+        let added_reasoning = json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": []
+        });
+        let completed_reasoning = json!({
+            "id": "rs_1",
+            "type": "reasoning",
+            "summary": [],
+            "encrypted_content": "encrypted"
+        });
+        let events = run_sse(vec![
+            json!({
+                "type": "response.output_item.added",
+                "item": added_reasoning
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp1",
+                    "output": [completed_reasoning]
+                }
+            }),
+        ])
+        .await;
+
+        assert_eq!(events.len(), 3);
+        assert_matches!(
+            &events[0],
+            ResponseEvent::OutputItemAdded(ResponseItem::Reasoning { id, .. }) if id == "rs_1"
+        );
+        assert_matches!(
+            &events[1],
+            ResponseEvent::OutputItemDone(ResponseItem::Reasoning {
+                id,
+                encrypted_content: Some(content),
+                ..
+            }) if id == "rs_1" && content == "encrypted"
         );
         assert_matches!(&events[2], ResponseEvent::Completed { .. });
     }

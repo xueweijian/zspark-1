@@ -678,6 +678,9 @@ async fn run_websocket_response_stream(
                                     tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                             }
                         }
+                        if let ResponseEvent::OutputItemAdded(item) = &event {
+                            completed_output_tracker.output_item_added(item);
+                        }
                         let _ = tx_event.send(Ok(event)).await;
                         if is_completed {
                             break;
