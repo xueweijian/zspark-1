@@ -279,23 +279,47 @@ function isResponsesUpstream(cfg: UpstreamConfig): boolean {
   }
 }
 
-/**
- * Parse the OpenAI Responses error message:
- *   "Item 'fc_…' of type 'function_call' was provided without its
- *    required 'reasoning' item: 'rs_…'."
- * Returns the orphaned function_call id (fc_…) we should strip from the
- * next attempt, or null if the error is something else.
- */
-function extractOrphanedFunctionCallId(raw: string): string | null {
-  const match = raw.match(/Item '([^']+)' of type 'function_call' was provided without its required 'reasoning' item/)
-  return match ? match[1] : null
+interface OrphanedFunctionCallError {
+  functionCallId: string
+  reasoningId: string | null
 }
 
 /**
- * Drop a specific function_call (by id or call_id) and its paired
- * function_call_output from `payload.input`. Used for retry-after-400
- * recovery when upstream complains about an orphaned reasoning pair.
+ * Parse the OpenAI Responses error message:
+ *   "Item 'fc_...' of type 'function_call' was provided without its
+ *    required 'reasoning' item: 'rs_...'."
  */
+function extractOrphanedFunctionCallError(raw: string): OrphanedFunctionCallError | null {
+  const match = raw.match(/Item '([^']+)' of type 'function_call' was provided without its required 'reasoning' item(?:: '([^']+)')?/)
+  return match ? { functionCallId: match[1], reasoningId: match[2] ?? null } : null
+}
+
+function isFunctionCallMatch(item: any, fcIdentifier: string): boolean {
+  if (item?.type !== 'function_call') return false
+  return item.id === fcIdentifier || item.call_id === fcIdentifier
+}
+
+function hasReasoningItem(payload: any, reasoningId: string): boolean {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) return false
+  return payload.input.some((item: any) => item?.type === 'reasoning' && item.id === reasoningId)
+}
+
+function insertMissingReasoningItem(
+  payload: any,
+  fcIdentifier: string,
+  reasoningId: string
+): { payload: any; inserted: boolean } {
+  if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) {
+    return { payload, inserted: false }
+  }
+  if (hasReasoningItem(payload, reasoningId)) return { payload, inserted: false }
+  const index = payload.input.findIndex((item: any) => isFunctionCallMatch(item, fcIdentifier))
+  if (index < 0) return { payload, inserted: false }
+  const input = [...payload.input]
+  input.splice(index, 0, reasoningItem(reasoningId))
+  return { payload: { ...payload, input }, inserted: true }
+}
+
 function stripFunctionCall(payload: any, fcIdentifier: string): { payload: any; dropped: boolean } {
   if (!payload || typeof payload !== 'object' || !Array.isArray(payload.input)) {
     return { payload, dropped: false }
@@ -303,24 +327,33 @@ function stripFunctionCall(payload: any, fcIdentifier: string): { payload: any; 
   const items: any[] = payload.input
   const orphanedCallIds = new Set<string>()
   let dropped = false
-  const filtered: any[] = []
   for (const item of items) {
-    if (item?.type === 'function_call') {
-      const itemId = typeof item.id === 'string' ? item.id : null
-      const callId = typeof item.call_id === 'string' ? item.call_id : null
-      if (itemId === fcIdentifier || callId === fcIdentifier) {
-        if (callId) orphanedCallIds.add(callId)
-        dropped = true
-        continue
-      }
+    if (isFunctionCallMatch(item, fcIdentifier)) {
+      if (typeof item.call_id === 'string') orphanedCallIds.add(item.call_id)
+      dropped = true
     }
-    if (item?.type === 'function_call_output' && typeof item.call_id === 'string' && orphanedCallIds.has(item.call_id)) {
-      continue
-    }
-    filtered.push(item)
   }
   if (!dropped) return { payload, dropped: false }
+  const filtered = items.filter((item) => {
+    if (isFunctionCallMatch(item, fcIdentifier)) return false
+    if (item?.type === 'function_call_output' && typeof item.call_id === 'string' && orphanedCallIds.has(item.call_id)) {
+      return false
+    }
+    return true
+  })
   return { payload: { ...payload, input: filtered }, dropped: true }
+}
+
+function recoverOrphanedFunctionCall(
+  payload: any,
+  error: OrphanedFunctionCallError
+): { payload: any; recovered: boolean } {
+  if (error.reasoningId && !hasReasoningItem(payload, error.reasoningId)) {
+    const inserted = insertMissingReasoningItem(payload, error.functionCallId, error.reasoningId)
+    if (inserted.inserted) return { payload: inserted.payload, recovered: true }
+  }
+  const stripped = stripFunctionCall(payload, error.functionCallId)
+  return { payload: stripped.payload, recovered: stripped.dropped }
 }
 
 const MAX_RESPONSES_RETRY_ATTEMPTS = 4
@@ -380,14 +413,20 @@ async function handleResponsesPassthrough(
     if (!upstreamDone && !res.writableEnded) abortUpstream()
   })
 
+  let activeAttempt = 0
   const attempt = (currentBody: Buffer, attemptIndex: number): void => {
+    const attemptToken = ++activeAttempt
+    upstreamDone = false
     sendResponsesRequest(
       cfg,
       currentBody,
       stream,
       (upstreamRes) => {
-        upstreamRes.on('end', () => { upstreamDone = true })
-        upstreamRes.on('close', () => { upstreamDone = true })
+        const markDone = () => {
+          if (activeAttempt === attemptToken) upstreamDone = true
+        }
+        upstreamRes.on('end', markDone)
+        upstreamRes.on('close', markDone)
         const status = upstreamRes.statusCode ?? 502
         // Only intercept 400s — they're the only ones that carry the
         // reasoning-orphan error. Buffer the body so we can sniff it.
@@ -396,12 +435,12 @@ async function handleResponsesPassthrough(
           upstreamRes.on('data', (c) => chunks.push(c))
           upstreamRes.on('end', () => {
             const raw = Buffer.concat(chunks).toString('utf8')
-            const orphanId = extractOrphanedFunctionCallId(raw)
-            if (orphanId) {
-              const { payload: cleaned, dropped } = stripFunctionCall(payload, orphanId)
-              if (dropped) {
-                payload = cleaned
-                const nextBody = Buffer.from(JSON.stringify(cleaned), 'utf8')
+            const orphanError = extractOrphanedFunctionCallError(raw)
+            if (orphanError) {
+              const recovered = recoverOrphanedFunctionCall(payload, orphanError)
+              if (recovered.recovered) {
+                payload = recovered.payload
+                const nextBody = Buffer.from(JSON.stringify(recovered.payload), 'utf8')
                 attempt(nextBody, attemptIndex + 1)
                 return
               }
@@ -425,6 +464,7 @@ async function handleResponsesPassthrough(
         }
       },
       (err) => {
+        if (activeAttempt !== attemptToken) return
         upstreamDone = true
         if (String(err.message).includes('downstream closed')) return
         if (responseWritable(res)) {
