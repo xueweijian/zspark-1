@@ -9,8 +9,10 @@ import {
   fmtBytes,
   fmtDuration,
   formatUserInputContent,
+  findSharedWorkspaceFileForPath,
   isSharedArtifactPath,
   scopeLabel,
+  sharedArtifactFile,
   sharedArtifactPath,
   stripInternalPromptContext,
   titleFromBlocks,
@@ -60,6 +62,28 @@ describe('changes / shared artifacts', () => {
     expect(p).toBe('shared://w/s/a/name.txt')
     expect(isSharedArtifactPath(p)).toBe(true)
     expect(isSharedArtifactPath('/local/file')).toBe(false)
+  })
+  test('findSharedWorkspaceFileForPath matches shared artifacts by path or basename', () => {
+    const shared = sharedArtifactFile('w', 's', {
+      id: 'artifact-1',
+      name: 'Year-End-Review.pptx',
+      size_bytes: 1234,
+      created_at: '2026-05-14T00:00:00.000Z'
+    } as any)
+    const localUploaded = {
+      ...shared,
+      id: 'local-upload',
+      path: 'C:\\\\Users\\\\root123\\\\Documents\\\\zspark\\\\outputs\\\\Year-End-Review.pptx'
+    }
+    const files = [
+      { id: 'local', name: 'note.txt', path: '/tmp/note.txt', source: 'change', status: 'created', updatedAt: 1 },
+      localUploaded,
+      shared
+    ] as any
+
+    expect(findSharedWorkspaceFileForPath(files, shared.path)).toEqual(shared)
+    expect(findSharedWorkspaceFileForPath(files, 'outputs/final/Year-End-Review.pptx')).toEqual(localUploaded)
+    expect(findSharedWorkspaceFileForPath(files, 'outputs/final/missing.pptx')).toBeNull()
   })
 })
 

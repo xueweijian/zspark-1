@@ -359,6 +359,22 @@ export function isSharedArtifactPath(path?: string): boolean {
   return Boolean(path?.startsWith('shared://'))
 }
 
+function artifactLookupName(path?: string): string {
+  return basename(String(path ?? '')).trim().toLowerCase()
+}
+
+export function findSharedWorkspaceFileForPath(files: WorkspaceFile[], path?: string): WorkspaceFile | null {
+  const rawPath = String(path ?? '').trim()
+  if (!rawPath) return null
+  const sharedFiles = files.filter((file) => file.sharedArtifact)
+  const exact = sharedFiles.find((file) => file.path === rawPath)
+  if (exact) return exact
+
+  const name = artifactLookupName(rawPath)
+  if (!name) return null
+  return sharedFiles.find((file) => artifactLookupName(file.name) === name || artifactLookupName(file.path) === name) ?? null
+}
+
 export function sharedArtifactFile(workspaceId: string, sessionId: string, artifact: SharedArtifact): WorkspaceFile {
   const createdAt = artifact.created_at ? Date.parse(artifact.created_at) : Date.now()
   return {

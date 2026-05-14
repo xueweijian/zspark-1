@@ -115,7 +115,7 @@ export interface ProviderForm {
   wireApi: 'responses' | 'chat'
 }
 
-export type Panel = null | 'search' | 'skills' | 'plugins' | 'automations' | 'history' | 'shared'
+export type Panel = null | 'search' | 'skills' | 'plugins' | 'automations' | 'history' | 'shared' | 'files'
 
 export interface ThreadSummary {
   id: string
