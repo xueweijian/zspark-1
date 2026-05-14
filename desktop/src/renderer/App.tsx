@@ -179,6 +179,8 @@ declare global {
       enterpriseArtifacts: (workspaceId: string, sessionId: string) => Promise<{ ok: boolean; artifacts?: SharedArtifact[]; status?: number; error?: string }>
       enterpriseUploadArtifact: (workspaceId: string, sessionId: string, filePath: string, meta?: { name?: string; mimeType?: string; turnId?: string }) => Promise<{ ok: boolean; artifact?: SharedArtifact; status?: number; error?: string }>
       enterpriseDownloadArtifact: (workspaceId: string, sessionId: string, artifactId: string, name?: string) => Promise<{ ok: boolean; path?: string; canceled?: boolean; status?: number; error?: string }>
+      enterpriseDownloadArtifactToCache: (workspaceId: string, sessionId: string, artifactId: string, name?: string) => Promise<{ ok: boolean; path?: string; status?: number; error?: string }>
+      enterpriseOpenArtifactCache: (workspaceId?: string, sessionId?: string) => Promise<{ ok: boolean; path?: string; error?: string }>
       onEnterpriseDeviceCode: (cb: (payload: EnterpriseDeviceCode) => void) => void | (() => void)
       onStdout: (cb: (s: string) => void) => void | (() => void)
       onStderr: (cb: (s: string) => void) => void | (() => void)
@@ -1193,14 +1195,17 @@ function DesktopApp() {
     files: WorkspaceFile[],
     options: { title?: string; subtitle?: string; tone?: 'normal' | 'warn' } = {}
   ) => {
-    if (files.length === 0) return
+    const displayFiles = activeSharedWorkspaceRef.current
+      ? files.filter((file) => file.sharedArtifact || file.status === 'missing')
+      : files
+    if (displayFiles.length === 0) return
     const id = `files-${itemId}`
-    const title = options.title ?? `${files.length} file${files.length === 1 ? '' : 's'} ready`
-    for (const file of files) {
+    const title = options.title ?? `${displayFiles.length} file${displayFiles.length === 1 ? '' : 's'} ready`
+    for (const file of displayFiles) {
       if (file.status !== 'missing') shownArtifactPaths.current.add(file.path)
     }
     setBlocks((bs) => {
-      const next = { type: 'files' as const, id, turnId, title, files, subtitle: options.subtitle, tone: options.tone ?? 'normal' }
+      const next = { type: 'files' as const, id, turnId, title, files: displayFiles, subtitle: options.subtitle, tone: options.tone ?? 'normal' }
       if (bs.some((b) => b.id === id)) return bs.map((b) => (b.id === id ? next : b))
       return [...bs, next]
     })
@@ -2645,10 +2650,10 @@ function DesktopApp() {
     if (file.sharedArtifact) {
       const { workspaceId, sessionId, artifactId } = file.sharedArtifact
       try {
-        const result = await window.zspark.enterpriseDownloadArtifact(workspaceId, sessionId, artifactId, file.name)
+        const result = await window.zspark.enterpriseDownloadArtifactToCache(workspaceId, sessionId, artifactId, file.name)
         if (result.ok) {
-          toast('info', `Saved to ${shortPath(result.path)}`)
-        } else if (!result.canceled) {
+          toast('info', `Downloaded to ${shortPath(result.path)}`)
+        } else {
           toast('error', result.error ?? 'Could not download shared artifact')
         }
       } catch (err: any) {
@@ -2661,7 +2666,17 @@ function DesktopApp() {
 
   const openWorkspaceFile = async (file: WorkspaceFile) => {
     if (file.sharedArtifact) {
-      await downloadWorkspaceFile(file)
+      const { workspaceId, sessionId, artifactId } = file.sharedArtifact
+      try {
+        const result = await window.zspark.enterpriseDownloadArtifactToCache(workspaceId, sessionId, artifactId, file.name)
+        if (result.ok && result.path) {
+          await openFilePath(result.path)
+        } else {
+          toast('error', result.error ?? 'Could not open shared artifact')
+        }
+      } catch (err: any) {
+        toast('error', err?.message ?? String(err))
+      }
       return
     }
     await openFilePath(file.path)
@@ -2691,6 +2706,18 @@ function DesktopApp() {
       return
     }
     await openFilePath(path)
+  }
+
+  const openSharedArtifactFolder = async () => {
+    try {
+      const result = await window.zspark.enterpriseOpenArtifactCache(
+        activeSharedWorkspaceRef.current ?? undefined,
+        activeSharedSessionRef.current ?? undefined
+      )
+      if (!result.ok) toast('error', result.error ?? 'Could not open shared artifact folder')
+    } catch (err: any) {
+      toast('error', err?.message ?? String(err))
+    }
   }
 
   const refreshSkills = async (forceReload = false) => {
@@ -3033,6 +3060,8 @@ function DesktopApp() {
   const activeSharedSessionTitle = sharedSessions.find((session) => session.id === activeSharedSession)?.title
   const visibleThreads = activeSharedWorkspace ? sharedSessions.map(sharedSessionToThread) : threads
   const activeThreadId = activeSharedWorkspace ? activeSharedSession : thread
+  const sharedWorkspaceFiles = workspaceFiles.filter((file) => file.sharedArtifact)
+  const visibleWorkspaceFiles = activeSharedWorkspace ? sharedWorkspaceFiles : workspaceFiles
 
   return (
     <div className="app">
@@ -3353,7 +3382,7 @@ function DesktopApp() {
           {runtime.activePermissionProfile?.id && <div className="kv"><span className="k">Profile</span><span className="v">{runtime.activePermissionProfile.id}</span></div>}
         </div>
         <div className="right-section">
-          <h4>Files</h4>
+          <h4>{activeSharedWorkspace ? 'Shared artifacts' : 'Files'}</h4>
           <div className="file-actions">
             <button onClick={() => activeSharedWorkspace ? refreshSharedArtifactsForActiveSession(true) : revealFilePath(runtime.attachmentDir)} disabled={activeSharedWorkspace ? !activeSharedSession : !runtime.attachmentDir}>
               {activeSharedWorkspace ? 'Refresh shared' : 'Attachments'}
@@ -3362,16 +3391,21 @@ function DesktopApp() {
               {activeSharedWorkspace ? 'Local runtime' : 'Workspace'}
             </button>
             {activeSharedWorkspace && (
+              <button onClick={openSharedArtifactFolder} disabled={!activeSharedSession}>
+                Open downloads
+              </button>
+            )}
+            {activeSharedWorkspace && (
               <button onClick={() => openPanel('files')} disabled={!activeSharedSession}>
-                Open files
+                Artifacts
               </button>
             )}
           </div>
-          {workspaceFiles.length === 0 ? (
+          {visibleWorkspaceFiles.length === 0 ? (
             <div className="right-empty">{activeSharedWorkspace ? 'No shared artifacts yet.' : 'No attached or changed files yet.'}</div>
           ) : (
             <div className="file-list">
-              {workspaceFiles.slice(0, 8).map((file) => (
+              {visibleWorkspaceFiles.slice(0, 8).map((file) => (
                 <div className="file-row" key={file.path}>
                   <div className="file-row-main">
                     <span className={`file-status file-status-${file.status}`}>{file.status}</span>
@@ -3504,7 +3538,7 @@ function DesktopApp() {
       )}
 
       {panel === 'files' && (
-        <Drawer title={activeSharedWorkspace ? 'Shared workspace files' : 'Workspace files'} onClose={() => setPanel(null)}>
+        <Drawer title={activeSharedWorkspace ? 'Shared artifacts' : 'Workspace files'} onClose={() => setPanel(null)}>
           <div className="shared-panel">
             <div className="file-actions">
               <button onClick={() => activeSharedWorkspace ? refreshSharedArtifactsForActiveSession(true) : revealFilePath(runtime.attachmentDir)} disabled={activeSharedWorkspace ? !activeSharedSession : !runtime.attachmentDir}>
@@ -3513,12 +3547,17 @@ function DesktopApp() {
               <button onClick={() => revealFilePath(runtime.workspaceRoot)} disabled={!runtime.workspaceRoot}>
                 Local runtime
               </button>
+              {activeSharedWorkspace && (
+                <button onClick={openSharedArtifactFolder} disabled={!activeSharedSession}>
+                  Open downloads
+                </button>
+              )}
             </div>
-            {workspaceFiles.length === 0 ? (
+            {visibleWorkspaceFiles.length === 0 ? (
               <div className="drawer-empty">{activeSharedWorkspace ? 'No shared artifacts for this session yet.' : 'No attached or changed files yet.'}</div>
             ) : (
               <div className="artifact-list">
-                {workspaceFiles.map((file) => (
+                {visibleWorkspaceFiles.map((file) => (
                   <div className="artifact-row" key={file.path}>
                     <div className="artifact-file">
                       <span className={`file-status file-status-${file.status}`}>{file.status}</span>

@@ -297,6 +297,19 @@ function resolveAllowedLocalPath(filePath: string) {
   return resolveAllowedLocalPathRaw(WORKSPACE_ROOT, filePath)
 }
 
+function safePathSegment(value: string) {
+  return String(value || 'unknown').replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 120) || 'unknown'
+}
+
+function sharedArtifactCacheDir(workspaceId?: string, sessionId?: string) {
+  return join(
+    app.getPath('downloads'),
+    'zspark-shared-artifacts',
+    safePathSegment(workspaceId ?? 'workspace'),
+    safePathSegment(sessionId ?? 'session')
+  )
+}
+
 function resolveAllowedSkillPath(filePath: string) {
   const requested = realpathSync(filePath)
   const skills = discoverLocalSkills(WORKSPACE_ROOT).skills
@@ -820,6 +833,40 @@ ipcMain.handle('enterprise:downloadArtifact', async (_e, workspaceId: string, se
     if (!response.body) return { ok: false, error: 'Download response did not include a body' }
     await pipeline(Readable.fromWeb(response.body as any), createWriteStream(save.filePath))
     return { ok: true, path: save.filePath }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
+})
+
+ipcMain.handle('enterprise:downloadArtifactToCache', async (_e, workspaceId: string, sessionId: string, artifactId: string, name?: string) => {
+  try {
+    const fetched = await enterpriseFetchResponse(
+      `/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/download`
+    )
+    if (!fetched.response) return fetched
+    const response = fetched.response
+    if (!response.ok) {
+      const text = await response.text()
+      return { ok: false, status: response.status, error: text || `Download failed with HTTP ${response.status}` }
+    }
+    if (!response.body) return { ok: false, error: 'Download response did not include a body' }
+    const defaultName = name || contentDispositionFileName(response.headers.get('content-disposition')) || artifactId
+    const dir = sharedArtifactCacheDir(workspaceId, sessionId)
+    mkdirSync(dir, { recursive: true })
+    const filePath = join(dir, basename(defaultName))
+    await pipeline(Readable.fromWeb(response.body as any), createWriteStream(filePath))
+    return { ok: true, path: filePath }
+  } catch (err: any) {
+    return { ok: false, error: err?.message ?? String(err) }
+  }
+})
+
+ipcMain.handle('enterprise:openArtifactCache', async (_e, workspaceId?: string, sessionId?: string) => {
+  try {
+    const dir = sharedArtifactCacheDir(workspaceId, sessionId)
+    mkdirSync(dir, { recursive: true })
+    const error = await shell.openPath(dir)
+    return error ? { ok: false, error } : { ok: true, path: dir }
   } catch (err: any) {
     return { ok: false, error: err?.message ?? String(err) }
   }

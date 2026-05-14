@@ -29,6 +29,8 @@ const api = {
   enterpriseArtifacts: (workspaceId: string, sessionId: string) => ipcRenderer.invoke('enterprise:artifacts', workspaceId, sessionId),
   enterpriseUploadArtifact: (workspaceId: string, sessionId: string, filePath: string, meta?: any) => ipcRenderer.invoke('enterprise:uploadArtifact', workspaceId, sessionId, filePath, meta),
   enterpriseDownloadArtifact: (workspaceId: string, sessionId: string, artifactId: string, name?: string) => ipcRenderer.invoke('enterprise:downloadArtifact', workspaceId, sessionId, artifactId, name),
+  enterpriseDownloadArtifactToCache: (workspaceId: string, sessionId: string, artifactId: string, name?: string) => ipcRenderer.invoke('enterprise:downloadArtifactToCache', workspaceId, sessionId, artifactId, name),
+  enterpriseOpenArtifactCache: (workspaceId?: string, sessionId?: string) => ipcRenderer.invoke('enterprise:openArtifactCache', workspaceId, sessionId),
   onEnterpriseDeviceCode: (cb: (payload: { userCode?: string; verificationUri?: string; message?: string; expiresOn?: number | null }) => void) => {
     const listener = (_e: IpcRendererEvent, payload: { userCode?: string; verificationUri?: string; message?: string; expiresOn?: number | null }) => cb(payload)
     ipcRenderer.on('enterprise:deviceCode', listener)
