@@ -656,16 +656,20 @@ async fn run_websocket_response_stream(
                         "response event consumer dropped".to_string(),
                     ));
                 }
-                let missing_completed_output_items =
-                    completed_output_tracker.missing_output_items(&event);
+                let completed_output_items =
+                    completed_output_tracker.output_items_before_completed(&event);
                 match process_responses_event(event) {
                     Ok(Some(event)) => {
                         let is_completed = matches!(event, ResponseEvent::Completed { .. });
-                        if let ResponseEvent::OutputItemDone(item) = &event {
-                            completed_output_tracker.record_output_item(item);
+                        if let ResponseEvent::OutputItemDone(item) = event {
+                            if let Some(item) = completed_output_tracker.output_item_done(item) {
+                                let _ =
+                                    tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
+                            }
+                            continue;
                         }
                         if is_completed {
-                            for item in missing_completed_output_items {
+                            for item in completed_output_items {
                                 let _ =
                                     tx_event.send(Ok(ResponseEvent::OutputItemDone(item))).await;
                             }

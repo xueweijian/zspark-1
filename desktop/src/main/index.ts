@@ -19,6 +19,7 @@ import {
   openExternalUrl,
   resolveAllowedLocalPath as resolveAllowedLocalPathRaw
 } from './pathSafety'
+import { ensureWorkspaceRoot, resolveWorkspaceRoot } from './workspaceRoot'
 
 let mainWindow: BrowserWindow | null = null
 let codex: ChildProcessWithoutNullStreams | null = null
@@ -75,18 +76,7 @@ const MAX_CODEX_LOG_BYTES = 8 * 1024 * 1024
 // renderer-side guard below the JSON cap (base64 inflates ~1.37×).
 const MAX_ARTIFACT_UPLOAD_BYTES = 50 * 1024 * 1024
 const BRIDGE_API_KEY = randomBytes(32).toString('hex')
-
-function resolveWorkspaceRoot(start: string): string {
-  let dir = start
-  while (true) {
-    if (existsSync(join(dir, '.git')) && (existsSync(join(dir, 'codex-rs')) || existsSync(join(dir, '.codex')))) {
-      return dir
-    }
-    const parent = dirname(dir)
-    if (parent === dir) return start
-    dir = parent
-  }
-}
+ensureWorkspaceRoot(WORKSPACE_ROOT)
 
 function loadSettings(): AppSettings {
   try {
