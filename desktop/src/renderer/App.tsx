@@ -960,6 +960,7 @@ function DesktopApp() {
   const sharedSnapshotSyncQueue = useRef<Promise<void>>(Promise.resolve())
   const activeSharedSnapshotRevision = useRef<number | null>(null)
   const shownArtifactPaths = useRef<Set<string>>(new Set())
+  const shownArtifactNames = useRef<Set<string>>(new Set())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
   const submitInFlight = useRef(false)
   const stickToBottom = useRef(true)
@@ -1243,6 +1244,13 @@ function DesktopApp() {
       return [...byPath.values()].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 24)
     })
   }
+  const rememberDisplayedArtifacts = (files: WorkspaceFile[]) => {
+    for (const file of files) {
+      if (file.status === 'missing') continue
+      shownArtifactPaths.current.add(file.path)
+      shownArtifactNames.current.add(file.name.toLowerCase())
+    }
+  }
   const upsertArtifactBlock = (
     turnId: string,
     itemId: string,
@@ -1255,9 +1263,7 @@ function DesktopApp() {
     if (displayFiles.length === 0) return
     const id = `files-${itemId}`
     const title = options.title ?? `${displayFiles.length} file${displayFiles.length === 1 ? '' : 's'} ready`
-    for (const file of displayFiles) {
-      if (file.status !== 'missing') shownArtifactPaths.current.add(file.path)
-    }
+    rememberDisplayedArtifacts(displayFiles)
     setBlocks((bs) => {
       const next = { type: 'files' as const, id, turnId, title, files: displayFiles, subtitle: options.subtitle, tone: options.tone ?? 'normal' }
       const resolvedFiles = displayFiles.filter((file) => file.status !== 'missing')
@@ -1384,6 +1390,15 @@ function DesktopApp() {
     return files
   }
 
+  const refreshSharedArtifactsForLookup = async () => {
+    const workspaceId = activeSharedWorkspaceRef.current
+    const sessionId = activeSharedSessionRef.current
+    if (!workspaceId || !sessionId) return []
+    const files = await fetchSharedArtifactFiles(workspaceId, sessionId, false)
+    if (files.length) upsertWorkspaceFiles(files)
+    return files
+  }
+
   const scanTurnArtifacts = async (turnId: string, startedAt: number, itemId: string) => {
     try {
       const result = await window.zspark.scanRecentArtifacts({
@@ -1391,7 +1406,10 @@ function DesktopApp() {
         limit: 1
       })
       let files: WorkspaceFile[] = result.artifacts
-        .filter((artifact) => !shownArtifactPaths.current.has(artifact.path))
+        .filter((artifact) => (
+          !shownArtifactPaths.current.has(artifact.path) &&
+          !shownArtifactNames.current.has(artifact.name.toLowerCase())
+        ))
         .map((artifact, index) => ({
           id: `scan-${turnId}-${index}-${artifact.mtimeMs}`,
           name: artifact.name,
@@ -1420,9 +1438,7 @@ function DesktopApp() {
     const existing: WorkspaceFile[] = []
     const missing: WorkspaceFile[] = []
     const now = Date.now()
-    const refreshedSharedFiles = activeSharedWorkspaceRef.current && activeSharedSessionRef.current
-      ? await refreshSharedArtifactsForActiveSession(false)
-      : []
+    const refreshedSharedFiles = await refreshSharedArtifactsForLookup()
     const sharedFiles = [...refreshedSharedFiles, ...workspaceFilesRef.current]
     let recentArtifacts: RecentArtifactLike[] | null = null
     const resolveRecentArtifact = async (candidate: string) => {
@@ -1482,9 +1498,7 @@ function DesktopApp() {
     if (existing.length) {
       const sharedExisting = await uploadSharedArtifacts(existing, turnId)
       upsertWorkspaceFiles(sharedExisting)
-      upsertArtifactBlock(turnId, `${itemId}-verified`, sharedExisting, {
-        subtitle: 'Verified on disk from assistant output'
-      })
+      rememberDisplayedArtifacts(sharedExisting)
     }
     if (missing.length) {
       upsertArtifactBlock(turnId, `${itemId}-missing`, missing, {
@@ -1506,9 +1520,7 @@ function DesktopApp() {
 
     const files: WorkspaceFile[] = []
     const now = Date.now()
-    const refreshedSharedFiles = activeSharedWorkspaceRef.current && activeSharedSessionRef.current
-      ? await refreshSharedArtifactsForActiveSession(false)
-      : []
+    const refreshedSharedFiles = await refreshSharedArtifactsForLookup()
     const sharedFiles = [...refreshedSharedFiles, ...workspaceFilesRef.current]
     let recentArtifacts: RecentArtifactLike[] | null = null
     const resolveRecentArtifact = async (candidate: string) => {
@@ -1559,10 +1571,7 @@ function DesktopApp() {
     const uploadedFiles = await uploadSharedArtifacts(files, agentBlock.turnId ?? `agent-${agentBlock.id}`)
     checkedArtifactMessages.current.set(agentBlock.id, signature)
     upsertWorkspaceFiles(uploadedFiles)
-    upsertArtifactBlock(agentBlock.turnId ?? `agent-${agentBlock.id}`, `${agentBlock.id}-inline-artifacts`, uploadedFiles, {
-      title: `${uploadedFiles.length} downloadable artifact${uploadedFiles.length === 1 ? '' : 's'} ready`,
-      subtitle: 'Verified from the assistant response'
-    })
+    rememberDisplayedArtifacts(uploadedFiles)
   }
 
   const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {
@@ -2145,8 +2154,6 @@ function DesktopApp() {
             }
             updateTurn(turnId, (t) => ({ ...t, finalMessageId: blockId }))
             void verifyArtifactClaims(turnId, String(item.id ?? `agent-${turnId}`), txt)
-            const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
-            window.setTimeout(() => void scanTurnArtifacts(turnId, startedAt, `scan-${String(item.id ?? `agent-${turnId}`)}`), 500)
             return
           }
           if (item.type === 'reasoning') {
@@ -2217,8 +2224,6 @@ function DesktopApp() {
               }
               if (status === 'done') {
                 noteCompletedTurnWork(turnId, 'command')
-                const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
-                window.setTimeout(() => void scanTurnArtifacts(turnId, startedAt, `scan-${itemId}-command`), 500)
               }
             }
             return
@@ -2950,7 +2955,17 @@ function DesktopApp() {
     }
     if ((!rawText && currentAttachments.length === 0 && currentSkills.length === 0 && providedInput.length === 0) || !ready) return
     const text = rawText || (currentAttachments.length ? suggestedPromptForAttachments(currentAttachments) : '')
-    const runtimeBlocker = officeArtifactRuntimeBlocker(text, currentSkills, runtimeRef.current)
+    let submissionRuntime = runtimeRef.current
+    let runtimeBlocker = officeArtifactRuntimeBlocker(text, currentSkills, submissionRuntime)
+    if (runtimeBlocker) {
+      try {
+        const info = await window.zspark.getRuntimeInfo()
+        submissionRuntime = { ...submissionRuntime, ...info }
+        runtimeRef.current = submissionRuntime
+        setRuntime((prev) => ({ ...prev, ...info }))
+        runtimeBlocker = officeArtifactRuntimeBlocker(text, currentSkills, submissionRuntime)
+      } catch {}
+    }
     if (runtimeBlocker) {
       toast('error', runtimeBlocker)
       return
@@ -2980,7 +2995,7 @@ function DesktopApp() {
           contextLines.push(`Use skill: ${skill.name}`)
         }
       }
-      contextLines.push(...officeRuntimeContext(currentSkills, runtimeRef.current))
+      contextLines.push(...officeRuntimeContext(currentSkills, submissionRuntime))
       contextLines.push(...executionSafetyContext(text))
       for (const attachment of currentAttachments) {
         if (attachment.kind === 'image') {
