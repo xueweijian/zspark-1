@@ -20,6 +20,7 @@ import {
   dirname,
   extractArtifactPathCandidates,
   findRecentArtifactForCandidate,
+  isDisplayArtifactPath,
   resolveWorkspacePath,
   type RecentArtifactLike
 } from './artifacts'
@@ -1231,12 +1232,19 @@ function DesktopApp() {
     files: WorkspaceFile[],
     options: { title?: string; subtitle?: string; tone?: 'normal' | 'warn' } = {}
   ) => {
+    const artifactFiles = files.filter((file) => (
+      file.status === 'missing' ||
+      (file.status !== 'deleted' && isDisplayArtifactPath(file.path))
+    ))
     const displayFiles = activeSharedWorkspaceRef.current
-      ? files.filter((file) => file.sharedArtifact || file.status === 'missing')
-      : files
+      ? artifactFiles.filter((file) => file.sharedArtifact || file.status === 'missing')
+      : artifactFiles
     if (displayFiles.length === 0) return
     const id = `files-${itemId}`
-    const title = options.title ?? `${displayFiles.length} file${displayFiles.length === 1 ? '' : 's'} ready`
+    const filteredSomeFiles = displayFiles.length !== files.length
+    const title = !filteredSomeFiles && options.title
+      ? options.title
+      : `${displayFiles.length} file${displayFiles.length === 1 ? '' : 's'} ready`
     for (const file of displayFiles) {
       if (file.status !== 'missing') shownArtifactPaths.current.add(file.path)
     }
@@ -1253,10 +1261,26 @@ function DesktopApp() {
         })
         return unresolved.length ? [{ ...block, files: unresolved }] : []
       })
-      if (withoutResolvedMissing.some((b) => b.id === id)) {
-        return withoutResolvedMissing.map((b) => (b.id === id ? next : b))
+      const withoutDuplicateFiles = options.tone === 'warn' || !resolvedFiles.length
+        ? withoutResolvedMissing
+        : withoutResolvedMissing.flatMap((block) => {
+            if (block.type !== 'files' || block.tone === 'warn' || block.turnId !== turnId || block.id === id) return [block]
+            const remaining = block.files.filter((file) => {
+              if (file.status === 'missing') return true
+              return !resolvedPaths.has(file.path) && !resolvedNames.has(basename(file.path).toLowerCase())
+            })
+            if (remaining.length === block.files.length) return [block]
+            if (!remaining.length) return []
+            return [{
+              ...block,
+              title: `${remaining.length} file${remaining.length === 1 ? '' : 's'} ready`,
+              files: remaining
+            }]
+          })
+      if (withoutDuplicateFiles.some((b) => b.id === id)) {
+        return withoutDuplicateFiles.map((b) => (b.id === id ? next : b))
       }
-      return [...withoutResolvedMissing, next]
+      return [...withoutDuplicateFiles, next]
     })
   }
 

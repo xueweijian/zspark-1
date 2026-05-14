@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'vitest'
-import { dirname, extractArtifactPathCandidates, findRecentArtifactForCandidate, resolveWorkspacePath } from './artifacts'
+import {
+  dirname,
+  extractArtifactPathCandidates,
+  findRecentArtifactForCandidate,
+  isDisplayArtifactPath,
+  resolveWorkspacePath
+} from './artifacts'
 
 describe('artifact helpers', () => {
   test('extracts workspace artifact paths from assistant text', () => {
@@ -38,5 +44,14 @@ describe('artifact helpers', () => {
     expect(findRecentArtifactForCandidate('output/Year-End-Review.pptx', artifacts)).toEqual(artifact)
     expect(findRecentArtifactForCandidate('outputs/final/Year-End-Review.pptx', artifacts)).toEqual(artifact)
     expect(findRecentArtifactForCandidate('outputs/final/Missing.pptx', artifacts)).toBeNull()
+  })
+
+  test('distinguishes final artifacts from presentation scratch files', () => {
+    expect(isDisplayArtifactPath('/repo/outputs/manual/presentations/demo/output/demo.pptx')).toBe(true)
+    expect(isDisplayArtifactPath('shared://w/s/a/demo.pptx')).toBe(true)
+    expect(isDisplayArtifactPath('/repo/outputs/manual/presentations/demo/slides/slide-01.mjs')).toBe(false)
+    expect(isDisplayArtifactPath('/repo/outputs/manual/presentations/demo/profile-plan.txt')).toBe(false)
+    expect(isDisplayArtifactPath('/repo/outputs/manual/presentations/demo/preview/slide-01.png')).toBe(false)
+    expect(isDisplayArtifactPath('C:\\repo\\outputs\\manual\\presentations\\demo\\qa\\contact-sheet.png')).toBe(false)
   })
 })
