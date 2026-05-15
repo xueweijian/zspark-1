@@ -59,7 +59,7 @@ export const IconProject = () => (
 
 export const IconSend = () => (
   <Wrap>
-    <path d="m5 12 14-7-3 7 3 7-14-7z" />
+    <path d="m19 12-14 7 3-7-3-7 14 7z" />
   </Wrap>
 )
 
