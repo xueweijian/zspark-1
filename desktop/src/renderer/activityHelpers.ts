@@ -175,46 +175,88 @@ export function cleanShellCommand(command: string): string {
     .trim()
 }
 
+export interface DeletedArtifactReference {
+  turnId: string
+  pathKey: string
+  nameKey: string
+}
+
+type ShellInvocationKind = 'cmd' | 'shell'
+
 /**
- * Pull out paths the assistant claims to have deleted in this command. We
- * key off:
- *   1. Codex's structured `commandActions` with `type === 'delete'` (any
- *      language, any provider — this is the canonical signal).
- *   2. Shell tokens for the common deletion verbs across PowerShell, cmd,
- *      bash, and Trash workflows. Locale-independent because we match the
- *      verb literally, not its translated message.
- *
- * Returns absolute or basename strings (whatever the command supplied);
- * callers should normalize before comparing.
+ * Pull out paths the assistant deleted in this command. Prefer structured
+ * delete actions when present, and parse command strings as a fallback for
+ * shell output that only reports commands.
  */
 export function extractDeletedPathsFromCommand(item: any): string[] {
+  const seen = new Set<string>()
   const out: string[] = []
+  const collect = (path: string) => {
+    const text = path.trim().replace(/^['"]|['"]$/g, '')
+    if (!text || seen.has(text)) return
+    seen.add(text)
+    out.push(text)
+  }
+
+  collectDeletedPathsFromCommand(String(item?.command ?? ''), collect)
   const actions = Array.isArray(item?.commandActions) ? item.commandActions : []
   for (const action of actions) {
-    const type = String(action?.type ?? '').toLowerCase()
-    if (type === 'delete' && action?.path) out.push(String(action.path))
-  }
-  const command = String(item?.command ?? '')
-  if (!command) return out
-  const cleaned = cleanShellCommand(command)
-  // Take only the first pipeline segment so "rm a; ls" still parses `a`.
-  for (const segment of cleaned.split(/[;&|\n]+/)) {
-    const tokens = tokenizeShell(segment.trim())
-    if (tokens.length === 0) continue
-    const verb = tokens[0]?.toLowerCase()
-    const isDelete =
-      verb === 'rm' || verb === 'rmdir' || verb === 'del' || verb === 'erase' ||
-      verb === 'unlink' || verb === 'remove-item' ||
-      // PowerShell aliases
-      verb === 'ri' || verb === 'rd'
-    if (!isDelete) continue
-    for (let i = 1; i < tokens.length; i++) {
-      const tok = tokens[i]
-      if (!tok || tok.startsWith('-')) continue
-      out.push(tok.replace(/^['"]|['"]$/g, ''))
-    }
+    if (String(action?.type ?? '').toLowerCase() === 'delete' && action?.path) collect(String(action.path))
+    if (action?.command) collectDeletedPathsFromCommand(String(action.command), collect)
   }
   return out
+}
+
+export function deletedArtifactReference(turnId: string, path: string): DeletedArtifactReference | null {
+  const trimmed = path.trim()
+  if (!turnId || !trimmed) return null
+  return {
+    turnId,
+    pathKey: normalizeDeletedArtifactPath(trimmed),
+    nameKey: deletedArtifactNameKey(trimmed)
+  }
+}
+
+export function deletedArtifactReferenceMatchesCandidate(
+  turnId: string,
+  candidate: string,
+  references: DeletedArtifactReference[]
+): boolean {
+  const trimmed = candidate.trim()
+  if (!turnId || !trimmed) return false
+  const pathKey = normalizeDeletedArtifactPath(trimmed)
+  const nameKey = deletedArtifactNameKey(trimmed)
+  const canUseBasenameFallback = !/[\\/]/.test(trimmed) && !/^[A-Za-z]:/.test(trimmed)
+  return references.some((ref) => (
+    ref.turnId === turnId &&
+    (ref.pathKey === pathKey || (canUseBasenameFallback && ref.nameKey === nameKey))
+  ))
+}
+
+function collectDeletedPathsFromCommand(
+  command: string,
+  collect: (path: string) => void,
+  invocationKind: ShellInvocationKind = 'shell'
+): void {
+  if (!command) return
+  const cleaned = cleanShellCommand(command)
+  for (const segment of splitShellSegments(cleaned)) {
+    const tokens = tokenizeShell(segment.trim())
+    if (tokens.length === 0) continue
+    const unwrapped = unwrapShellInvocation(tokens)
+    if (unwrapped) {
+      collectDeletedPathsFromCommand(unwrapped.command, collect, unwrapped.kind)
+      continue
+    }
+    const verb = commandVerb(tokens[0])
+    const kind = deleteVerbKind(verb, invocationKind)
+    if (!kind) continue
+    for (let i = 1; i < tokens.length; i++) {
+      const tok = tokens[i]
+      if (!tok || shouldSkipDeleteToken(tok, kind)) continue
+      collect(tok)
+    }
+  }
 }
 
 function tokenizeShell(line: string): string[] {
@@ -236,6 +278,96 @@ function tokenizeShell(line: string): string[] {
   }
   if (buf) out.push(buf)
   return out
+}
+
+function splitShellSegments(line: string): string[] {
+  const out: string[] = []
+  let buf = ''
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i]
+    if (quote) {
+      if (ch === quote) quote = null
+      buf += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      buf += ch
+      continue
+    }
+    if (ch === '\n' || ch === ';' || ch === '|' || ch === '&') {
+      if (buf.trim()) out.push(buf.trim())
+      buf = ''
+      if ((ch === '&' || ch === '|') && line[i + 1] === ch) i++
+      continue
+    }
+    buf += ch
+  }
+  if (buf.trim()) out.push(buf.trim())
+  return out
+}
+
+function commandVerb(token?: string): string {
+  const raw = String(token ?? '').replace(/^['"]|['"]$/g, '')
+  const parts = raw.split(/[\\/]/)
+  return (parts.pop() || raw).toLowerCase()
+}
+
+function shellRemainder(tokens: string[], optionIndex: number): string {
+  const rest = tokens.slice(optionIndex + 1)
+  if (rest.length <= 1) return rest.join(' ')
+  return rest.map((token) => /\s/.test(token) ? `"${token}"` : token).join(' ')
+}
+
+function unwrapShellInvocation(tokens: string[]): { command: string; kind: ShellInvocationKind } | null {
+  const verb = commandVerb(tokens[0])
+  if (verb === 'powershell.exe' || verb === 'powershell' || verb === 'pwsh.exe' || verb === 'pwsh') {
+    const index = tokens.findIndex((token) => {
+      const lower = token.toLowerCase()
+      return lower === '-command' || lower === '-c'
+    })
+    return index === -1 ? null : { command: shellRemainder(tokens, index), kind: 'shell' }
+  }
+  if (verb === 'cmd.exe' || verb === 'cmd') {
+    const index = tokens.findIndex((token) => {
+      const lower = token.toLowerCase()
+      return lower === '/c' || lower === '/k'
+    })
+    return index === -1 ? null : { command: shellRemainder(tokens, index), kind: 'cmd' }
+  }
+  if (verb === 'bash' || verb === 'sh' || verb === 'zsh') {
+    const index = tokens.findIndex((token) => token === '-lc' || token === '-c')
+    return index === -1 ? null : { command: shellRemainder(tokens, index), kind: 'shell' }
+  }
+  return null
+}
+
+function deleteVerbKind(verb: string, invocationKind: ShellInvocationKind): 'cmd' | 'shell' | null {
+  if (verb === 'del' || verb === 'erase') return 'cmd'
+  if (verb === 'rd' || verb === 'rmdir') return invocationKind === 'cmd' ? 'cmd' : 'shell'
+  if (
+    verb === 'rm' ||
+    verb === 'unlink' ||
+    verb === 'remove-item' ||
+    verb === 'ri'
+  ) return 'shell'
+  return null
+}
+
+function shouldSkipDeleteToken(token: string, kind: 'cmd' | 'shell'): boolean {
+  if (token === '--') return true
+  if (token.startsWith('-')) return true
+  if (kind === 'cmd' && /^\/[A-Za-z?]+$/.test(token)) return true
+  return token === '>' || token === '2>' || token === '1>' || token === '>>'
+}
+
+function normalizeDeletedArtifactPath(path: string): string {
+  return path.trim().replace(/^['"]|['"]$/g, '').replace(/\\/g, '/').replace(/\/+/g, '/').toLowerCase()
+}
+
+function deletedArtifactNameKey(path: string): string {
+  return basename(normalizeDeletedArtifactPath(path)).toLowerCase()
 }
 
 export function titleizeToolName(value?: string): string {

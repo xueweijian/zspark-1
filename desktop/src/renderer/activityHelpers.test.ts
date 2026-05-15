@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'vitest'
 import {
   cleanShellCommand,
+  deletedArtifactReference,
+  deletedArtifactReferenceMatchesCandidate,
   extractDeletedPathsFromCommand,
   inferActionKindFromTitle,
   inferCommandInfo,
@@ -81,12 +83,22 @@ describe('publicActivityTitleText', () => {
 })
 
 describe('extractDeletedPathsFromCommand', () => {
-  test('uses structured commandActions when present (locale-independent)', () => {
+  test('uses structured delete commandActions when present', () => {
     const paths = extractDeletedPathsFromCommand({
       command: 'whatever the assistant typed',
       commandActions: [
         { type: 'delete', path: 'C:\\Users\\u\\Desktop\\Year-End-Review.pptx' },
         { type: 'read', path: 'C:\\Users\\u\\Desktop\\notes.md' }
+      ]
+    })
+    expect(paths).toEqual(['C:\\Users\\u\\Desktop\\Year-End-Review.pptx'])
+  })
+
+  test('uses parsed commandActions commands when the top-level command is unavailable', () => {
+    const paths = extractDeletedPathsFromCommand({
+      commandActions: [
+        { type: 'unknown', command: 'Remove-Item C:\\Users\\u\\Desktop\\Year-End-Review.pptx -Force' },
+        { type: 'read', command: 'Get-Content C:\\Users\\u\\Desktop\\notes.md', path: 'C:\\Users\\u\\Desktop\\notes.md' }
       ]
     })
     expect(paths).toEqual(['C:\\Users\\u\\Desktop\\Year-End-Review.pptx'])
@@ -98,8 +110,37 @@ describe('extractDeletedPathsFromCommand', () => {
     expect(extractDeletedPathsFromCommand({ command: 'Remove-Item "C:\\tmp\\b.pptx" -Force' })).toEqual(['C:\\tmp\\b.pptx'])
   })
 
+  test('unwraps Windows shell command wrappers before parsing deletes', () => {
+    expect(extractDeletedPathsFromCommand({
+      command: '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "Remove-Item \'C:\\tmp\\wrapped deck.pptx\' -Force"'
+    })).toEqual(['C:\\tmp\\wrapped deck.pptx'])
+    expect(extractDeletedPathsFromCommand({
+      command: 'cmd.exe /c del /q C:\\tmp\\cmd-deck.pptx'
+    })).toEqual(['C:\\tmp\\cmd-deck.pptx'])
+    expect(extractDeletedPathsFromCommand({
+      command: 'cmd.exe /c rmdir /s /q "C:\\tmp\\old deck"'
+    })).toEqual(['C:\\tmp\\old deck'])
+  })
+
   test('ignores non-delete commands', () => {
     expect(extractDeletedPathsFromCommand({ command: 'ls -la' })).toEqual([])
     expect(extractDeletedPathsFromCommand({ command: 'cat foo.pptx' })).toEqual([])
+  })
+})
+
+describe('deleted artifact reference matching', () => {
+  test('suppresses only within the same turn', () => {
+    const ref = deletedArtifactReference('turn-1', 'C:\\tmp\\deck.pptx')
+
+    expect(ref).not.toBeNull()
+    expect(deletedArtifactReferenceMatchesCandidate('turn-1', 'C:\\tmp\\deck.pptx', [ref!])).toBe(true)
+    expect(deletedArtifactReferenceMatchesCandidate('turn-2', 'C:\\tmp\\deck.pptx', [ref!])).toBe(false)
+  })
+
+  test('uses basename fallback only for bare assistant references', () => {
+    const ref = deletedArtifactReference('turn-1', 'C:\\tmp\\deck.pptx')
+
+    expect(deletedArtifactReferenceMatchesCandidate('turn-1', 'deck.pptx', [ref!])).toBe(true)
+    expect(deletedArtifactReferenceMatchesCandidate('turn-1', 'outputs/deck.pptx', [ref!])).toBe(false)
   })
 })

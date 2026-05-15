@@ -130,7 +130,10 @@ import {
   commandActionInfo,
   commandActivityDetail,
   commandActivityInfo,
+  deletedArtifactReference,
+  deletedArtifactReferenceMatchesCandidate,
   displayActivities,
+  type DeletedArtifactReference,
   extractDeletedPathsFromCommand,
   inferActionKindFromTitle,
   inferCommandInfo,
@@ -963,13 +966,7 @@ function DesktopApp() {
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const shownArtifactNames = useRef<Set<string>>(new Set())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
-  // Paths the assistant has deleted via shell commands or fileChange events
-  // earlier in this session. verifyArtifactClaims uses this set to skip
-  // missing-on-disk warnings for files we *expected* to be gone — without
-  // it, a "delete X then mention X" turn always trips the red banner.
-  // Keys are normalized to lowercase basenames so cross-OS paths match.
-  const sessionDeletedNames = useRef<Set<string>>(new Set())
-  const sessionDeletedPaths = useRef<Set<string>>(new Set())
+  const deletedArtifacts = useRef<DeletedArtifactReference[]>([])
   const submitInFlight = useRef(false)
   const stickToBottom = useRef(true)
   const programmaticScroll = useRef(false)
@@ -1259,6 +1256,17 @@ function DesktopApp() {
       shownArtifactNames.current.add(file.name.toLowerCase())
     }
   }
+  const rememberDeletedArtifact = (turnId: string, path: string) => {
+    const ref = deletedArtifactReference(turnId, path)
+    if (!ref) return
+    const next = deletedArtifacts.current.filter((item) => !(
+      item.turnId === ref.turnId &&
+      item.pathKey === ref.pathKey &&
+      item.nameKey === ref.nameKey
+    ))
+    next.push(ref)
+    deletedArtifacts.current = next.slice(-200)
+  }
   const upsertArtifactBlock = (
     turnId: string,
     itemId: string,
@@ -1454,12 +1462,7 @@ function DesktopApp() {
       return findRecentArtifactForCandidate(candidate, recentArtifacts)
     }
     await Promise.all(candidates.map(async (candidate, index) => {
-      // If this session just deleted the file (or one with the same
-      // basename), don't pester the user about it. We only know what
-      // _zspark_ deleted; out-of-band rm's still surface as missing.
-      const candidateLower = candidate.trim().toLowerCase()
-      const candidateBase = basename(candidate).toLowerCase()
-      if (sessionDeletedPaths.current.has(candidateLower) || sessionDeletedNames.current.has(candidateBase)) {
+      if (deletedArtifactReferenceMatchesCandidate(turnId, candidate, deletedArtifacts.current)) {
         return
       }
       const sharedFile = findSharedWorkspaceFileForPath(sharedFiles, candidate)
@@ -1583,9 +1586,9 @@ function DesktopApp() {
       })
     }
 
+    checkedArtifactMessages.current.set(agentBlock.id, signature)
     if (!files.length) return
     const uploadedFiles = await uploadSharedArtifacts(files, agentBlock.turnId ?? `agent-${agentBlock.id}`)
-    checkedArtifactMessages.current.set(agentBlock.id, signature)
     upsertWorkspaceFiles(uploadedFiles)
     rememberDisplayedArtifacts(uploadedFiles)
   }
@@ -2240,15 +2243,8 @@ function DesktopApp() {
               }
               if (status === 'done') {
                 noteCompletedTurnWork(turnId, 'command')
-                // Remember anything the assistant just deleted so the
-                // artifact-verifier doesn't yell about it later in this
-                // session. Only record on success — failed deletes mean
-                // the file is still there.
                 for (const deleted of extractDeletedPathsFromCommand(item)) {
-                  const trimmed = deleted.trim()
-                  if (!trimmed) continue
-                  sessionDeletedPaths.current.add(trimmed.toLowerCase())
-                  sessionDeletedNames.current.add(basename(trimmed).toLowerCase())
+                  rememberDeletedArtifact(turnId, deleted)
                 }
               }
             }
@@ -2266,8 +2262,7 @@ function DesktopApp() {
               upsertWorkspaceFiles(files)
               for (const file of files) {
                 if (file.status === 'deleted') {
-                  sessionDeletedPaths.current.add(file.path.toLowerCase())
-                  sessionDeletedNames.current.add(file.name.toLowerCase())
+                  rememberDeletedArtifact(turnId, file.path)
                 }
               }
               updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail, actionKind: 'file' })
