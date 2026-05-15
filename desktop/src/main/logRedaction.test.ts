@@ -25,8 +25,8 @@ describe('log redaction', () => {
   })
 
   test('redacts nested secret-like keys', () => {
-    expect(redactSensitiveValue({ provider: { apiKey: 'sk-live', model: 'x' } })).toEqual({
-      provider: { apiKey: '[redacted]', model: 'x' }
+    expect(redactSensitiveValue({ provider: { apiKey: 'sk-live', clientId: 'gmail-client-id', model: 'x' } })).toEqual({
+      provider: { apiKey: '[redacted]', clientId: '[redacted]', model: 'x' }
     })
   })
 
@@ -45,12 +45,14 @@ describe('log redaction', () => {
   })
 
   test('redacts secret assignments embedded in legacy plain-text log lines', () => {
-    const line = 'spawn args=["-c","mcp_servers={ gmail = { env = { ZSPARK_GMAIL_CLIENT_SECRET = \\"client-secret\\", ZSPARK_GMAIL_REFRESH_TOKEN = \\"refresh-token\\" } } }"]'
+    const line = 'spawn args=["-c","mcp_servers={ gmail = { env = { ZSPARK_GMAIL_CLIENT_ID = \\"client-id\\", ZSPARK_GMAIL_CLIENT_SECRET = \\"client-secret\\", ZSPARK_GMAIL_REFRESH_TOKEN = \\"refresh-token\\" } } }"]'
 
     const redacted = redactSensitiveLogLine(line)
 
+    expect(redacted).toContain('ZSPARK_GMAIL_CLIENT_ID = \\"[redacted]\\"')
     expect(redacted).toContain('ZSPARK_GMAIL_CLIENT_SECRET = \\"[redacted]\\"')
     expect(redacted).toContain('ZSPARK_GMAIL_REFRESH_TOKEN = \\"[redacted]\\"')
+    expect(redacted).not.toContain('client-id')
     expect(redacted).not.toContain('client-secret')
     expect(redacted).not.toContain('refresh-token')
   })

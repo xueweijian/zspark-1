@@ -1,8 +1,8 @@
-const SENSITIVE_KEY_RE = /(authorization|api[_-]?key|token|secret|password|bearer)/i
-const SECRET_KEY_SOURCE = String.raw`[\w.-]*(?:authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|pwd|credential|bearer)[\w.-]*`
+const SENSITIVE_KEY_RE = /(authorization|api[_-]?key|client[_-]?id|token|secret|password|bearer)/i
+const SECRET_KEY_SOURCE = String.raw`[\w.-]*(?:authorization|api[_-]?key|client[_-]?id|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|pwd|credential|bearer)[\w.-]*`
 const URL_USERINFO_RE = /\b([a-z][a-z0-9+.-]*:\/\/)([^/\s@]+@)/gi
 const BEARER_RE = /\b(Bearer\s+)[A-Za-z0-9._~+/-]+=*/gi
-const QUERY_SECRET_RE = /([?&](?:api[_-]?key|token|access[_-]?token|secret|password)=)[^&\s]+/gi
+const QUERY_SECRET_RE = /([?&](?:api[_-]?key|client[_-]?id|token|access[_-]?token|secret|password)=)[^&\s]+/gi
 const GITHUB_TOKEN_RE = /\bgh[pousr]_[A-Za-z0-9_]{20,}\b/g
 const DOUBLE_QUOTED_SECRET_ASSIGNMENT_RE = new RegExp(String.raw`((?:"?${SECRET_KEY_SOURCE}"?\s*[:=]\s*)")(?:(?:\\.)|[^"\\])*"`, 'gi')
 const SINGLE_QUOTED_SECRET_ASSIGNMENT_RE = new RegExp(String.raw`((?:'?${SECRET_KEY_SOURCE}'?\s*[:=]\s*)')(?:(?:\\.)|[^'\\])*'`, 'gi')

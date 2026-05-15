@@ -490,17 +490,23 @@ function rotateLogIfLarge(path: string) {
   }
 }
 
+function rewriteCodexLog(path: string, content: string) {
+  const tmpPath = `${path}.${process.pid}.${Date.now().toString(36)}.${randomBytes(4).toString('hex')}.tmp`
+  writeFileSync(tmpPath, content)
+  renameSync(tmpPath, path)
+}
+
 function scrubExistingCodexLog(path: string) {
   try {
     if (!existsSync(path)) return
     const stat = statSync(path)
     if (stat.size > MAX_CODEX_LOG_BYTES) {
-      writeFileSync(path, '')
+      rewriteCodexLog(path, '')
       return
     }
     const content = readFileSync(path, 'utf8')
     const redacted = redactSensitiveLogText(content)
-    if (redacted !== content) writeFileSync(path, redacted)
+    if (redacted !== content) rewriteCodexLog(path, redacted)
   } catch {
     // Log cleanup must never prevent the app-server from starting.
   }
