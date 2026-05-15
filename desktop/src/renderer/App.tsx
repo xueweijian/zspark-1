@@ -131,6 +131,7 @@ import {
   commandActivityDetail,
   commandActivityInfo,
   displayActivities,
+  extractDeletedPathsFromCommand,
   inferActionKindFromTitle,
   inferCommandInfo,
   itemTimeMs,
@@ -962,6 +963,13 @@ function DesktopApp() {
   const shownArtifactPaths = useRef<Set<string>>(new Set())
   const shownArtifactNames = useRef<Set<string>>(new Set())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
+  // Paths the assistant has deleted via shell commands or fileChange events
+  // earlier in this session. verifyArtifactClaims uses this set to skip
+  // missing-on-disk warnings for files we *expected* to be gone — without
+  // it, a "delete X then mention X" turn always trips the red banner.
+  // Keys are normalized to lowercase basenames so cross-OS paths match.
+  const sessionDeletedNames = useRef<Set<string>>(new Set())
+  const sessionDeletedPaths = useRef<Set<string>>(new Set())
   const submitInFlight = useRef(false)
   const stickToBottom = useRef(true)
   const programmaticScroll = useRef(false)
@@ -1446,6 +1454,14 @@ function DesktopApp() {
       return findRecentArtifactForCandidate(candidate, recentArtifacts)
     }
     await Promise.all(candidates.map(async (candidate, index) => {
+      // If this session just deleted the file (or one with the same
+      // basename), don't pester the user about it. We only know what
+      // _zspark_ deleted; out-of-band rm's still surface as missing.
+      const candidateLower = candidate.trim().toLowerCase()
+      const candidateBase = basename(candidate).toLowerCase()
+      if (sessionDeletedPaths.current.has(candidateLower) || sessionDeletedNames.current.has(candidateBase)) {
+        return
+      }
       const sharedFile = findSharedWorkspaceFileForPath(sharedFiles, candidate)
       if (sharedFile) {
         existing.push({
@@ -2224,6 +2240,16 @@ function DesktopApp() {
               }
               if (status === 'done') {
                 noteCompletedTurnWork(turnId, 'command')
+                // Remember anything the assistant just deleted so the
+                // artifact-verifier doesn't yell about it later in this
+                // session. Only record on success — failed deletes mean
+                // the file is still there.
+                for (const deleted of extractDeletedPathsFromCommand(item)) {
+                  const trimmed = deleted.trim()
+                  if (!trimmed) continue
+                  sessionDeletedPaths.current.add(trimmed.toLowerCase())
+                  sessionDeletedNames.current.add(basename(trimmed).toLowerCase())
+                }
               }
             }
             return
@@ -2238,6 +2264,12 @@ function DesktopApp() {
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'file', title, actionKind: 'file' })
               const files = filesFromChanges(changes, runtimeRef.current.cwd ?? runtimeRef.current.workspaceRoot)
               upsertWorkspaceFiles(files)
+              for (const file of files) {
+                if (file.status === 'deleted') {
+                  sessionDeletedPaths.current.add(file.path.toLowerCase())
+                  sessionDeletedNames.current.add(file.name.toLowerCase())
+                }
+              }
               updateActivity(turnId, itemActivity.current.get(itemId)!, { status: 'done', endedAt: Date.now(), title, detail, actionKind: 'file' })
               noteCompletedTurnWork(turnId, 'file')
             }

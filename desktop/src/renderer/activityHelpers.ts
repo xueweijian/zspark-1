@@ -175,6 +175,69 @@ export function cleanShellCommand(command: string): string {
     .trim()
 }
 
+/**
+ * Pull out paths the assistant claims to have deleted in this command. We
+ * key off:
+ *   1. Codex's structured `commandActions` with `type === 'delete'` (any
+ *      language, any provider — this is the canonical signal).
+ *   2. Shell tokens for the common deletion verbs across PowerShell, cmd,
+ *      bash, and Trash workflows. Locale-independent because we match the
+ *      verb literally, not its translated message.
+ *
+ * Returns absolute or basename strings (whatever the command supplied);
+ * callers should normalize before comparing.
+ */
+export function extractDeletedPathsFromCommand(item: any): string[] {
+  const out: string[] = []
+  const actions = Array.isArray(item?.commandActions) ? item.commandActions : []
+  for (const action of actions) {
+    const type = String(action?.type ?? '').toLowerCase()
+    if (type === 'delete' && action?.path) out.push(String(action.path))
+  }
+  const command = String(item?.command ?? '')
+  if (!command) return out
+  const cleaned = cleanShellCommand(command)
+  // Take only the first pipeline segment so "rm a; ls" still parses `a`.
+  for (const segment of cleaned.split(/[;&|\n]+/)) {
+    const tokens = tokenizeShell(segment.trim())
+    if (tokens.length === 0) continue
+    const verb = tokens[0]?.toLowerCase()
+    const isDelete =
+      verb === 'rm' || verb === 'rmdir' || verb === 'del' || verb === 'erase' ||
+      verb === 'unlink' || verb === 'remove-item' ||
+      // PowerShell aliases
+      verb === 'ri' || verb === 'rd'
+    if (!isDelete) continue
+    for (let i = 1; i < tokens.length; i++) {
+      const tok = tokens[i]
+      if (!tok || tok.startsWith('-')) continue
+      out.push(tok.replace(/^['"]|['"]$/g, ''))
+    }
+  }
+  return out
+}
+
+function tokenizeShell(line: string): string[] {
+  const out: string[] = []
+  let buf = ''
+  let quote: '"' | "'" | null = null
+  for (const ch of line) {
+    if (quote) {
+      if (ch === quote) quote = null
+      else buf += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; continue }
+    if (/\s/.test(ch)) {
+      if (buf) { out.push(buf); buf = '' }
+      continue
+    }
+    buf += ch
+  }
+  if (buf) out.push(buf)
+  return out
+}
+
 export function titleizeToolName(value?: string): string {
   const raw = String(value ?? 'tool').split(':').pop() ?? 'tool'
   const lower = raw.toLowerCase()

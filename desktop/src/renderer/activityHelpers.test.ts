@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import {
   cleanShellCommand,
+  extractDeletedPathsFromCommand,
   inferActionKindFromTitle,
   inferCommandInfo,
   normalizeActivity,
@@ -76,5 +77,29 @@ describe('publicActivityTitleText', () => {
     expect(publicActivityTitleText('Read SKILL.md')).toBe('Loaded presentation skill')
     expect(publicActivityTitleText('tool call')).toBe('Used tool')
     expect(publicActivityTitleText('Custom step')).toBe('Custom step')
+  })
+})
+
+describe('extractDeletedPathsFromCommand', () => {
+  test('uses structured commandActions when present (locale-independent)', () => {
+    const paths = extractDeletedPathsFromCommand({
+      command: 'whatever the assistant typed',
+      commandActions: [
+        { type: 'delete', path: 'C:\\Users\\u\\Desktop\\Year-End-Review.pptx' },
+        { type: 'read', path: 'C:\\Users\\u\\Desktop\\notes.md' }
+      ]
+    })
+    expect(paths).toEqual(['C:\\Users\\u\\Desktop\\Year-End-Review.pptx'])
+  })
+
+  test('parses rm/del/Remove-Item across shells without depending on output language', () => {
+    expect(extractDeletedPathsFromCommand({ command: 'rm -f foo.pptx bar.pptx' })).toEqual(['foo.pptx', 'bar.pptx'])
+    expect(extractDeletedPathsFromCommand({ command: 'del C:\\tmp\\a.pptx' })).toEqual(['C:\\tmp\\a.pptx'])
+    expect(extractDeletedPathsFromCommand({ command: 'Remove-Item "C:\\tmp\\b.pptx" -Force' })).toEqual(['C:\\tmp\\b.pptx'])
+  })
+
+  test('ignores non-delete commands', () => {
+    expect(extractDeletedPathsFromCommand({ command: 'ls -la' })).toEqual([])
+    expect(extractDeletedPathsFromCommand({ command: 'cat foo.pptx' })).toEqual([])
   })
 })
