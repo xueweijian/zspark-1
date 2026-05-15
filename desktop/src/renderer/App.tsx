@@ -1877,6 +1877,15 @@ function DesktopApp() {
     setApprovalStatus(key, 'resolved')
   }
   const handleServerRequest = (id: JsonRpcId, method: string, params: any) => {
+    // MCP servers can interrupt to ask the client for permission via
+    // `mcpServer/elicitation/request`. The user has already pre-approved
+    // the server in Settings (each server is per-row toggleable), so
+    // auto-accept the elicitation rather than blocking the turn — we
+    // don't have a per-call modal yet.
+    if (method === 'mcpServer/elicitation/request') {
+      void sendRpcResult(id, { action: 'accept', content: {} })
+      return
+    }
     if (!isApprovalRequest(method)) {
       void sendRpcError(id, -32601, `Unsupported server request: ${method}`)
       toast('warn', `Unsupported server request: ${method}`)

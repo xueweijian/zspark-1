@@ -40,6 +40,15 @@ For each sub-query:
 
 Do **not** rely on a single source per sub-question.
 
+#### Tool-budget rules (CRITICAL — do not skip)
+
+- **Never call `browser_snapshot` during deep research.** Full a11y snapshots are tens of KB each and stack across turns; a few of them blow past Azure's per-request output cap and the upstream returns `response.failed`, which the user sees as "Reconnecting…". Use `browser_evaluate` with `() => document.title + '\n' + document.body.innerText.slice(0, 4000)` instead. Always slice the text to ≤ 4000 chars per page.
+- **Never take screenshots during research.** Text only.
+- **Per page**: at most one `browser_navigate` + one `browser_evaluate`. Then move on.
+- **Per turn**: hard cap at 20 tool calls. If you cannot finish, write the report with what you have and clearly mark the gaps under "Open questions".
+- **Prefer native `web_search`** if available. Use Playwright only to read a specific URL the search results gave you.
+- After every 5 tool calls, take stock: do you have enough to write the report? If yes, **stop searching and write**.
+
 ### 4. Cross-check
 
 After all sub-queries, build a small contradictions table:
