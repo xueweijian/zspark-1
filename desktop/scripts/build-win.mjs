@@ -4,7 +4,7 @@ import { existsSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const env = { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false' }
-const bin = (name) => process.platform === 'win32' ? `${name}.cmd` : name
+const useShell = process.platform === 'win32'
 const codexExe = resolve('../codex-rs/target/release/codex.exe')
 
 if (!existsSync(codexExe)) {
@@ -14,7 +14,7 @@ if (!existsSync(codexExe)) {
 }
 
 function run(command, args) {
-  const result = spawnSync(bin(command), args, { stdio: 'inherit', env })
+  const result = spawnSync(command, args, { stdio: 'inherit', env, shell: useShell })
   if (result.error) {
     console.error(result.error.message)
     process.exit(1)
