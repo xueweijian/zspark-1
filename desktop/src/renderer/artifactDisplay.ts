@@ -20,3 +20,7 @@ export function shouldDisplayScannedArtifact(
   const displayedAt = shown.get(artifact.path)
   return displayedAt === undefined || artifact.mtimeMs > displayedAt
 }
+
+export function clearDisplayedArtifactRevisions(shown: Map<string, number>) {
+  shown.clear()
+}

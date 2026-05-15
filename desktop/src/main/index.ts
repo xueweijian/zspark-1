@@ -13,12 +13,13 @@ import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
 import {
   buildMcpServersTomlValue,
+  duplicateMcpServerNames,
   sanitizeMcpServerList,
   type McpServerEntry
 } from './mcpServers'
 import { redactProcessArgsForLog, redactSensitiveLogLine } from './logRedaction'
 import {
-  decryptSensitiveMcpEnv,
+  decryptSensitiveMcpEnvWithIssues,
   encryptSensitiveMcpEnv,
   hasEncryptedMcpEnv,
   maskSensitiveMcpEnvForView,
@@ -69,6 +70,7 @@ interface AppSettings {
 let bridgePort: number | null = null
 let bridgeClose: (() => void) | null = null
 let settingsLoadIssue: string | null = null
+let mcpSecretDecryptIssues: string[] = []
 
 const PROVIDER_ENDPOINT_SUFFIXES = ['/chat/completions', '/responses', '/models']
 const DEFAULT_ENTRA_TENANT_ID = process.env.ZSPARK_TENANT_ID ?? ''
@@ -103,14 +105,14 @@ function loadSettings(): AppSettings {
       raw.enterpriseAuth.accessToken = safeStorage.decryptString(Buffer.from(raw.enterpriseAuth.encryptedAccessToken, 'base64'))
       delete raw.enterpriseAuth.encryptedAccessToken
     }
+    mcpSecretDecryptIssues = []
     const mcpServers = sanitizeMcpServerList(raw?.mcpServers)
     if (settingsEncryptionAvailable()) {
-      try {
-        raw.mcpServers = decryptSensitiveMcpEnv(mcpServers, (value) => safeStorage.decryptString(Buffer.from(value, 'base64')))
-      } catch (err: any) {
-        raw.mcpServers = mcpServers
-        settingsLoadIssue = `Some encrypted MCP server secrets could not be decrypted on this machine. Re-enter those env values before saving MCP settings. ${err?.message ?? String(err)}`
-      }
+      const result = decryptSensitiveMcpEnvWithIssues(mcpServers, (value) => safeStorage.decryptString(Buffer.from(value, 'base64')))
+      raw.mcpServers = result.servers
+      mcpSecretDecryptIssues = result.issues.map((issue) => (
+        `${issue.serverName || issue.serverId || 'unknown'}.${issue.key}: ${issue.error}`
+      ))
     } else {
       raw.mcpServers = mcpServers
     }
@@ -118,8 +120,10 @@ function loadSettings(): AppSettings {
   } catch (err: any) {
     if (err?.code === 'ENOENT') {
       settingsLoadIssue = null
+      mcpSecretDecryptIssues = []
       return {}
     }
+    mcpSecretDecryptIssues = []
     const backupPath = `${SETTINGS_PATH}.corrupt-${Date.now()}`
     try {
       if (existsSync(SETTINGS_PATH)) renameSync(SETTINGS_PATH, backupPath)
@@ -151,8 +155,15 @@ function settingsWarnings(s: AppSettings) {
   if ((s.enterpriseAuth as any)?.encryptedAccessToken && !s.enterpriseAuth?.accessToken) {
     warnings.push('The saved Entra token cannot be decrypted on this machine. Sign in again before using shared workspaces.')
   }
+  if (mcpSecretDecryptIssues.length > 0) {
+    warnings.push(`Some MCP server secrets could not be decrypted and were cleared. Re-enter these values before using the affected servers: ${mcpSecretDecryptIssues.join('; ')}`)
+  }
   if (hasEncryptedMcpEnv(s.mcpServers) && !settingsEncryptionAvailable()) {
     warnings.push('Encrypted MCP server env values cannot be decrypted on this machine. Re-enter those values before using the affected MCP servers.')
+  }
+  const duplicateNames = duplicateMcpServerNames(sanitizeMcpServerList(s.mcpServers))
+  if (duplicateNames.length > 0) {
+    warnings.push(`Duplicate enabled MCP server names are configured; only the first enabled server for each name will be launched: ${duplicateNames.join(', ')}`)
   }
   if (isRemoteHttpEnterpriseUrl(s.enterprise?.serverUrl)) {
     warnings.push('Shared workspace server is using plain HTTP. This is acceptable for a controlled demo or private tunnel, but use HTTPS before customer or production use.')
@@ -195,6 +206,7 @@ function saveSettings(s: AppSettings) {
   }
   renameSync(tmpPath, SETTINGS_PATH)
   settingsLoadIssue = null
+  mcpSecretDecryptIssues = []
 }
 
 /**

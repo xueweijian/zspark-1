@@ -43,6 +43,8 @@ AGENTS.override.md
 .jest/
 *.tsbuildinfo
 .zspark-attachments/
+.playwright-mcp/
+outputs/
 
 # logs
 *.log

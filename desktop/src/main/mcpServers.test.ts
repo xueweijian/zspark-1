@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import {
   buildMcpServersTomlValue,
+  duplicateMcpServerNames,
   generateMcpServerId,
   sanitizeMcpServer,
   sanitizeMcpServerList
@@ -53,6 +54,17 @@ describe('sanitizeMcpServerList', () => {
   test('returns empty array for non-array input', () => {
     expect(sanitizeMcpServerList(undefined)).toEqual([])
     expect(sanitizeMcpServerList('nope')).toEqual([])
+  })
+})
+
+describe('duplicateMcpServerNames', () => {
+  test('reports duplicate enabled names in first-seen order', () => {
+    expect(duplicateMcpServerNames([
+      { id: '1', name: 'gmail', command: 'c', args: [], env: {}, enabled: true },
+      { id: '2', name: 'gmail', command: 'd', args: [], env: {}, enabled: true },
+      { id: '3', name: 'disabled', command: 'e', args: [], env: {}, enabled: false },
+      { id: '4', name: 'disabled', command: 'f', args: [], env: {}, enabled: true }
+    ])).toEqual(['gmail'])
   })
 })
 

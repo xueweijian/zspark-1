@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import {
   decryptSensitiveMcpEnv,
+  decryptSensitiveMcpEnvWithIssues,
   encryptSensitiveMcpEnv,
   hasEncryptedMcpEnv,
   maskSensitiveMcpEnvForView,
@@ -48,6 +49,36 @@ describe('settings secret helpers', () => {
       ZSPARK_GMAIL_CLIENT_SECRET: 'secret',
       ZSPARK_GMAIL_REFRESH_TOKEN: 'refresh-token'
     })
+  })
+
+  test('keeps healthy MCP env secrets when one encrypted value cannot decrypt', () => {
+    const [broken, healthy] = [
+      server({
+        ZSPARK_GMAIL_CLIENT_SECRET: 'enc:v1:bad',
+        ZSPARK_GMAIL_REFRESH_TOKEN: 'enc:v1:good'
+      }),
+      { ...server({ API_KEY: 'enc:v1:ok' }), id: 'other', name: 'other' }
+    ]
+    const result = decryptSensitiveMcpEnvWithIssues([broken, healthy], (value) => {
+      if (value === 'bad') throw new Error('bad decrypt')
+      return `plain-${value}`
+    })
+
+    expect(result.servers.map((entry) => entry.env)).toEqual([
+      {
+        ZSPARK_GMAIL_CLIENT_SECRET: '',
+        ZSPARK_GMAIL_REFRESH_TOKEN: 'plain-good'
+      },
+      { API_KEY: 'plain-ok' }
+    ])
+    expect(result.issues).toEqual([
+      {
+        serverId: 'gmail',
+        serverName: 'gmail',
+        key: 'ZSPARK_GMAIL_CLIENT_SECRET',
+        error: 'bad decrypt'
+      }
+    ])
   })
 
   test('keeps existing secrets when renderer saves a masked MCP env view', () => {

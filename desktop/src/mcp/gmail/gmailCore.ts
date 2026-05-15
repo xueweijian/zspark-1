@@ -24,12 +24,14 @@ export interface CalendarEventInput {
   title: string
   start: string // ISO 8601
   end: string
+  timeZone?: string
   attendees?: string[]
   body?: string
   conference?: 'meet' | 'none'
 }
 
 const REFRESH_SKEW_MS = 60_000
+export const GMAIL_MESSAGE_BODY_LIMIT = 16_000
 
 export function tokenIsFresh(token: OAuthToken | null | undefined, nowMs = Date.now()): boolean {
   if (!token || !token.accessToken) return false
@@ -121,6 +123,13 @@ function decodeBodyData(data: string | undefined): string {
   }
 }
 
+function truncateGmailBody(body: string): string {
+  if (body.length <= GMAIL_MESSAGE_BODY_LIMIT) return body
+  const suffix = `\n\n[truncated; original length ${body.length} characters]`
+  const visibleLimit = Math.max(0, GMAIL_MESSAGE_BODY_LIMIT - suffix.length)
+  return `${body.slice(0, visibleLimit)}${suffix}`
+}
+
 /**
  * Convert a Gmail API `users.messages.get` (format=full) payload into the
  * compact shape we expose through MCP.
@@ -131,7 +140,7 @@ export function parseGmailMessage(raw: any): GmailMessage | null {
   const parts = flattenParts(raw.payload)
   const textPart = parts.find((p) => p?.mimeType === 'text/plain' && p?.body?.data)
   const fallbackPart = parts.find((p) => p?.body?.data)
-  const body = decodeBodyData(textPart?.body?.data ?? fallbackPart?.body?.data)
+  const body = truncateGmailBody(decodeBodyData(textPart?.body?.data ?? fallbackPart?.body?.data))
   return {
     id: raw.id,
     threadId: typeof raw.threadId === 'string' ? raw.threadId : undefined,
@@ -153,6 +162,10 @@ export function buildCalendarEventPayload(input: CalendarEventInput) {
     description: input.body,
     start: { dateTime: input.start },
     end: { dateTime: input.end }
+  }
+  if (input.timeZone?.trim()) {
+    payload.start.timeZone = input.timeZone.trim()
+    payload.end.timeZone = input.timeZone.trim()
   }
   if (input.attendees && input.attendees.length > 0) {
     payload.attendees = input.attendees.map((email) => ({ email }))
@@ -236,6 +249,7 @@ export const GMAIL_MCP_TOOLS: ToolDescriptor[] = [
         title: { type: 'string' },
         start: { type: 'string', description: 'ISO 8601 start timestamp.' },
         end: { type: 'string', description: 'ISO 8601 end timestamp.' },
+        timeZone: { type: 'string', description: 'IANA timezone, e.g. "Asia/Shanghai".' },
         attendees: { type: 'array', items: { type: 'string' } },
         body: { type: 'string' },
         conference: { type: 'string', enum: ['meet', 'none'] }

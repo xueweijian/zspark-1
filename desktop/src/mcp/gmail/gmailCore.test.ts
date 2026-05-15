@@ -6,6 +6,7 @@ import {
   encodeBase64Url,
   encodeGmailSendBody,
   GMAIL_MCP_TOOLS,
+  GMAIL_MESSAGE_BODY_LIMIT,
   parseGmailMessage,
   tokenIsFresh
 } from './gmailCore'
@@ -116,6 +117,20 @@ describe('parseGmailMessage', () => {
     expect(parsed?.snippet).toBe('preview')
   })
 
+  test('truncates very large message bodies before exposing them to the model', () => {
+    const body = 'x'.repeat(GMAIL_MESSAGE_BODY_LIMIT + 10)
+    const raw = {
+      id: 'large',
+      payload: {
+        headers: [],
+        body: { data: encodeBase64Url(body) }
+      }
+    }
+    const parsed = parseGmailMessage(raw)
+    expect(parsed?.body?.length).toBeLessThan(body.length)
+    expect(parsed?.body).toContain('[truncated')
+  })
+
   test('falls back to a non-text part when no text/plain exists', () => {
     const raw = {
       id: 'x',
@@ -140,9 +155,12 @@ describe('buildCalendarEventPayload', () => {
       start: '2026-05-15T10:00:00Z',
       end: '2026-05-15T11:00:00Z',
       attendees: ['a@x.com', 'b@x.com'],
-      conference: 'meet'
+      conference: 'meet',
+      timeZone: 'Asia/Shanghai'
     })
     expect(payload.summary).toBe('sync')
+    expect(payload.start).toEqual({ dateTime: '2026-05-15T10:00:00Z', timeZone: 'Asia/Shanghai' })
+    expect(payload.end).toEqual({ dateTime: '2026-05-15T11:00:00Z', timeZone: 'Asia/Shanghai' })
     expect(payload.attendees).toEqual([{ email: 'a@x.com' }, { email: 'b@x.com' }])
     expect(payload.conferenceData?.createRequest?.conferenceSolutionKey?.type).toBe('hangoutsMeet')
   })

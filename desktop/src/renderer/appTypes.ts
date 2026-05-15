@@ -271,6 +271,13 @@ export interface McpServerView {
   enabled: boolean
 }
 
+export type McpServerStartupStatus = 'starting' | 'ready' | 'failed' | 'cancelled'
+
+export interface McpServerStartupView {
+  status: McpServerStartupStatus
+  error?: string | null
+}
+
 export interface AppSettingsView {
   provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
   enterprise?: EnterpriseConfig

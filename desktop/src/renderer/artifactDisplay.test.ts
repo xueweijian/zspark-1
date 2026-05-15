@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { rememberDisplayedArtifactRevisions, shouldDisplayScannedArtifact } from './artifactDisplay'
+import { clearDisplayedArtifactRevisions, rememberDisplayedArtifactRevisions, shouldDisplayScannedArtifact } from './artifactDisplay'
 import type { WorkspaceFile } from './appTypes'
 
 function file(path: string, name: string, updatedAt: number): WorkspaceFile {
@@ -34,5 +34,12 @@ describe('artifact display revision tracking', () => {
     const shown = new Map<string, number>()
     rememberDisplayedArtifactRevisions([{ ...file('/tmp/missing.pptx', 'missing.pptx', 1000), status: 'missing' }], shown)
     expect(shouldDisplayScannedArtifact({ path: '/tmp/missing.pptx', mtimeMs: 1000 }, shown)).toBe(true)
+  })
+
+  test('clears remembered revisions on thread reset', () => {
+    const shown = new Map<string, number>()
+    rememberDisplayedArtifactRevisions([file('/tmp/output.pptx', 'output.pptx', 1000)], shown)
+    clearDisplayedArtifactRevisions(shown)
+    expect(shouldDisplayScannedArtifact({ path: '/tmp/output.pptx', mtimeMs: 1000 }, shown)).toBe(true)
   })
 })

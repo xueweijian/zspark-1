@@ -17,6 +17,7 @@ const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me'
 const CALENDAR_BASE = 'https://www.googleapis.com/calendar/v3/calendars/primary'
 const REFRESH_SKEW_MS = 60_000
+const GMAIL_MESSAGE_BODY_LIMIT = 16_000
 
 let cachedToken = null
 
@@ -80,6 +81,13 @@ function flattenParts(payload) {
   return payload.parts.flatMap(flattenParts)
 }
 
+function truncateGmailBody(body) {
+  if (body.length <= GMAIL_MESSAGE_BODY_LIMIT) return body
+  const suffix = `\n\n[truncated; original length ${body.length} characters]`
+  const visibleLimit = Math.max(0, GMAIL_MESSAGE_BODY_LIMIT - suffix.length)
+  return `${body.slice(0, visibleLimit)}${suffix}`
+}
+
 function parseGmailMessage(raw) {
   if (!raw || typeof raw.id !== 'string') return null
   const headers = Array.isArray(raw?.payload?.headers) ? raw.payload.headers : []
@@ -95,7 +103,7 @@ function parseGmailMessage(raw) {
     subject: pickHeader(headers, 'Subject'),
     date: pickHeader(headers, 'Date'),
     snippet: raw.snippet,
-    body: data ? decodeBase64Url(data) : undefined
+    body: data ? truncateGmailBody(decodeBase64Url(data)) : undefined
   }
 }
 
@@ -146,6 +154,7 @@ const TOOLS = [
         title: { type: 'string' },
         start: { type: 'string', description: 'ISO 8601 start.' },
         end: { type: 'string', description: 'ISO 8601 end.' },
+        timeZone: { type: 'string', description: 'IANA timezone, e.g. "Asia/Shanghai".' },
         attendees: { type: 'array', items: { type: 'string' } },
         body: { type: 'string' },
         conference: { type: 'string', enum: ['meet', 'none'] }
@@ -240,6 +249,10 @@ async function callCalendarCreate(params = {}) {
     description: params.body,
     start: { dateTime: params.start },
     end: { dateTime: params.end }
+  }
+  if (params.timeZone?.trim()) {
+    payload.start.timeZone = params.timeZone.trim()
+    payload.end.timeZone = params.timeZone.trim()
   }
   if (Array.isArray(params.attendees) && params.attendees.length > 0) {
     payload.attendees = params.attendees.map((email) => ({ email }))

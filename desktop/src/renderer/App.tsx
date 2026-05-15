@@ -17,7 +17,7 @@ import {
   type SkillCategory
 } from './skillCatalog'
 import { normalizeMarkdownForDisplay } from './markdown'
-import { rememberDisplayedArtifactRevisions, shouldDisplayScannedArtifact } from './artifactDisplay'
+import { clearDisplayedArtifactRevisions, rememberDisplayedArtifactRevisions, shouldDisplayScannedArtifact } from './artifactDisplay'
 import {
   dirname,
   extractArtifactPathCandidates,
@@ -65,6 +65,7 @@ import type {
   EnterpriseStatus,
   JsonRpcId,
   LocalSkillMeta,
+  McpServerStartupView,
   McpServerView,
   MemoryCitation,
   MemoryCitationEntry,
@@ -799,11 +800,20 @@ function newMcpDraft(): McpServerView {
   }
 }
 
+const mcpStartupLabels: Record<string, string> = {
+  starting: 'Starting',
+  ready: 'Ready',
+  failed: 'Failed',
+  cancelled: 'Stopped'
+}
+
 function McpServersEditor({
   servers,
+  mcpStartup,
   onChange
 }: {
   servers: McpServerView[]
+  mcpStartup: Record<string, McpServerStartupView>
   onChange: (next: McpServerView[]) => void
 }) {
   const [editing, setEditing] = useState<string | null>(null)
@@ -821,6 +831,7 @@ function McpServersEditor({
       {servers.length === 0 && <p className="modal-hint">No MCP servers configured yet. Add one to expose extra tools to the assistant.</p>}
       {servers.map((server) => {
         const open = editing === server.id
+        const startup = server.name ? mcpStartup[server.name] : undefined
         return (
           <div key={server.id} className="mcp-row">
             <div className="mcp-row-head">
@@ -830,13 +841,19 @@ function McpServersEditor({
                   checked={server.enabled}
                   onChange={(e) => updateAt(server.id, { enabled: e.target.checked })}
                 />
-                <span>{server.name || '(unnamed)'}</span>
+                <span className="mcp-server-name">{server.name || '(unnamed)'}</span>
+                {startup && (
+                  <span className={`mcp-status ${startup.status}`}>
+                    {mcpStartupLabels[startup.status] ?? startup.status}
+                  </span>
+                )}
               </label>
               <div className="mcp-row-actions">
                 <button className="ghost" onClick={() => setEditing(open ? null : server.id)}>{open ? 'Done' : 'Edit'}</button>
                 <button className="ghost" onClick={() => remove(server.id)}>Delete</button>
               </div>
             </div>
+            {startup?.error && <div className="mcp-error" role="status">{startup.error}</div>}
             {open && (
               <div className="mcp-row-body">
                 <label>Name<input value={server.name} onChange={(e) => updateAt(server.id, { name: e.target.value })} placeholder="gmail" /></label>
@@ -875,7 +892,13 @@ function McpServersEditor({
   )
 }
 
-function SettingsModal({ onClose }: { onClose: () => void }) {
+function SettingsModal({
+  mcpStartup,
+  onClose
+}: {
+  mcpStartup: Record<string, McpServerStartupView>
+  onClose: () => void
+}) {
   const [form, setForm] = useState<ProviderForm>({ baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', wireApi: 'responses' })
   const [enterprise, setEnterprise] = useState<EnterpriseForm>({
     serverUrl: '',
@@ -938,7 +961,7 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
             <h3>MCP servers</h3>
             <p className="modal-hint">Tools exposed to the assistant via Model Context Protocol. Each server launches a local process; toggle individually.</p>
           </div>
-          <McpServersEditor servers={mcpServers} onChange={setMcpServers} />
+          <McpServersEditor servers={mcpServers} mcpStartup={mcpStartup} onChange={setMcpServers} />
         </div>
         <div className="settings-group">
           <div>
@@ -1020,6 +1043,7 @@ function DesktopApp() {
   const [activeSharedWorkspace, setActiveSharedWorkspace] = useState<string | null>(null)
   const [sharedSessions, setSharedSessions] = useState<SharedSession[]>([])
   const [activeSharedSession, setActiveSharedSession] = useState<string | null>(null)
+  const [mcpStartup, setMcpStartup] = useState<Record<string, McpServerStartupView>>({})
   // Track current turn block id for incoming events
   const currentTurn = useRef<{ turnId: string; blockId: string; startedAt: number } | null>(null)
   // Map agent itemId (delta or completed) -> agent block id, scoped per turn
@@ -1142,6 +1166,7 @@ function DesktopApp() {
     completedWorkByTurn.current.clear()
     commandFailuresByTurn.current.clear()
     interruptingTurns.current.clear()
+    clearDisplayedArtifactRevisions(shownArtifactRevisions.current)
   }
   const refreshRuntimeHost = async () => {
     try {
@@ -1875,7 +1900,19 @@ function DesktopApp() {
     // MCP elicitations, but do not auto-grant URL opens or structured
     // input requests without a dedicated UI.
     if (method === 'mcpServer/elicitation/request') {
-      void sendRpcResult(id, responseForMcpElicitationRequest(params))
+      const { reason, ...response } = responseForMcpElicitationRequest(params)
+      if (response.action === 'decline') {
+        const serverName = typeof params?.serverName === 'string' && params.serverName.trim()
+          ? params.serverName.trim()
+          : 'MCP server'
+        const detail = reason === 'structured-input'
+          ? 'requested structured input, which zspark does not support yet.'
+          : reason === 'url'
+            ? 'requested a URL action, which requires an explicit UI before it can be approved.'
+            : 'sent an unsupported elicitation request.'
+        toast('warn', `${serverName} ${detail}`)
+      }
+      void sendRpcResult(id, response)
       return
     }
     if (!isApprovalRequest(method)) {
@@ -2051,6 +2088,17 @@ function DesktopApp() {
   useEffect(() => {
     function handle(method: string, params: any) {
       switch (method) {
+        case 'mcpServer/startupStatus/updated': {
+          const name = typeof params?.name === 'string' ? params.name : ''
+          const status = params?.status
+          if (!name || (status !== 'starting' && status !== 'ready' && status !== 'failed' && status !== 'cancelled')) return
+          const error = typeof params?.error === 'string' && params.error ? params.error : null
+          setMcpStartup((prev) => ({ ...prev, [name]: { status, error } }))
+          if (status === 'failed') {
+            toast('warn', `MCP ${name} failed to start${error ? `: ${error}` : ''}`)
+          }
+          return
+        }
         case 'turn/started': {
           submitInFlight.current = false
           setSubmitting(false)
@@ -3693,7 +3741,7 @@ function DesktopApp() {
         </div>
       </aside>
 
-      {showSettings && <SettingsModal onClose={() => setShowSettings(false)} />}
+      {showSettings && <SettingsModal mcpStartup={mcpStartup} onClose={() => setShowSettings(false)} />}
 
       {panel === 'search' && (
         <Drawer title={activeSharedWorkspace ? 'Search shared sessions' : 'Search threads'} onClose={() => setPanel(null)}>

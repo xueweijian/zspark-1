@@ -83,6 +83,19 @@ export function sanitizeMcpServerList(raw: unknown): McpServerEntry[] {
   return out
 }
 
+export function duplicateMcpServerNames(entries: McpServerEntry[]): string[] {
+  const counts = new Map<string, number>()
+  for (const entry of entries) {
+    if (!entry.enabled) continue
+    counts.set(entry.name, (counts.get(entry.name) ?? 0) + 1)
+  }
+  const duplicates: string[] = []
+  for (const [name, count] of counts) {
+    if (count > 1) duplicates.push(name)
+  }
+  return duplicates
+}
+
 /**
  * Build the TOML fragment passed to codex-rs via `-c mcp_servers=...`.
  * codex-rs accepts a single inline-table value: each key is the server

@@ -17,14 +17,15 @@ describe('responseForMcpElicitationRequest', () => {
         properties: { confirmed: { type: 'boolean' } },
         required: ['confirmed']
       }
-    })).toEqual({ action: 'decline', content: null })
+    })).toEqual({ action: 'decline', content: null, reason: 'structured-input' })
   })
 
   test('declines URL and malformed elicitations', () => {
     expect(responseForMcpElicitationRequest({ mode: 'url', url: 'https://example.com' })).toEqual({
       action: 'decline',
-      content: null
+      content: null,
+      reason: 'url'
     })
-    expect(responseForMcpElicitationRequest(null)).toEqual({ action: 'decline', content: null })
+    expect(responseForMcpElicitationRequest(null)).toEqual({ action: 'decline', content: null, reason: 'malformed' })
   })
 })
