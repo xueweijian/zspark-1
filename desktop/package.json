@@ -49,6 +49,14 @@
           "codex",
           "codex.exe"
         ]
+      },
+      {
+        "from": "scripts",
+        "to": "scripts",
+        "filter": [
+          "gmail-mcp-server.mjs",
+          "gmail-oauth-bootstrap.mjs"
+        ]
       }
     ],
     "win": {

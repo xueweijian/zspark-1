@@ -100,6 +100,17 @@ describe('buildMcpServersTomlValue', () => {
     expect(toml).not.toContain('a = {')
     expect(toml).toContain('b = {')
   })
+
+  test('emits only the first enabled server for duplicate names', () => {
+    const toml = buildMcpServersTomlValue([
+      { id: '1', name: 'gmail', command: 'node', args: ['first.js'], env: {}, enabled: true },
+      { id: '2', name: 'gmail', command: 'node', args: ['second.js'], env: {}, enabled: true },
+      { id: '3', name: 'other', command: 'node', args: ['third.js'], env: {}, enabled: true }
+    ])
+    expect(toml).toContain('"first.js"')
+    expect(toml).not.toContain('"second.js"')
+    expect(toml).toContain('"third.js"')
+  })
 })
 
 describe('generateMcpServerId', () => {

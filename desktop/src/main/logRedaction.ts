@@ -33,3 +33,9 @@ export function redactSensitiveLogLine(line: string): string {
     return redactSensitiveString(line)
   }
 }
+
+export function redactProcessArgsForLog(args: string[]): string[] {
+  return args.map((arg) => (
+    arg.startsWith('mcp_servers=') ? 'mcp_servers=[redacted]' : redactSensitiveString(arg)
+  ))
+}

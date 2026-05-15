@@ -17,6 +17,7 @@ import {
   type SkillCategory
 } from './skillCatalog'
 import { normalizeMarkdownForDisplay } from './markdown'
+import { rememberDisplayedArtifactRevisions, shouldDisplayScannedArtifact } from './artifactDisplay'
 import {
   dirname,
   extractArtifactPathCandidates,
@@ -37,6 +38,7 @@ import {
   shouldRecoverFromProviderRetry,
   type CompletedTurnWorkKind
 } from './turnRecovery'
+import { responseForMcpElicitationRequest } from './mcpElicitation'
 import {
   approvalResponsePayload,
   approvalStatusForDecision,
@@ -1060,8 +1062,7 @@ function DesktopApp() {
   // instead of racing it and reporting a false conflict.
   const sharedSnapshotSyncQueue = useRef<Promise<void>>(Promise.resolve())
   const activeSharedSnapshotRevision = useRef<number | null>(null)
-  const shownArtifactPaths = useRef<Set<string>>(new Set())
-  const shownArtifactNames = useRef<Set<string>>(new Set())
+  const shownArtifactRevisions = useRef<Map<string, number>>(new Map())
   const sharedArtifactUploads = useRef<Set<string>>(new Set())
   const deletedArtifacts = useRef<DeletedArtifactReference[]>([])
   const submitInFlight = useRef(false)
@@ -1347,11 +1348,7 @@ function DesktopApp() {
     })
   }
   const rememberDisplayedArtifacts = (files: WorkspaceFile[]) => {
-    for (const file of files) {
-      if (file.status === 'missing') continue
-      shownArtifactPaths.current.add(file.path)
-      shownArtifactNames.current.add(file.name.toLowerCase())
-    }
+    rememberDisplayedArtifactRevisions(files, shownArtifactRevisions.current)
   }
   const rememberDeletedArtifact = (turnId: string, path: string) => {
     const ref = deletedArtifactReference(turnId, path)
@@ -1519,10 +1516,7 @@ function DesktopApp() {
         limit: 1
       })
       let files: WorkspaceFile[] = result.artifacts
-        .filter((artifact) => (
-          !shownArtifactPaths.current.has(artifact.path) &&
-          !shownArtifactNames.current.has(artifact.name.toLowerCase())
-        ))
+        .filter((artifact) => shouldDisplayScannedArtifact(artifact, shownArtifactRevisions.current))
         .map((artifact, index) => ({
           id: `scan-${turnId}-${index}-${artifact.mtimeMs}`,
           name: artifact.name,
@@ -1877,13 +1871,11 @@ function DesktopApp() {
     setApprovalStatus(key, 'resolved')
   }
   const handleServerRequest = (id: JsonRpcId, method: string, params: any) => {
-    // MCP servers can interrupt to ask the client for permission via
-    // `mcpServer/elicitation/request`. The user has already pre-approved
-    // the server in Settings (each server is per-row toggleable), so
-    // auto-accept the elicitation rather than blocking the turn — we
-    // don't have a per-call modal yet.
+    // Keep the current non-blocking path for simple confirmation-only
+    // MCP elicitations, but do not auto-grant URL opens or structured
+    // input requests without a dedicated UI.
     if (method === 'mcpServer/elicitation/request') {
-      void sendRpcResult(id, { action: 'accept', content: {} })
+      void sendRpcResult(id, responseForMcpElicitationRequest(params))
       return
     }
     if (!isApprovalRequest(method)) {

@@ -16,7 +16,14 @@ import {
   sanitizeMcpServerList,
   type McpServerEntry
 } from './mcpServers'
-import { redactSensitiveLogLine } from './logRedaction'
+import { redactProcessArgsForLog, redactSensitiveLogLine } from './logRedaction'
+import {
+  decryptSensitiveMcpEnv,
+  encryptSensitiveMcpEnv,
+  hasEncryptedMcpEnv,
+  maskSensitiveMcpEnvForView,
+  mergeMaskedMcpEnv
+} from './settingsSecrets'
 import { artifactMimeType, contentDispositionFileName } from './mime'
 import {
   ensureShellOpenAllowed,
@@ -96,6 +103,17 @@ function loadSettings(): AppSettings {
       raw.enterpriseAuth.accessToken = safeStorage.decryptString(Buffer.from(raw.enterpriseAuth.encryptedAccessToken, 'base64'))
       delete raw.enterpriseAuth.encryptedAccessToken
     }
+    const mcpServers = sanitizeMcpServerList(raw?.mcpServers)
+    if (settingsEncryptionAvailable()) {
+      try {
+        raw.mcpServers = decryptSensitiveMcpEnv(mcpServers, (value) => safeStorage.decryptString(Buffer.from(value, 'base64')))
+      } catch (err: any) {
+        raw.mcpServers = mcpServers
+        settingsLoadIssue = `Some encrypted MCP server secrets could not be decrypted on this machine. Re-enter those env values before saving MCP settings. ${err?.message ?? String(err)}`
+      }
+    } else {
+      raw.mcpServers = mcpServers
+    }
     return raw
   } catch (err: any) {
     if (err?.code === 'ENOENT') {
@@ -125,13 +143,16 @@ function settingsWarnings(s: AppSettings) {
   const warnings: string[] = []
   if (settingsLoadIssue) warnings.push(settingsLoadIssue)
   if (!settingsEncryptionAvailable()) {
-    warnings.push('System keychain encryption is unavailable. Provider API keys and Entra tokens saved on this machine will be stored in the app settings file.')
+    warnings.push('System keychain encryption is unavailable. Provider API keys, Entra tokens, and sensitive MCP env values saved on this machine will be stored in the app settings file.')
   }
   if ((s.provider as any)?.encryptedApiKey && !s.provider?.apiKey) {
     warnings.push('An encrypted provider API key exists but cannot be decrypted on this machine. Re-enter the key before saving provider settings.')
   }
   if ((s.enterpriseAuth as any)?.encryptedAccessToken && !s.enterpriseAuth?.accessToken) {
     warnings.push('The saved Entra token cannot be decrypted on this machine. Sign in again before using shared workspaces.')
+  }
+  if (hasEncryptedMcpEnv(s.mcpServers) && !settingsEncryptionAvailable()) {
+    warnings.push('Encrypted MCP server env values cannot be decrypted on this machine. Re-enter those values before using the affected MCP servers.')
   }
   if (isRemoteHttpEnterpriseUrl(s.enterprise?.serverUrl)) {
     warnings.push('Shared workspace server is using plain HTTP. This is acceptable for a controlled demo or private tunnel, but use HTTPS before customer or production use.')
@@ -155,6 +176,12 @@ function saveSettings(s: AppSettings) {
       encryptedAccessToken: safeStorage.encryptString(out.enterpriseAuth.accessToken).toString('base64')
     }
     delete out.enterpriseAuth.accessToken
+  }
+  if (out.mcpServers) {
+    const mcpServers = sanitizeMcpServerList(out.mcpServers)
+    out.mcpServers = settingsEncryptionAvailable()
+      ? encryptSensitiveMcpEnv(mcpServers, (value) => safeStorage.encryptString(value).toString('base64'))
+      : mcpServers
   }
   const tmpPath = `${SETTINGS_PATH}.${process.pid}.${Date.now()}.tmp`
   // fsync the bytes before rename so a crash between write+rename can't
@@ -246,7 +273,7 @@ function tokenIsUsable(auth?: EnterpriseAuth) {
 function safeSettingsView(s: AppSettings) {
   const view: AppSettings & { warnings: string[] } = {
     enterprise: effectiveEnterpriseConfig(s),
-    mcpServers: sanitizeMcpServerList(s.mcpServers),
+    mcpServers: maskSensitiveMcpEnvForView(sanitizeMcpServerList(s.mcpServers)),
     warnings: settingsWarnings(s)
   }
   if (s.provider) {
@@ -558,7 +585,7 @@ function spawnCodex() {
   mkdirSync(app.getPath('userData'), { recursive: true })
   rotateLogIfLarge(logPath)
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' })
-  logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(providerArgs)} ===\n`)
+  logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(redactProcessArgsForLog(providerArgs))} ===\n`)
   let logStreamClosed = false
   const closeLogStream = (suffix: string) => {
     if (logStreamClosed) return
@@ -694,7 +721,10 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(a
     }
   }
   if (partial.mcpServers !== undefined) {
-    next.mcpServers = sanitizeMcpServerList(partial.mcpServers)
+    next.mcpServers = sanitizeMcpServerList(mergeMaskedMcpEnv(
+      sanitizeMcpServerList(cur.mcpServers),
+      sanitizeMcpServerList(partial.mcpServers)
+    ))
   }
   if (next.enterprise) {
     next.enterprise = {

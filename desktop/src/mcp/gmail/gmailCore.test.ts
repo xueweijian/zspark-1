@@ -40,7 +40,8 @@ describe('buildRfc822Message', () => {
     expect(msg).toContain('To: a@x.com, b@x.com')
     expect(msg).toContain('Subject: Hi')
     expect(msg).toContain('MIME-Version: 1.0')
-    expect(msg).toMatch(/\r\n\r\nHello there\.$/)
+    expect(msg).toContain('Content-Transfer-Encoding: base64')
+    expect(Buffer.from(msg.split('\r\n\r\n')[1], 'base64').toString('utf8')).toBe('Hello there.')
   })
 
   test('adds optional From and Cc only when supplied', () => {
@@ -56,6 +57,22 @@ describe('buildRfc822Message', () => {
     })
     expect(withExtras).toContain('From: me@x.com')
     expect(withExtras).toContain('Cc: c@x.com')
+  })
+
+  test('sanitizes injected header newlines and encodes non-ascii subjects', () => {
+    const msg = buildRfc822Message({
+      from: 'me@x.com\r\nBcc: attacker@x.com',
+      to: ['a@x.com\r\nBcc: attacker@x.com'],
+      cc: ['c@x.com'],
+      subject: '季度总结',
+      body: '中文 body'
+    })
+    const headers = msg.split('\r\n\r\n')[0]
+    expect(headers).not.toContain('\r\nBcc:')
+    expect(headers).toContain('From: me@x.com Bcc: attacker@x.com')
+    expect(headers).toContain('To: a@x.com Bcc: attacker@x.com')
+    expect(headers).toContain(`Subject: =?UTF-8?B?${Buffer.from('季度总结').toString('base64')}?=`)
+    expect(Buffer.from(msg.split('\r\n\r\n')[1], 'base64').toString('utf8')).toBe('中文 body')
   })
 })
 

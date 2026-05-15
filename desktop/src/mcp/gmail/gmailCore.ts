@@ -46,6 +46,28 @@ export function encodeBase64Url(input: string): string {
   return Buffer.from(input, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
+function sanitizeHeaderValue(value: string): string {
+  return String(value ?? '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .trim()
+}
+
+function encodeMimeHeaderValue(value: string): string {
+  const clean = sanitizeHeaderValue(value)
+  return /^[\x20-\x7e]*$/.test(clean)
+    ? clean
+    : `=?UTF-8?B?${Buffer.from(clean, 'utf8').toString('base64')}?=`
+}
+
+function formatAddressList(values: string[]): string {
+  return values.map(sanitizeHeaderValue).filter(Boolean).join(', ')
+}
+
+function wrapBase64(value: string): string {
+  return Buffer.from(value, 'utf8').toString('base64').match(/.{1,76}/g)?.join('\r\n') ?? ''
+}
+
 /**
  * Build an RFC 5322 message and encode it the way Gmail's `users.messages.send`
  * expects (base64url of the full MIME envelope).
@@ -57,16 +79,17 @@ export function buildRfc822Message(args: {
   body: string
   from?: string
 }): string {
+  const body = wrapBase64(args.body)
   const headers = [
-    args.from ? `From: ${args.from}` : null,
-    `To: ${args.to.join(', ')}`,
-    args.cc && args.cc.length > 0 ? `Cc: ${args.cc.join(', ')}` : null,
-    `Subject: ${args.subject}`,
+    args.from ? `From: ${sanitizeHeaderValue(args.from)}` : null,
+    `To: ${formatAddressList(args.to)}`,
+    args.cc && args.cc.length > 0 ? `Cc: ${formatAddressList(args.cc)}` : null,
+    `Subject: ${encodeMimeHeaderValue(args.subject)}`,
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset="UTF-8"',
-    'Content-Transfer-Encoding: 7bit'
+    'Content-Transfer-Encoding: base64'
   ].filter((line): line is string => Boolean(line))
-  return `${headers.join('\r\n')}\r\n\r\n${args.body}`
+  return `${headers.join('\r\n')}\r\n\r\n${body}`
 }
 
 export function encodeGmailSendBody(rfc822: string): string {

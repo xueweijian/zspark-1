@@ -94,7 +94,14 @@ export function sanitizeMcpServerList(raw: unknown): McpServerEntry[] {
  * passed unconditionally).
  */
 export function buildMcpServersTomlValue(entries: McpServerEntry[]): string {
-  const active = entries.filter((entry) => entry.enabled)
+  const active: McpServerEntry[] = []
+  const seenNames = new Set<string>()
+  for (const entry of entries) {
+    if (!entry.enabled) continue
+    if (seenNames.has(entry.name)) continue
+    seenNames.add(entry.name)
+    active.push(entry)
+  }
   if (active.length === 0) return '{}'
   const body = active
     .map((entry) => {

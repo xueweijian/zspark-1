@@ -34,17 +34,39 @@ function encodeBase64Url(input) {
   return Buffer.from(input, 'utf8').toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
+function sanitizeHeaderValue(value) {
+  return String(value ?? '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+    .trim()
+}
+
+function encodeMimeHeaderValue(value) {
+  const clean = sanitizeHeaderValue(value)
+  return /^[\x20-\x7e]*$/.test(clean)
+    ? clean
+    : `=?UTF-8?B?${Buffer.from(clean, 'utf8').toString('base64')}?=`
+}
+
+function formatAddressList(values) {
+  return values.map(sanitizeHeaderValue).filter(Boolean).join(', ')
+}
+
+function wrapBase64(value) {
+  return Buffer.from(value, 'utf8').toString('base64').match(/.{1,76}/g)?.join('\r\n') ?? ''
+}
+
 function buildRfc822({ to, cc, subject, body, from }) {
   const headers = [
-    from ? `From: ${from}` : null,
-    `To: ${to.join(', ')}`,
-    cc?.length ? `Cc: ${cc.join(', ')}` : null,
-    `Subject: ${subject}`,
+    from ? `From: ${sanitizeHeaderValue(from)}` : null,
+    `To: ${formatAddressList(to)}`,
+    cc?.length ? `Cc: ${formatAddressList(cc)}` : null,
+    `Subject: ${encodeMimeHeaderValue(subject)}`,
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset="UTF-8"',
-    'Content-Transfer-Encoding: 7bit'
+    'Content-Transfer-Encoding: base64'
   ].filter(Boolean)
-  return `${headers.join('\r\n')}\r\n\r\n${body}`
+  return `${headers.join('\r\n')}\r\n\r\n${wrapBase64(body)}`
 }
 
 function pickHeader(headers, name) {
