@@ -63,6 +63,7 @@ import type {
   EnterpriseStatus,
   JsonRpcId,
   LocalSkillMeta,
+  McpServerView,
   MemoryCitation,
   MemoryCitationEntry,
   MessageBlock,
@@ -785,6 +786,93 @@ function actIcon(k: ActivityKind) {
   }
 }
 
+function newMcpDraft(): McpServerView {
+  return {
+    id: `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    name: '',
+    command: '',
+    args: [],
+    env: {},
+    enabled: true
+  }
+}
+
+function McpServersEditor({
+  servers,
+  onChange
+}: {
+  servers: McpServerView[]
+  onChange: (next: McpServerView[]) => void
+}) {
+  const [editing, setEditing] = useState<string | null>(null)
+  const updateAt = (id: string, patch: Partial<McpServerView>) => {
+    onChange(servers.map((s) => (s.id === id ? { ...s, ...patch } : s)))
+  }
+  const remove = (id: string) => onChange(servers.filter((s) => s.id !== id))
+  const add = () => {
+    const draft = newMcpDraft()
+    onChange([...servers, draft])
+    setEditing(draft.id)
+  }
+  return (
+    <div className="mcp-list">
+      {servers.length === 0 && <p className="modal-hint">No MCP servers configured yet. Add one to expose extra tools to the assistant.</p>}
+      {servers.map((server) => {
+        const open = editing === server.id
+        return (
+          <div key={server.id} className="mcp-row">
+            <div className="mcp-row-head">
+              <label className="mcp-toggle">
+                <input
+                  type="checkbox"
+                  checked={server.enabled}
+                  onChange={(e) => updateAt(server.id, { enabled: e.target.checked })}
+                />
+                <span>{server.name || '(unnamed)'}</span>
+              </label>
+              <div className="mcp-row-actions">
+                <button className="ghost" onClick={() => setEditing(open ? null : server.id)}>{open ? 'Done' : 'Edit'}</button>
+                <button className="ghost" onClick={() => remove(server.id)}>Delete</button>
+              </div>
+            </div>
+            {open && (
+              <div className="mcp-row-body">
+                <label>Name<input value={server.name} onChange={(e) => updateAt(server.id, { name: e.target.value })} placeholder="gmail" /></label>
+                <label>Command<input value={server.command} onChange={(e) => updateAt(server.id, { command: e.target.value })} placeholder="node" /></label>
+                <label>Args (one per line)
+                  <textarea
+                    rows={3}
+                    value={server.args.join('\n')}
+                    onChange={(e) => updateAt(server.id, { args: e.target.value.split('\n').map((s) => s.trim()).filter((s) => s.length > 0) })}
+                  />
+                </label>
+                <label>Env (KEY=VALUE per line)
+                  <textarea
+                    rows={3}
+                    value={Object.entries(server.env).map(([k, v]) => `${k}=${v}`).join('\n')}
+                    onChange={(e) => {
+                      const env: Record<string, string> = {}
+                      for (const line of e.target.value.split('\n')) {
+                        const idx = line.indexOf('=')
+                        if (idx <= 0) continue
+                        const k = line.slice(0, idx).trim()
+                        const v = line.slice(idx + 1)
+                        if (k) env[k] = v
+                      }
+                      updateAt(server.id, { env })
+                    }}
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+        )
+      })}
+      <button className="ghost mcp-add" onClick={add}>+ Add MCP server</button>
+    </div>
+  )
+}
+
 function SettingsModal({ onClose }: { onClose: () => void }) {
   const [form, setForm] = useState<ProviderForm>({ baseUrl: 'https://api.openai.com/v1', apiKey: '', model: 'gpt-4o-mini', wireApi: 'responses' })
   const [enterprise, setEnterprise] = useState<EnterpriseForm>({
@@ -794,18 +882,20 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
     apiScope: '',
     authority: ''
   })
+  const [mcpServers, setMcpServers] = useState<McpServerView[]>([])
   const [saving, setSaving] = useState(false)
   const [warnings, setWarnings] = useState<string[]>([])
   useEffect(() => {
     window.zspark.getSettings().then((s) => {
       if (s.provider) setForm((p) => ({ ...p, ...s.provider }))
       if (s.enterprise) setEnterprise((p) => ({ ...p, ...s.enterprise }))
+      if (s.mcpServers) setMcpServers(s.mcpServers)
       setWarnings(s.warnings ?? [])
     })
   }, [])
   const save = async () => {
     setSaving(true)
-    const result = await window.zspark.saveSettings({ provider: form, enterprise })
+    const result = await window.zspark.saveSettings({ provider: form, enterprise, mcpServers })
     setWarnings(result.warnings ?? [])
     setSaving(false)
     if (!result.ok) {
@@ -840,6 +930,13 @@ function SettingsModal({ onClose }: { onClose: () => void }) {
               {warnings.map((warning) => <div key={warning}>{warning}</div>)}
             </div>
           )}
+        </div>
+        <div className="settings-group">
+          <div>
+            <h3>MCP servers</h3>
+            <p className="modal-hint">Tools exposed to the assistant via Model Context Protocol. Each server launches a local process; toggle individually.</p>
+          </div>
+          <McpServersEditor servers={mcpServers} onChange={setMcpServers} />
         </div>
         <div className="settings-group">
           <div>

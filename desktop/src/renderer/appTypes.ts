@@ -262,9 +262,19 @@ export interface SharedWorkspace {
   updated_at?: string
 }
 
+export interface McpServerView {
+  id: string
+  name: string
+  command: string
+  args: string[]
+  env: Record<string, string>
+  enabled: boolean
+}
+
 export interface AppSettingsView {
   provider?: { baseUrl: string; apiKey: string; model: string; wireApi: 'responses' | 'chat' }
   enterprise?: EnterpriseConfig
+  mcpServers?: McpServerView[]
   warnings?: string[]
 }
 

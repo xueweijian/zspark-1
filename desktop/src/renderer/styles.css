@@ -413,3 +413,11 @@ input,textarea,select{font:inherit}
 .skill-actions button:hover:not(:disabled){background:#f4f4f5;border-color:#a1a1aa}
 .skill-actions button:disabled{opacity:.45;cursor:not-allowed}
 .skill-actions button.secondary{color:#52525b;background:#fafafa;border-color:#e4e4e7}
+.mcp-list{display:flex;flex-direction:column;gap:8px}
+.mcp-row{border:1px solid #e4e4e7;border-radius:8px;padding:8px 10px;background:#fff}
+.mcp-row-head{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.mcp-toggle{display:flex;align-items:center;gap:8px;font-size:13px;font-weight:500;color:#27272a;cursor:pointer}
+.mcp-row-actions{display:flex;gap:6px}
+.mcp-row-body{display:flex;flex-direction:column;gap:8px;margin-top:10px;padding-top:10px;border-top:1px dashed #e4e4e7}
+.mcp-row-body textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical}
+.mcp-add{align-self:flex-start;margin-top:4px}

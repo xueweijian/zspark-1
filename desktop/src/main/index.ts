@@ -11,6 +11,11 @@ import { scanRecentArtifacts } from './artifacts'
 import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
+import {
+  buildMcpServersTomlValue,
+  sanitizeMcpServerList,
+  type McpServerEntry
+} from './mcpServers'
 import { redactSensitiveLogLine } from './logRedaction'
 import { artifactMimeType, contentDispositionFileName } from './mime'
 import {
@@ -51,6 +56,7 @@ interface AppSettings {
   provider?: ProviderConfig
   enterprise?: Partial<EnterpriseConfig>
   enterpriseAuth?: EnterpriseAuth
+  mcpServers?: McpServerEntry[]
 }
 
 let bridgePort: number | null = null
@@ -240,6 +246,7 @@ function tokenIsUsable(auth?: EnterpriseAuth) {
 function safeSettingsView(s: AppSettings) {
   const view: AppSettings & { warnings: string[] } = {
     enterprise: effectiveEnterpriseConfig(s),
+    mcpServers: sanitizeMcpServerList(s.mcpServers),
     warnings: settingsWarnings(s)
   }
   if (s.provider) {
@@ -491,13 +498,15 @@ function formatCodexLogChunk(channel: 'stdout' | 'stderr', chunk: string): strin
  */
 function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<string, string> } {
   const tomlString = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
+  const mcpToml = buildMcpServersTomlValue(sanitizeMcpServerList(loadSettings().mcpServers))
   const baseArgs = [
     // Trust our own workspace so codex stops nagging about project-local
     // config every spawn. The path is whatever directory the binary
     // happens to look at; trust the parent so any subfolder counts.
     '-c', `projects.${tomlString(WORKSPACE_ROOT)}.trust_level=${tomlString('trusted')}`,
-    // Drop the bundled MCP servers — zspark ships its own skills.
-    '-c', `mcp_servers={}`,
+    // User-configured MCP servers, plus any built-in zspark MCP servers
+    // (e.g. Gmail) that the user has enabled in Settings.
+    '-c', `mcp_servers=${mcpToml}`,
     // Keep Codex native memories available in zspark. This only enables the
     // feature gate; [memories] use/generate settings still come from config.
     '-c', `features.memories=true`
@@ -684,6 +693,9 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(a
       next.provider.apiKey = cur.provider.apiKey
     }
   }
+  if (partial.mcpServers !== undefined) {
+    next.mcpServers = sanitizeMcpServerList(partial.mcpServers)
+  }
   if (next.enterprise) {
     next.enterprise = {
       ...effectiveEnterpriseConfig(cur),
@@ -696,10 +708,10 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(a
     }
   }
   saveSettings(next)
-  if (partial.provider) {
-    // Restart codex with new provider so the change takes effect immediately,
-    // but wait for the old child to exit so the next spawn doesn't race a
-    // still-alive process for stdin / log fd.
+  if (partial.provider || partial.mcpServers !== undefined) {
+    // Restart codex so the provider / MCP-server change takes effect
+    // immediately, but wait for the old child to exit so the next spawn
+    // doesn't race a still-alive process for stdin / log fd.
     await restartCodex()
   }
   return { ok: true, warnings: settingsWarnings(next) }
