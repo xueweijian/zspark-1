@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'vitest'
-import { redactProcessArgsForLog, redactSensitiveLogLine, redactSensitiveValue } from './logRedaction'
+import { redactProcessArgsForLog, redactSensitiveLogLine, redactSensitiveLogText, redactSensitiveValue } from './logRedaction'
 
 describe('log redaction', () => {
   test('redacts credential-bearing URLs and token fields from JSON logs', () => {
@@ -42,5 +42,20 @@ describe('log redaction', () => {
       '-c',
       'model="gpt-5.4"'
     ])
+  })
+
+  test('redacts secret assignments embedded in legacy plain-text log lines', () => {
+    const line = 'spawn args=["-c","mcp_servers={ gmail = { env = { ZSPARK_GMAIL_CLIENT_SECRET = \\"client-secret\\", ZSPARK_GMAIL_REFRESH_TOKEN = \\"refresh-token\\" } } }"]'
+
+    const redacted = redactSensitiveLogLine(line)
+
+    expect(redacted).toContain('ZSPARK_GMAIL_CLIENT_SECRET = \\"[redacted]\\"')
+    expect(redacted).toContain('ZSPARK_GMAIL_REFRESH_TOKEN = \\"[redacted]\\"')
+    expect(redacted).not.toContain('client-secret')
+    expect(redacted).not.toContain('refresh-token')
+  })
+
+  test('redacts multi-line legacy log text while preserving line breaks', () => {
+    expect(redactSensitiveLogText('one\nrefresh_token = "secret"\n')).toBe('one\nrefresh_token = "[redacted]"\n')
   })
 })

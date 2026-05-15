@@ -2,6 +2,7 @@ import type { McpServerEntry } from './mcpServers'
 
 const ENCRYPTED_VALUE_PREFIX = 'enc:v1:'
 const MASK_MARKER = '••••'
+const MASKED_SECRET_RE = new RegExp(`^[^${MASK_MARKER[0]}]{0,4}${MASK_MARKER}[^${MASK_MARKER[0]}]{0,4}$`)
 const SENSITIVE_MCP_ENV_KEY_RE = /(?:^|_)(?:api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|passwd|pwd|credential|auth)(?:_|$)|private[_-]?key/i
 
 export interface McpSecretDecryptIssue {
@@ -23,6 +24,10 @@ function maskSecret(value: string): string {
   if (!value) return ''
   if (value.length <= 8) return MASK_MARKER
   return `${value.slice(0, 4)}${MASK_MARKER}${value.slice(-4)}`
+}
+
+function isMaskedSecretValue(value: string): boolean {
+  return MASKED_SECRET_RE.test(value)
 }
 
 function cloneMcpServers(servers: McpServerEntry[]): McpServerEntry[] {
@@ -102,7 +107,7 @@ export function mergeMaskedMcpEnv(
     const existing = currentById.get(server.id)
     if (!existing) return server
     for (const [key, value] of Object.entries(server.env)) {
-      if (!isSensitiveMcpEnvKey(key) || !value.includes(MASK_MARKER)) continue
+      if (!isSensitiveMcpEnvKey(key) || !isMaskedSecretValue(value)) continue
       const existingValue = existing.env[key]
       if (existingValue) server.env[key] = existingValue
     }

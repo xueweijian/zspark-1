@@ -94,4 +94,13 @@ describe('settings secret helpers', () => {
     ])
     expect(edited[0].env.ZSPARK_GMAIL_CLIENT_SECRET).toBe('new-secret')
   })
+
+  test('does not treat arbitrary values containing the mask marker as masked secrets', () => {
+    const current = [server({ ZSPARK_GMAIL_CLIENT_SECRET: 'secret-token' })]
+    const merged = mergeMaskedMcpEnv(current, [
+      server({ ZSPARK_GMAIL_CLIENT_SECRET: 'literal •••• value' })
+    ])
+
+    expect(merged[0].env.ZSPARK_GMAIL_CLIENT_SECRET).toBe('literal •••• value')
+  })
 })

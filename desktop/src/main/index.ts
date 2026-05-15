@@ -17,7 +17,7 @@ import {
   sanitizeMcpServerList,
   type McpServerEntry
 } from './mcpServers'
-import { redactProcessArgsForLog, redactSensitiveLogLine } from './logRedaction'
+import { redactProcessArgsForLog, redactSensitiveLogLine, redactSensitiveLogText } from './logRedaction'
 import {
   decryptSensitiveMcpEnvWithIssues,
   encryptSensitiveMcpEnv,
@@ -490,6 +490,22 @@ function rotateLogIfLarge(path: string) {
   }
 }
 
+function scrubExistingCodexLog(path: string) {
+  try {
+    if (!existsSync(path)) return
+    const stat = statSync(path)
+    if (stat.size > MAX_CODEX_LOG_BYTES) {
+      writeFileSync(path, '')
+      return
+    }
+    const content = readFileSync(path, 'utf8')
+    const redacted = redactSensitiveLogText(content)
+    if (redacted !== content) writeFileSync(path, redacted)
+  } catch {
+    // Log cleanup must never prevent the app-server from starting.
+  }
+}
+
 function formatCodexLogChunk(channel: 'stdout' | 'stderr', chunk: string): string {
   return chunk.split(/\n/).map((line, index, lines) => {
     if (!line && index === lines.length - 1) return ''
@@ -595,6 +611,8 @@ function spawnCodex() {
   // turning on full RUST_LOG noise in the chat UI.
   const logPath = join(app.getPath('userData'), 'codex-stream.log')
   mkdirSync(app.getPath('userData'), { recursive: true })
+  scrubExistingCodexLog(logPath)
+  scrubExistingCodexLog(`${logPath}.1`)
   rotateLogIfLarge(logPath)
   const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' })
   logStream.write(`\n=== ${new Date().toISOString()} spawn args=${JSON.stringify(redactProcessArgsForLog(providerArgs))} ===\n`)
