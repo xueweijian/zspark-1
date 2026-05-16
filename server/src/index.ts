@@ -15,7 +15,7 @@ import { registerRateLimit } from './rateLimit.js'
 const Env = z.object({
   NODE_ENV: z.string().default('production'),
   PORT: z.string().default('8787'),
-  DATABASE_URL: z.string().default('postgres://zspark:zspark@localhost:5432/zspark'),
+  DATABASE_URL: z.string().optional(),
   REDIS_URL: z.string().default('redis://localhost:6379'),
   ZSPARK_TENANT_ID: z.string().optional(),
   ZSPARK_CLIENT_ID: z.string().optional(),
@@ -30,9 +30,10 @@ const Env = z.object({
 })
 
 const env = Env.parse(process.env)
+const DEFAULT_DEV_DATABASE_URL = 'postgres://zspark:zspark@localhost:5432/zspark'
 
 async function main() {
-  await initDb(env.DATABASE_URL)
+  await initDb(databaseUrl(env))
   const app = Fastify({
     logger: {
       level: 'info',
@@ -53,8 +54,8 @@ async function main() {
   await app.register(cors, { origin: corsOrigin(env), credentials: true })
   await app.register(websocket)
 
-  registerRateLimit(app, env)
   app.addHook('onRequest', entraAuth(env))
+  registerRateLimit(app, env)
 
   app.get('/healthz', async () => ({ ok: true, service: 'zspark-server' }))
 
@@ -76,8 +77,31 @@ function csv(value?: string) {
 
 function corsOrigin(env: z.infer<typeof Env>) {
   const allowedOrigins = csv(env.ZSPARK_CORS_ORIGINS)
-  if (env.NODE_ENV === 'development' && allowedOrigins.length === 0) return true
+  if (env.NODE_ENV === 'development' && allowedOrigins.length === 0) {
+    return async (origin: string | undefined) => !origin || isLoopbackOrigin(origin)
+  }
   return async (origin: string | undefined) => !origin || allowedOrigins.includes(origin)
+}
+
+function databaseUrl(env: z.infer<typeof Env>) {
+  if (env.DATABASE_URL) return env.DATABASE_URL
+  if (env.NODE_ENV === 'development') return DEFAULT_DEV_DATABASE_URL
+  throw new Error('DATABASE_URL is required when NODE_ENV is not development')
+}
+
+function isLoopbackOrigin(origin: string) {
+  if (origin === 'null' || origin.startsWith('file://')) return true
+  try {
+    const url = new URL(origin)
+    return (url.protocol === 'http:' || url.protocol === 'https:') && isLoopbackHost(url.hostname)
+  } catch {
+    return false
+  }
+}
+
+function isLoopbackHost(hostname: string) {
+  const host = hostname.toLowerCase()
+  return host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]'
 }
 
 function scrubRequestUrl(rawUrl: string) {

@@ -32,6 +32,7 @@ export interface CalendarEventInput {
 
 const REFRESH_SKEW_MS = 60_000
 export const GMAIL_MESSAGE_BODY_LIMIT = 16_000
+const EMAIL_RE = /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[^\s@<>(),;:"]+$/
 
 export function tokenIsFresh(token: OAuthToken | null | undefined, nowMs = Date.now()): boolean {
   if (!token || !token.accessToken) return false
@@ -66,6 +67,17 @@ function formatAddressList(values: string[]): string {
   return values.map(sanitizeHeaderValue).filter(Boolean).join(', ')
 }
 
+function normalizedEmailList(values: string[] | undefined, field: string, required = false): string[] {
+  if (!values || values.length === 0) {
+    if (required) throw new Error(`${field} requires at least one email address`)
+    return []
+  }
+  const emails = values.map((value) => sanitizeHeaderValue(value)).filter(Boolean)
+  const invalid = emails.find((value) => !EMAIL_RE.test(value))
+  if (invalid) throw new Error(`${field} contains an invalid email address: ${invalid}`)
+  return emails
+}
+
 function wrapBase64(value: string): string {
   return Buffer.from(value, 'utf8').toString('base64').match(/.{1,76}/g)?.join('\r\n') ?? ''
 }
@@ -82,10 +94,12 @@ export function buildRfc822Message(args: {
   from?: string
 }): string {
   const body = wrapBase64(args.body)
+  const to = normalizedEmailList(args.to, 'to', true)
+  const cc = normalizedEmailList(args.cc, 'cc')
   const headers = [
     args.from ? `From: ${sanitizeHeaderValue(args.from)}` : null,
-    `To: ${formatAddressList(args.to)}`,
-    args.cc && args.cc.length > 0 ? `Cc: ${formatAddressList(args.cc)}` : null,
+    `To: ${formatAddressList(to)}`,
+    cc.length > 0 ? `Cc: ${formatAddressList(cc)}` : null,
     `Subject: ${encodeMimeHeaderValue(args.subject)}`,
     'MIME-Version: 1.0',
     'Content-Type: text/plain; charset="UTF-8"',
@@ -157,28 +171,23 @@ export function buildCalendarEventPayload(input: CalendarEventInput) {
   if (!input.title?.trim()) throw new Error('Calendar event requires a title')
   if (!input.start || !input.end) throw new Error('Calendar event requires start and end timestamps')
 
-  const payload: any = {
+  const timeZone = input.timeZone?.trim()
+  const attendees = normalizedEmailList(input.attendees, 'attendees')
+  return {
     summary: input.title.trim(),
     description: input.body,
-    start: { dateTime: input.start },
-    end: { dateTime: input.end }
-  }
-  if (input.timeZone?.trim()) {
-    payload.start.timeZone = input.timeZone.trim()
-    payload.end.timeZone = input.timeZone.trim()
-  }
-  if (input.attendees && input.attendees.length > 0) {
-    payload.attendees = input.attendees.map((email) => ({ email }))
-  }
-  if (input.conference === 'meet') {
-    payload.conferenceData = {
-      createRequest: {
-        requestId: `zspark-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        conferenceSolutionKey: { type: 'hangoutsMeet' }
+    start: { dateTime: input.start, ...(timeZone ? { timeZone } : {}) },
+    end: { dateTime: input.end, ...(timeZone ? { timeZone } : {}) },
+    ...(attendees.length > 0 ? { attendees: attendees.map((email) => ({ email })) } : {}),
+    ...(input.conference === 'meet' ? {
+      conferenceData: {
+        createRequest: {
+          requestId: `zspark-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          conferenceSolutionKey: { type: 'hangoutsMeet' }
+        }
       }
-    }
+    } : {})
   }
-  return payload
 }
 
 export interface ToolDescriptor {

@@ -34,7 +34,7 @@ function authorityBase(env: EntraEnv) {
 /**
  * Entra ID (Azure China) bearer-token middleware.
  *
- * - Skips /healthz and /teams/messages (Bot Framework handles its own auth)
+ * - Skips exact /healthz and /teams/messages paths
  * - Verifies signature via JWKS at login.partner.microsoftonline.cn
  * - Validates `aud` against ZSPARK_CLIENT_ID and `iss` tenant
  * - Sets req.principal = upn|preferred_username|sub
@@ -47,10 +47,7 @@ export function entraAuth(env: EntraEnv) {
   const allowDevShim = env.NODE_ENV === 'development'
 
   return async (req: FastifyRequest, reply: FastifyReply) => {
-    if (
-      req.url.startsWith('/healthz') ||
-      req.url.startsWith('/teams/messages')
-    ) {
+    if (isPublicPath(req.url)) {
       return
     }
 
@@ -98,10 +95,23 @@ export function entraAuth(env: EntraEnv) {
       ;(req as any).groups = Array.isArray(payload['groups']) ? payload['groups'] : []
     } catch (err: any) {
       req.log.warn({ detail: err?.message }, 'Entra token verification failed')
-      reply.code(401).send({ error: 'token verification failed', detail: err?.message })
+      reply.code(401).send({ error: 'token verification failed' })
       return reply
     }
   }
+}
+
+function requestPath(url: string) {
+  try {
+    return new URL(url, 'http://zspark.local').pathname
+  } catch {
+    return url.split('?')[0] ?? url
+  }
+}
+
+function isPublicPath(url: string) {
+  const path = requestPath(url)
+  return path === '/healthz' || path === '/teams/messages'
 }
 
 function tokenIssuers(env: EntraEnv) {

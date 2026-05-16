@@ -582,7 +582,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
   // consumer (codex always sends `stream: true` for chat-loop turns).
   const stream = payload.stream === true
   const chatTools = toolsToChat(payload.tools)
-  const chatBody: any = {
+  const chatBody: any = Object.fromEntries(Object.entries({
     model: payload.model,
     messages: [
       ...(payload.instructions ? [{ role: 'system', content: payload.instructions }] : []),
@@ -595,9 +595,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse, authTo
     tools: chatTools,
     tool_choice: chatTools ? payload.tool_choice : undefined,
     parallel_tool_calls: chatTools ? payload.parallel_tool_calls : undefined
-  }
-  // Strip undefined to avoid choking strict providers
-  for (const k of Object.keys(chatBody)) if (chatBody[k] === undefined) delete chatBody[k]
+  }).filter(([, value]) => value !== undefined))
 
   const u = buildUpstreamUrl(cfg.baseUrl, CHAT_COMPLETIONS_SUFFIX)
   const reqLib = requestLibForUrl(u)
@@ -940,8 +938,13 @@ export function startBridge(authToken?: string): Promise<{ port: number; close: 
     }
     res.writeHead(404).end()
   })
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    const onError = (err: Error) => {
+      reject(err)
+    }
+    server.once('error', onError)
     server.listen(0, '127.0.0.1', () => {
+      server.off('error', onError)
       const addr = server.address()
       const port = typeof addr === 'object' && addr ? addr.port : 0
       resolve({ port, close: () => server.close() })

@@ -145,7 +145,9 @@ export function mergePersistedActivityBlocks(blocks: Block[], persisted: Extract
     if (existingIndex !== -1) {
       const existing = next[existingIndex] as Extract<Block, { type: 'turn' }>
       if (activityDetailWeight(persistedTurn) > activityDetailWeight(existing) || existing.activities.length === 0) {
-        next[existingIndex] = { ...persistedTurn, collapsed: false }
+        next = next.map((block, index) => (
+          index === existingIndex ? { ...persistedTurn, collapsed: false } : block
+        ))
       }
       next = orderBlocksForTurn(next, persistedTurn.turnId)
       continue

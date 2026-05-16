@@ -11,6 +11,10 @@ const CreateWorkspaceBody = z.object({
 export async function canAccessWorkspace(req: FastifyRequest, workspaceId: string) {
   const keys = principalKeys(req)
   if (!pool || keys.length === 0) return false
+  const cache = ((req as any)._workspaceAccessCache ??= new Map<string, boolean>()) as Map<string, boolean>
+  const cacheKey = `${workspaceId}:${keys.join('\0')}`
+  const cached = cache.get(cacheKey)
+  if (cached !== undefined) return cached
   const result = await pool.query(
     `
       SELECT 1
@@ -22,7 +26,9 @@ export async function canAccessWorkspace(req: FastifyRequest, workspaceId: strin
     `,
     [workspaceId, keys]
   )
-  return Boolean(result.rowCount)
+  const allowed = Boolean(result.rowCount)
+  cache.set(cacheKey, allowed)
+  return allowed
 }
 
 export async function registerWorkspaceRoutes(app: FastifyInstance) {

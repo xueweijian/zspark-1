@@ -233,7 +233,7 @@ function defaultEnterpriseConfig(): EnterpriseConfig {
   }
 }
 
-function effectiveEnterpriseConfig(settings = loadSettings()): EnterpriseConfig {
+function effectiveEnterpriseConfig(settings: AppSettings): EnterpriseConfig {
   const defaults = defaultEnterpriseConfig()
   return {
     serverUrl: normalizeEnterpriseServerUrl(settings.enterprise?.serverUrl || defaults.serverUrl),
@@ -301,8 +301,9 @@ function safeSettingsView(s: AppSettings) {
 
 function enterpriseStatus(settings = loadSettings()) {
   const auth = settings.enterpriseAuth
+  const config = effectiveEnterpriseConfig(settings)
   return {
-    configured: Boolean(effectiveEnterpriseConfig(settings).serverUrl && effectiveEnterpriseConfig(settings).clientId && effectiveEnterpriseConfig(settings).tenantId),
+    configured: Boolean(config.serverUrl && config.clientId && config.tenantId),
     signedIn: tokenIsUsable(auth),
     account: auth
       ? {
@@ -312,7 +313,7 @@ function enterpriseStatus(settings = loadSettings()) {
           expiresAt: auth.expiresAt
         }
       : null,
-    config: effectiveEnterpriseConfig(settings)
+    config
   }
 }
 
@@ -492,7 +493,13 @@ function rotateLogIfLarge(path: string) {
 
 function rewriteCodexLog(path: string, content: string) {
   const tmpPath = `${path}.${process.pid}.${Date.now().toString(36)}.${randomBytes(4).toString('hex')}.tmp`
-  writeFileSync(tmpPath, content)
+  const fd = openSync(tmpPath, 'w', 0o600)
+  try {
+    writeFileSync(fd, content)
+    try { fsyncSync(fd) } catch { /* fsync is best-effort on some FS */ }
+  } finally {
+    closeSync(fd)
+  }
   renameSync(tmpPath, path)
 }
 
@@ -756,7 +763,7 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(a
       next.provider.apiKey = cur.provider.apiKey
     }
   }
-  if (partial.mcpServers !== undefined) {
+  if (Array.isArray((partial as any).mcpServers)) {
     next.mcpServers = sanitizeMcpServerList(mergeMaskedMcpEnv(
       sanitizeMcpServerList(cur.mcpServers),
       sanitizeMcpServerList(partial.mcpServers)
@@ -774,7 +781,7 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(a
     }
   }
   saveSettings(next)
-  if (partial.provider || partial.mcpServers !== undefined) {
+  if (partial.provider || Array.isArray((partial as any).mcpServers)) {
     // Restart codex so the provider / MCP-server change takes effect
     // immediately, but wait for the old child to exit so the next spawn
     // doesn't race a still-alive process for stdin / log fd.
@@ -787,9 +794,9 @@ ipcMain.handle('enterprise:status', () => enterpriseStatus())
 
 ipcMain.handle('enterprise:logout', () => withSettingsLock(() => {
   const settings = loadSettings()
-  delete settings.enterpriseAuth
-  saveSettings(settings)
-  return enterpriseStatus(settings)
+  const next = { ...settings, enterpriseAuth: undefined }
+  saveSettings(next)
+  return enterpriseStatus(next)
 }))
 
 ipcMain.handle('enterprise:login', async () => withSettingsLock(async () => {
@@ -807,14 +814,14 @@ ipcMain.handle('enterprise:login', async () => withSettingsLock(async () => {
     settings.enterprise = config
     saveSettings(settings)
 
-    const app = new PublicClientApplication({
+    const msalApp = new PublicClientApplication({
       auth: {
         clientId: config.clientId,
         authority: config.authority,
         knownAuthorities: ['login.partner.microsoftonline.cn']
       }
     })
-    const result = await app.acquireTokenByDeviceCode({
+    const result = await msalApp.acquireTokenByDeviceCode({
       scopes: [config.apiScope],
       deviceCodeCallback: (response: any) => {
         mainWindow?.webContents.send('enterprise:deviceCode', {

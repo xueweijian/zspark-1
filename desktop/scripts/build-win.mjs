@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const env = { ...process.env, CSC_IDENTITY_AUTO_DISCOVERY: 'false' }
 const useShell = process.platform === 'win32'
-const codexExe = resolve('../codex-rs/target/release/codex.exe')
+const scriptDir = dirname(fileURLToPath(import.meta.url))
+const desktopDir = resolve(scriptDir, '..')
+const repoRoot = resolve(desktopDir, '..')
+const codexExe = resolve(repoRoot, 'codex-rs/target/release/codex.exe')
 
 if (!existsSync(codexExe)) {
   console.error(`Missing Windows Codex binary: ${codexExe}`)
@@ -22,5 +26,6 @@ function run(command, args) {
   if (result.status !== 0) process.exit(result.status ?? 1)
 }
 
+await import(new URL('./build-gmail-mcp.mjs', import.meta.url))
 run('electron-vite', ['build'])
 run('electron-builder', ['--win', 'nsis', ...process.argv.slice(2)])

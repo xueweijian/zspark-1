@@ -141,7 +141,7 @@ const SharedSessionSnapshotSchema = z.object({
   artifacts: z.array(z.unknown()).max(200).optional(),
   updatedAt: z.number().optional(),
   revision: z.number().nullable().optional()
-}).passthrough()
+}).strict()
 
 const CreateSessionBody = z.object({
   title: z.string().max(160).optional(),
@@ -363,7 +363,31 @@ export async function registerSessionRoutes(app: FastifyInstance) {
     if (!sessionId || !(await ensureWorkspaceAccess(req, workspaceId))) {
       return reply.code(403).send({ error: 'workspace forbidden' })
     }
-    await pool.query('DELETE FROM sessions WHERE id = $1 AND workspace_id = $2', [sessionId, workspaceId])
+    const keys = principalKeys(req)
+    if (keys.length === 0) return reply.code(401).send({ error: 'unauthenticated' })
+    const deleted = await pool.query(
+      `
+        DELETE FROM sessions s
+        USING workspaces w
+        WHERE s.id = $1
+          AND s.workspace_id = $2
+          AND w.id = s.workspace_id
+          AND (
+            s.owner = ANY($3::text[])
+            OR w.owner_key = ANY($3::text[])
+            OR EXISTS (
+              SELECT 1
+              FROM workspace_members wm
+              WHERE wm.workspace_id = w.id
+                AND wm.principal_key = ANY($3::text[])
+                AND wm.role = 'owner'
+            )
+          )
+        RETURNING s.id
+      `,
+      [sessionId, workspaceId, keys]
+    )
+    if (!deleted.rowCount) return reply.code(403).send({ error: 'session delete forbidden' })
     return reply.code(204).send()
   })
 }

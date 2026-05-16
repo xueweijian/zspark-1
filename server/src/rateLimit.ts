@@ -11,6 +11,7 @@ interface Bucket {
 }
 
 const buckets = new Map<string, Bucket>()
+let lastCleanupAt = 0
 
 function numberEnv(value: string | undefined, fallback: number) {
   const parsed = Number(value)
@@ -27,14 +28,31 @@ function requestWeight(req: FastifyRequest) {
   return 3
 }
 
+function requestPath(url: string) {
+  try {
+    return new URL(url, 'http://zspark.local').pathname
+  } catch {
+    return url.split('?')[0] ?? url
+  }
+}
+
+function cleanupExpiredBuckets(now: number, windowMs: number, force = false) {
+  if (!force && now - lastCleanupAt < windowMs) return
+  lastCleanupAt = now
+  for (const [bucketKey, value] of buckets) {
+    if (now - value.windowStart >= windowMs) buckets.delete(bucketKey)
+  }
+}
+
 export function registerRateLimit(app: FastifyInstance, env: RateLimitEnv) {
   const windowMs = numberEnv(env.ZSPARK_RATE_LIMIT_WINDOW_MS, 60_000)
   const max = numberEnv(env.ZSPARK_RATE_LIMIT_MAX, 600)
 
   app.addHook('onRequest', async (req, reply) => {
-    if (req.url.startsWith('/healthz')) return
+    if (requestPath(req.url) === '/healthz') return
 
     const now = Date.now()
+    cleanupExpiredBuckets(now, windowMs)
     const key = requestKey(req)
     const weight = requestWeight(req)
     const bucket = buckets.get(key)
@@ -53,10 +71,6 @@ export function registerRateLimit(app: FastifyInstance, env: RateLimitEnv) {
       return reply
     }
 
-    if (buckets.size > 10_000) {
-      for (const [bucketKey, value] of buckets) {
-        if (now - value.windowStart >= windowMs) buckets.delete(bucketKey)
-      }
-    }
+    if (buckets.size > 10_000) cleanupExpiredBuckets(now, windowMs, true)
   })
 }

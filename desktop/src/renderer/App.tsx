@@ -1166,6 +1166,8 @@ function DesktopApp() {
     completedWorkByTurn.current.clear()
     commandFailuresByTurn.current.clear()
     interruptingTurns.current.clear()
+    checkedArtifactMessages.current.clear()
+    deletedArtifacts.current = []
     clearDisplayedArtifactRevisions(shownArtifactRevisions.current)
   }
   const refreshRuntimeHost = async () => {
@@ -2533,6 +2535,11 @@ function DesktopApp() {
     if (!thread || restoredActivityThreads.current.has(thread)) return
     const persisted = loadPersistedActivityBlocks(thread)
     restoredActivityThreads.current.add(thread)
+    while (restoredActivityThreads.current.size > 100) {
+      const oldest = restoredActivityThreads.current.values().next().value
+      if (!oldest) break
+      restoredActivityThreads.current.delete(oldest)
+    }
     if (!persisted.length) return
     setBlocks((bs) => (bs.length ? mergePersistedActivityBlocks(bs, persisted) : bs))
   }, [thread])

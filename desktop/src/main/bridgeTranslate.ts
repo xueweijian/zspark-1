@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto'
+
 /**
  * Pure helpers used by the Chat ↔ Responses bridge.
  *
@@ -28,7 +30,7 @@ export interface ResponseContext {
 }
 
 export function genId(prefix: string) {
-  return `${prefix}_${Math.random().toString(16).slice(2, 18)}`
+  return `${prefix}_${randomUUID().replace(/-/g, '')}`
 }
 
 export function contentToText(content: any): string {

@@ -6,10 +6,10 @@
   "main": "out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
-    "build": "electron-vite build",
+    "build": "node scripts/build-gmail-mcp.mjs && electron-vite build",
     "test": "vitest run",
     "build:win": "node scripts/build-win.mjs",
-    "build:mac": "electron-vite build && electron-builder --mac dmg",
+    "build:mac": "node scripts/build-gmail-mcp.mjs && electron-vite build && electron-builder --mac dmg",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {

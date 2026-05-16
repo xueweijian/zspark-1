@@ -29,6 +29,11 @@ describe('base64url helpers', () => {
     const original = 'héllo + world?\n'
     expect(decodeBase64Url(encodeBase64Url(original))).toBe(original)
   })
+
+  test('handles empty and malformed input without throwing', () => {
+    expect(decodeBase64Url('')).toBe('')
+    expect(() => decodeBase64Url('%%%')).not.toThrow()
+  })
 })
 
 describe('buildRfc822Message', () => {
@@ -63,7 +68,7 @@ describe('buildRfc822Message', () => {
   test('sanitizes injected header newlines and encodes non-ascii subjects', () => {
     const msg = buildRfc822Message({
       from: 'me@x.com\r\nBcc: attacker@x.com',
-      to: ['a@x.com\r\nBcc: attacker@x.com'],
+      to: ['a@x.com'],
       cc: ['c@x.com'],
       subject: '季度总结',
       body: '中文 body'
@@ -71,9 +76,17 @@ describe('buildRfc822Message', () => {
     const headers = msg.split('\r\n\r\n')[0]
     expect(headers).not.toContain('\r\nBcc:')
     expect(headers).toContain('From: me@x.com Bcc: attacker@x.com')
-    expect(headers).toContain('To: a@x.com Bcc: attacker@x.com')
+    expect(headers).toContain('To: a@x.com')
     expect(headers).toContain(`Subject: =?UTF-8?B?${Buffer.from('季度总结').toString('base64')}?=`)
     expect(Buffer.from(msg.split('\r\n\r\n')[1], 'base64').toString('utf8')).toBe('中文 body')
+  })
+
+  test('rejects malformed recipient addresses', () => {
+    expect(() => buildRfc822Message({
+      to: ['a@x.com\r\nBcc: attacker@x.com'],
+      subject: 'Hi',
+      body: 'Hello'
+    })).toThrow(/invalid email address/)
   })
 })
 
@@ -147,6 +160,7 @@ describe('buildCalendarEventPayload', () => {
   test('rejects missing title / timestamps', () => {
     expect(() => buildCalendarEventPayload({ title: '', start: 's', end: 'e' })).toThrow()
     expect(() => buildCalendarEventPayload({ title: 't', start: '', end: 'e' })).toThrow()
+    expect(() => buildCalendarEventPayload({ title: 't', start: 's', end: '' })).toThrow()
   })
 
   test('emits attendees and Meet conference data on request', () => {
@@ -172,6 +186,15 @@ describe('buildCalendarEventPayload', () => {
       end: '2026-05-15T11:00:00Z'
     })
     expect(payload.conferenceData).toBeUndefined()
+  })
+
+  test('rejects malformed attendees', () => {
+    expect(() => buildCalendarEventPayload({
+      title: 'Demo',
+      start: '2026-05-15T10:00:00Z',
+      end: '2026-05-15T11:00:00Z',
+      attendees: ['not-an-email']
+    })).toThrow(/invalid email address/)
   })
 })
 
