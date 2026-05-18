@@ -47,6 +47,7 @@ const REJECT_SANDBOX_APPROVAL_REASON: &str =
     "approval required by policy, but AskForApproval::Granular.sandbox_approval is false";
 const REJECT_RULES_APPROVAL_REASON: &str =
     "approval required by policy rule, but AskForApproval::Granular.rules is false";
+const WINDOWS_EXTERNAL_DESTRUCTIVE_REASON: &str = "destructive Windows filesystem command targets a user folder outside the workspace while Windows sandboxing is disabled";
 const RULES_DIR_NAME: &str = "rules";
 const RULE_EXTENSION: &str = "rules";
 const DEFAULT_POLICY_FILE: &str = "default.rules";
@@ -292,6 +293,14 @@ impl ExecPolicyManager {
             used_complex_parsing,
             command_origin,
         } = commands_for_exec_policy(command);
+        if let Some(reason) = forbidden_windows_external_destructive_command(
+            command,
+            file_system_sandbox_policy,
+            sandbox_cwd,
+            windows_sandbox_level,
+        ) {
+            return ExecApprovalRequirement::Forbidden { reason };
+        }
         // Keep heredoc prefix parsing for rule evaluation so existing
         // allow/prompt/forbidden rules still apply, but avoid auto-derived
         // amendments when only the heredoc fallback parser matched.
@@ -780,6 +789,68 @@ fn restricted_policy_without_windows_sandbox(
             FileSystemSandboxKind::Restricted
         )
         && !file_system_sandbox_policy.has_full_disk_write_access()
+}
+
+fn forbidden_windows_external_destructive_command(
+    command: &[String],
+    file_system_sandbox_policy: &FileSystemSandboxPolicy,
+    sandbox_cwd: &Path,
+    windows_sandbox_level: WindowsSandboxLevel,
+) -> Option<String> {
+    if !restricted_policy_without_windows_sandbox(file_system_sandbox_policy, windows_sandbox_level)
+    {
+        return None;
+    }
+
+    let command_text = normalize_windows_command_text(&command.join(" "));
+    if !looks_like_destructive_windows_file_operation(&command_text)
+        || !targets_windows_user_folder_outside_cwd(&command_text, sandbox_cwd)
+    {
+        return None;
+    }
+
+    Some(WINDOWS_EXTERNAL_DESTRUCTIVE_REASON.to_string())
+}
+
+fn normalize_windows_command_text(value: &str) -> String {
+    value.replace('\\', "/").to_ascii_lowercase()
+}
+
+fn looks_like_destructive_windows_file_operation(command_text: &str) -> bool {
+    let spaced = format!(" {command_text} ");
+    command_text.contains("remove-item")
+        || command_text.contains("move-item")
+        || command_text.contains("deletefile")
+        || command_text.contains("deletefolder")
+        || command_text.contains("sendtorecyclebin")
+        || command_text.contains("recycle")
+        || command_text.contains("trash")
+        || command_text.contains("shell.application") && command_text.contains("movehere")
+        || spaced.contains(" del ")
+        || spaced.contains(" erase ")
+        || spaced.contains(" rd ")
+        || spaced.contains(" rmdir ")
+}
+
+fn targets_windows_user_folder_outside_cwd(command_text: &str, sandbox_cwd: &Path) -> bool {
+    let targets_user_profile = command_text.contains(":/users/")
+        || command_text.contains("$env:userprofile")
+        || command_text.contains("%userprofile%");
+    if !targets_user_profile {
+        return false;
+    }
+
+    let targets_known_folder = command_text.contains("/desktop/")
+        || command_text.contains("/downloads/")
+        || command_text.contains("/documents/")
+        || command_text.contains("/onedrive/desktop/");
+    if !targets_known_folder {
+        return false;
+    }
+
+    let normalized_cwd = normalize_windows_command_text(&sandbox_cwd.to_string_lossy());
+    let cwd = normalized_cwd.trim_end_matches('/');
+    cwd.is_empty() || !command_text.contains(cwd)
 }
 
 fn default_policy_path(codex_home: &Path) -> PathBuf {

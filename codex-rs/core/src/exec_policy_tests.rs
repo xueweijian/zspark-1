@@ -1094,6 +1094,52 @@ async fn exec_approval_requirement_respects_approval_policy() {
     .await;
 }
 
+#[tokio::test]
+async fn windows_external_destructive_command_is_forbidden_when_windows_sandbox_disabled() {
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        r#"$shell = New-Object -ComObject Shell.Application; $shell.Namespace(10).MoveHere("C:\Users\root123\Desktop\unsafe.txt")"#
+            .to_string(),
+    ];
+    let file_system_sandbox_policy = workspace_write_file_system_sandbox_policy();
+
+    let requirement = ExecPolicyManager::new(Arc::new(Policy::empty()))
+        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+            command: &command,
+            approval_policy: AskForApproval::OnRequest,
+            permission_profile: permission_profile_from_sandbox_policy(
+                &SandboxPolicy::new_workspace_write_policy(),
+            ),
+            file_system_sandbox_policy: &file_system_sandbox_policy,
+            sandbox_cwd: Path::new(r"C:\Users\root123\zspark"),
+            sandbox_permissions: SandboxPermissions::RequireEscalated,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            prefix_rule: None,
+        })
+        .await;
+
+    assert_eq!(
+        requirement,
+        ExecApprovalRequirement::Forbidden {
+            reason: WINDOWS_EXTERNAL_DESTRUCTIVE_REASON.to_string(),
+        }
+    );
+}
+
+#[test]
+fn windows_workspace_destructive_command_is_not_classified_as_external() {
+    let command_text = normalize_windows_command_text(
+        r"Remove-Item C:\Users\root123\zspark\Desktop\inside-workspace.txt -Force",
+    );
+
+    assert!(!targets_windows_user_folder_outside_cwd(
+        &command_text,
+        Path::new(r"C:\Users\root123\zspark"),
+    ));
+}
+
 #[test]
 fn unmatched_granular_policy_still_prompts_for_restricted_sandbox_escalation() {
     let command = vec!["madeup-cmd".to_string()];
