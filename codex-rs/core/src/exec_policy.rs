@@ -293,14 +293,12 @@ impl ExecPolicyManager {
             used_complex_parsing,
             command_origin,
         } = commands_for_exec_policy(command);
-        if let Some(reason) = forbidden_windows_external_destructive_command(
+        let windows_external_destructive_reason = windows_external_destructive_command_reason(
             command,
             file_system_sandbox_policy,
             sandbox_cwd,
             windows_sandbox_level,
-        ) {
-            return ExecApprovalRequirement::Forbidden { reason };
-        }
+        );
         // Keep heredoc prefix parsing for rule evaluation so existing
         // allow/prompt/forbidden rules still apply, but avoid auto-derived
         // amendments when only the heredoc fallback parser matched.
@@ -341,6 +339,28 @@ impl ExecPolicyManager {
         } else {
             None
         };
+
+        if let Some(reason) = windows_external_destructive_reason {
+            return match evaluation.decision {
+                Decision::Forbidden => ExecApprovalRequirement::Forbidden {
+                    reason: derive_forbidden_reason(command, &evaluation),
+                },
+                Decision::Prompt | Decision::Allow => {
+                    match prompt_is_rejected_by_policy(
+                        approval_policy,
+                        /*prompt_is_rule*/ false,
+                    ) {
+                        Some(reason) => ExecApprovalRequirement::Forbidden {
+                            reason: reason.to_string(),
+                        },
+                        None => ExecApprovalRequirement::NeedsApproval {
+                            reason: Some(reason),
+                            proposed_execpolicy_amendment: None,
+                        },
+                    }
+                }
+            };
+        }
 
         match evaluation.decision {
             Decision::Forbidden => ExecApprovalRequirement::Forbidden {
@@ -791,7 +811,7 @@ fn restricted_policy_without_windows_sandbox(
         && !file_system_sandbox_policy.has_full_disk_write_access()
 }
 
-fn forbidden_windows_external_destructive_command(
+fn windows_external_destructive_command_reason(
     command: &[String],
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     sandbox_cwd: &Path,

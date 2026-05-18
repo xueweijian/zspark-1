@@ -1095,7 +1095,7 @@ async fn exec_approval_requirement_respects_approval_policy() {
 }
 
 #[tokio::test]
-async fn windows_external_destructive_command_is_forbidden_when_windows_sandbox_disabled() {
+async fn windows_external_destructive_command_requires_approval_when_windows_sandbox_disabled() {
     let command = vec![
         "powershell.exe".to_string(),
         "-NoProfile".to_string(),
@@ -1122,8 +1122,9 @@ async fn windows_external_destructive_command_is_forbidden_when_windows_sandbox_
 
     assert_eq!(
         requirement,
-        ExecApprovalRequirement::Forbidden {
-            reason: WINDOWS_EXTERNAL_DESTRUCTIVE_REASON.to_string(),
+        ExecApprovalRequirement::NeedsApproval {
+            reason: Some(WINDOWS_EXTERNAL_DESTRUCTIVE_REASON.to_string()),
+            proposed_execpolicy_amendment: None,
         }
     );
 }

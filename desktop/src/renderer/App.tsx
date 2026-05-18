@@ -40,6 +40,7 @@ import {
 } from './turnRecovery'
 import { responseForMcpElicitationRequest } from './mcpElicitation'
 import {
+  approvalSupportsApproveAll,
   approvalResponsePayload,
   approvalStatusForDecision,
   approvalStatusLabel,
@@ -591,6 +592,7 @@ function ApprovalCard({
   const actionable = request.status === 'pending'
   const compact = !actionable
   const approvedAll = request.status === 'approvedAll'
+  const canApproveAll = approvalSupportsApproveAll(request)
   return (
     <div className={`approval-card approval-${request.status}${compact ? ' approval-compact' : ''}`}>
       <div className="approval-mark"><IconShield /></div>
@@ -616,7 +618,7 @@ function ApprovalCard({
         {actionable && (
           <div className="approval-actions">
             <button className="approval-approve" onClick={() => onDecision(request, 'approve')}>Approve</button>
-            <button className="approval-approve-all" onClick={() => onDecision(request, 'approveAll')}>Approve all</button>
+            {canApproveAll && <button className="approval-approve-all" onClick={() => onDecision(request, 'approveAll')}>Approve all</button>}
             <button className="approval-deny" onClick={() => onDecision(request, 'deny')}>Deny</button>
           </div>
         )}
@@ -711,7 +713,7 @@ function executionSafetyContext(prompt: string): string[] {
     [
       'Zspark execution safety:',
       '- Do not claim that a file operation completed until command output and a follow-up check prove it.',
-      '- For deleting, moving, trashing, or writing files outside the workspace, call exec_command with sandbox_permissions set to require_escalated and provide a concise justification so Zspark can show Approve/Deny.',
+      '- For deleting, moving, trashing, or writing files outside the workspace, call exec_command with sandbox_permissions set to require_escalated and provide a concise justification; Zspark will require explicit approval before the command runs.',
       '- Use command forms that fail on permission errors; do not mask failures with a later success-looking echo.'
     ].join('\n')
   ]
@@ -1863,7 +1865,7 @@ function DesktopApp() {
     })
   }
   const canAutoApproveRequest = (request: ApprovalRequest) => (
-    Boolean(request.turnId && autoApprovedTurns.current.has(request.turnId))
+    Boolean(request.turnId && autoApprovedTurns.current.has(request.turnId) && approvalSupportsApproveAll(request))
   )
   const autoApproveRequest = (request: ApprovalRequest) => {
     approvalRequests.current.set(request.key, { ...request, status: 'approvedAll' })
@@ -1904,6 +1906,7 @@ function DesktopApp() {
   const autoApprovePendingRequestsForTurn = (turnId: string, exceptKey: string) => {
     for (const request of Array.from(approvalRequests.current.values())) {
       if (request.key === exceptKey || request.turnId !== turnId || request.status !== 'pending') continue
+      if (!canAutoApproveRequest(request)) continue
       autoApproveRequest(request)
     }
   }
@@ -1954,24 +1957,25 @@ function DesktopApp() {
   }
   const respondApproval = async (request: ApprovalRequest, mode: ApprovalDecisionMode) => {
     if (request.status !== 'pending') return
+    const effectiveMode = mode === 'approveAll' && !approvalSupportsApproveAll(request) ? 'approve' : mode
     setApprovalStatus(request.key, 'sending')
-    if (mode === 'approveAll' && request.turnId) autoApprovedTurns.current.add(request.turnId)
+    if (effectiveMode === 'approveAll' && request.turnId) autoApprovedTurns.current.add(request.turnId)
     try {
-      const ok = await sendRpcResult(request.id, approvalResponsePayload(request, mode))
+      const ok = await sendRpcResult(request.id, approvalResponsePayload(request, effectiveMode))
       if (!ok) throw new Error('Codex process is not running')
-      const status = approvalStatusForDecision(mode)
+      const status = approvalStatusForDecision(effectiveMode)
       setApprovalStatus(request.key, status)
-      if (mode === 'approveAll' && request.turnId) autoApprovePendingRequestsForTurn(request.turnId, request.key)
+      if (effectiveMode === 'approveAll' && request.turnId) autoApprovePendingRequestsForTurn(request.turnId, request.key)
       if (request.turnId) {
         updateActivity(request.turnId, `a-approval-${request.key}`, {
-          status: mode === 'deny' ? 'failed' : 'done',
+          status: effectiveMode === 'deny' ? 'failed' : 'done',
           endedAt: Date.now(),
-          title: mode === 'approveAll' ? 'Approval granted for this session' : mode === 'approve' ? 'Approval granted' : 'Approval denied',
+          title: effectiveMode === 'approveAll' ? 'Approval granted for this session' : effectiveMode === 'approve' ? 'Approval granted' : 'Approval denied',
           detail: request.title
         })
       }
     } catch (err: any) {
-      if (mode === 'approveAll' && request.turnId) autoApprovedTurns.current.delete(request.turnId)
+      if (effectiveMode === 'approveAll' && request.turnId) autoApprovedTurns.current.delete(request.turnId)
       setApprovalStatus(request.key, 'pending')
       toast('error', err?.message ?? String(err))
     }

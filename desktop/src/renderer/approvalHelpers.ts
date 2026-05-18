@@ -25,7 +25,7 @@ export function approvalTopline(status: ApprovalStatus) {
   }
 }
 
-function availableDecisionNames(params: any) {
+export function availableDecisionNames(params: any) {
   const decisions = Array.isArray(params?.availableDecisions) ? params.availableDecisions : []
   return decisions.flatMap((decision: any) => {
     if (typeof decision === 'string') return [decision]
@@ -39,13 +39,25 @@ function decisionAvailable(params: any, decision: string) {
   return names.length === 0 || names.includes(decision)
 }
 
+function explicitDecisionAvailable(params: any, decision: string) {
+  return availableDecisionNames(params).includes(decision)
+}
+
+export function approvalSupportsApproveAll(request: ApprovalRequest) {
+  if (request.kind === 'permissions') return true
+  if (request.method === 'execCommandApproval' || request.method === 'applyPatchApproval') return false
+  if (explicitDecisionAvailable(request.params, 'acceptForSession')) return true
+  return explicitDecisionAvailable(request.params, 'acceptWithExecpolicyAmendment')
+    && Array.isArray(request.params?.proposedExecpolicyAmendment)
+}
+
 export function approvalDecision(params: any, mode: ApprovalDecisionMode) {
   if (mode === 'deny') {
     return decisionAvailable(params, 'decline') ? 'decline' : 'cancel'
   }
   if (mode === 'approveAll') {
-    if (decisionAvailable(params, 'acceptForSession')) return 'acceptForSession'
-    if (decisionAvailable(params, 'acceptWithExecpolicyAmendment') && Array.isArray(params?.proposedExecpolicyAmendment)) {
+    if (explicitDecisionAvailable(params, 'acceptForSession')) return 'acceptForSession'
+    if (explicitDecisionAvailable(params, 'acceptWithExecpolicyAmendment') && Array.isArray(params?.proposedExecpolicyAmendment)) {
       return {
         acceptWithExecpolicyAmendment: {
           execpolicy_amendment: params.proposedExecpolicyAmendment
@@ -77,18 +89,19 @@ export function approvalStatusForDecision(mode: ApprovalDecisionMode): ApprovalS
 }
 
 export function approvalResponsePayload(request: ApprovalRequest, mode: ApprovalDecisionMode) {
+  const effectiveMode = mode === 'approveAll' && !approvalSupportsApproveAll(request) ? 'approve' : mode
   const approved = mode !== 'deny'
   if (request.method === 'execCommandApproval' || request.method === 'applyPatchApproval') {
     if (!approved) return { decision: 'denied' }
-    return { decision: mode === 'approveAll' ? 'approved_for_session' : 'approved' }
+    return { decision: effectiveMode === 'approveAll' ? 'approved_for_session' : 'approved' }
   }
   if (request.kind === 'permissions') {
     return approved
       ? {
-          scope: mode === 'approveAll' ? 'session' : 'turn',
+          scope: effectiveMode === 'approveAll' ? 'session' : 'turn',
           permissions: grantedPermissionsFromRequest(request.params?.permissions)
         }
       : { scope: 'turn', permissions: {} }
   }
-  return { decision: approvalDecision(request.params, mode) }
+  return { decision: approvalDecision(request.params, effectiveMode) }
 }

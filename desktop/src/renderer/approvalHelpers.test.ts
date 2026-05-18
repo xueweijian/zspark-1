@@ -1,5 +1,11 @@
 import { describe, expect, test } from 'vitest'
-import { approvalDecision, approvalResponsePayload, approvalStatusLabel, approvalTopline } from './approvalHelpers'
+import {
+  approvalDecision,
+  approvalResponsePayload,
+  approvalStatusLabel,
+  approvalSupportsApproveAll,
+  approvalTopline
+} from './approvalHelpers'
 import type { ApprovalRequest } from './appTypes'
 
 function request(partial: Partial<ApprovalRequest>): ApprovalRequest {
@@ -41,6 +47,27 @@ describe('approvalDecision', () => {
       }
     })
   })
+
+  test('does not invent session approval when decisions are omitted', () => {
+    expect(approvalDecision({}, 'approveAll')).toBe('accept')
+  })
+})
+
+describe('approvalSupportsApproveAll', () => {
+  test('requires explicit session or amendment support for command approvals', () => {
+    expect(approvalSupportsApproveAll(request({
+      params: { availableDecisions: ['accept', 'cancel'] }
+    }))).toBe(false)
+    expect(approvalSupportsApproveAll(request({
+      params: { availableDecisions: ['accept', 'acceptForSession', 'cancel'] }
+    }))).toBe(true)
+    expect(approvalSupportsApproveAll(request({
+      params: {
+        availableDecisions: [{ acceptWithExecpolicyAmendment: { execpolicy_amendment: ['node'] } }],
+        proposedExecpolicyAmendment: ['node']
+      }
+    }))).toBe(true)
+  })
 })
 
 describe('approvalResponsePayload', () => {
@@ -68,14 +95,20 @@ describe('approvalResponsePayload', () => {
     expect(approvalStatusLabel('approvedAll')).toBe('Approved all')
   })
 
-  test('uses session-scoped decisions for legacy approval methods', () => {
+  test('keeps legacy approval methods single prompt without explicit session support', () => {
     expect(approvalResponsePayload(request({
       method: 'execCommandApproval'
-    }), 'approveAll')).toEqual({ decision: 'approved_for_session' })
+    }), 'approveAll')).toEqual({ decision: 'approved' })
     expect(approvalResponsePayload(request({
       kind: 'fileChange',
       method: 'applyPatchApproval'
-    }), 'approveAll')).toEqual({ decision: 'approved_for_session' })
+    }), 'approveAll')).toEqual({ decision: 'approved' })
+  })
+
+  test('downgrades unsupported approve all command responses to single approval', () => {
+    expect(approvalResponsePayload(request({
+      params: { availableDecisions: ['accept', 'cancel'] }
+    }), 'approveAll')).toEqual({ decision: 'accept' })
   })
 
   test('shows resolved approval cards as granted instead of still required', () => {
