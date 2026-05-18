@@ -1129,6 +1129,80 @@ async fn windows_external_destructive_command_requires_approval_when_windows_san
     );
 }
 
+#[tokio::test]
+async fn windows_dynamic_recycle_delete_requires_approval_when_windows_sandbox_disabled() {
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        concat!(
+            r#"$desktop = [Environment]::GetFolderPath('Desktop'); "#,
+            r#"$path = Join-Path $desktop 'unsafe.txt'; "#,
+            r#"[Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($path, "#,
+            r#"'OnlyErrorDialogs', 'SendToRecycleBin')"#
+        )
+        .to_string(),
+    ];
+    let file_system_sandbox_policy = workspace_write_file_system_sandbox_policy();
+
+    let requirement = ExecPolicyManager::new(Arc::new(Policy::empty()))
+        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+            command: &command,
+            approval_policy: AskForApproval::OnRequest,
+            permission_profile: permission_profile_from_sandbox_policy(
+                &SandboxPolicy::new_workspace_write_policy(),
+            ),
+            file_system_sandbox_policy: &file_system_sandbox_policy,
+            sandbox_cwd: Path::new(r"C:\Users\root123\zspark"),
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            prefix_rule: None,
+        })
+        .await;
+
+    assert_eq!(
+        requirement,
+        ExecApprovalRequirement::NeedsApproval {
+            reason: Some(WINDOWS_DESTRUCTIVE_WITHOUT_SANDBOX_REASON.to_string()),
+            proposed_execpolicy_amendment: None,
+        }
+    );
+}
+
+#[tokio::test]
+async fn windows_workspace_delete_requires_approval_when_windows_sandbox_disabled() {
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        r"Remove-Item C:\Users\root123\zspark\Desktop\inside-workspace.txt -Force".to_string(),
+    ];
+    let file_system_sandbox_policy = workspace_write_file_system_sandbox_policy();
+
+    let requirement = ExecPolicyManager::new(Arc::new(Policy::empty()))
+        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+            command: &command,
+            approval_policy: AskForApproval::OnRequest,
+            permission_profile: permission_profile_from_sandbox_policy(
+                &SandboxPolicy::new_workspace_write_policy(),
+            ),
+            file_system_sandbox_policy: &file_system_sandbox_policy,
+            sandbox_cwd: Path::new(r"C:\Users\root123\zspark"),
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            prefix_rule: None,
+        })
+        .await;
+
+    assert_eq!(
+        requirement,
+        ExecApprovalRequirement::NeedsApproval {
+            reason: Some(WINDOWS_DESTRUCTIVE_WITHOUT_SANDBOX_REASON.to_string()),
+            proposed_execpolicy_amendment: None,
+        }
+    );
+}
+
 #[test]
 fn windows_workspace_destructive_command_is_not_classified_as_external() {
     let command_text = normalize_windows_command_text(

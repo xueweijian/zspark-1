@@ -127,11 +127,8 @@ async fn unmatched_powershell_delete_requires_approval_when_windows_sandbox_disa
     assert_eq!(
         requirement,
         ExecApprovalRequirement::NeedsApproval {
-            reason: None,
-            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
-                "Remove-Item".to_string(),
-                r"C:\Users\root123\Desktop\unsafe.txt".to_string(),
-            ])),
+            reason: Some(WINDOWS_EXTERNAL_DESTRUCTIVE_REASON.to_string()),
+            proposed_execpolicy_amendment: None,
         }
     );
 }

@@ -48,6 +48,8 @@ const REJECT_SANDBOX_APPROVAL_REASON: &str =
 const REJECT_RULES_APPROVAL_REASON: &str =
     "approval required by policy rule, but AskForApproval::Granular.rules is false";
 const WINDOWS_EXTERNAL_DESTRUCTIVE_REASON: &str = "destructive Windows filesystem command targets a user folder outside the workspace while Windows sandboxing is disabled";
+const WINDOWS_DESTRUCTIVE_WITHOUT_SANDBOX_REASON: &str =
+    "destructive Windows filesystem command requires approval while Windows sandboxing is disabled";
 const RULES_DIR_NAME: &str = "rules";
 const RULE_EXTENSION: &str = "rules";
 const DEFAULT_POLICY_FILE: &str = "default.rules";
@@ -293,7 +295,7 @@ impl ExecPolicyManager {
             used_complex_parsing,
             command_origin,
         } = commands_for_exec_policy(command);
-        let windows_external_destructive_reason = windows_external_destructive_command_reason(
+        let windows_destructive_reason = windows_destructive_command_reason(
             command,
             file_system_sandbox_policy,
             sandbox_cwd,
@@ -340,7 +342,7 @@ impl ExecPolicyManager {
             None
         };
 
-        if let Some(reason) = windows_external_destructive_reason {
+        if let Some(reason) = windows_destructive_reason {
             return match evaluation.decision {
                 Decision::Forbidden => ExecApprovalRequirement::Forbidden {
                     reason: derive_forbidden_reason(command, &evaluation),
@@ -811,7 +813,7 @@ fn restricted_policy_without_windows_sandbox(
         && !file_system_sandbox_policy.has_full_disk_write_access()
 }
 
-fn windows_external_destructive_command_reason(
+fn windows_destructive_command_reason(
     command: &[String],
     file_system_sandbox_policy: &FileSystemSandboxPolicy,
     sandbox_cwd: &Path,
@@ -823,13 +825,15 @@ fn windows_external_destructive_command_reason(
     }
 
     let command_text = normalize_windows_command_text(&command.join(" "));
-    if !looks_like_destructive_windows_file_operation(&command_text)
-        || !targets_windows_user_folder_outside_cwd(&command_text, sandbox_cwd)
-    {
+    if !looks_like_destructive_windows_file_operation(&command_text) {
         return None;
     }
 
-    Some(WINDOWS_EXTERNAL_DESTRUCTIVE_REASON.to_string())
+    if targets_windows_user_folder_outside_cwd(&command_text, sandbox_cwd) {
+        Some(WINDOWS_EXTERNAL_DESTRUCTIVE_REASON.to_string())
+    } else {
+        Some(WINDOWS_DESTRUCTIVE_WITHOUT_SANDBOX_REASON.to_string())
+    }
 }
 
 fn normalize_windows_command_text(value: &str) -> String {
