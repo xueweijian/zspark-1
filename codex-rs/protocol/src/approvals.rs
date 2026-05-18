@@ -310,7 +310,7 @@ impl ExecApprovalRequestEvent {
             return vec![ReviewDecision::Approved, ReviewDecision::Abort];
         }
 
-        let mut decisions = vec![ReviewDecision::Approved];
+        let mut decisions = vec![ReviewDecision::Approved, ReviewDecision::ApprovedForSession];
         if let Some(prefix) = proposed_execpolicy_amendment {
             decisions.push(ReviewDecision::ApprovedExecpolicyAmendment {
                 proposed_execpolicy_amendment: prefix.clone(),
@@ -413,6 +413,31 @@ mod tests {
                 command: "rm -rf /tmp/guardian".to_string(),
                 cwd: test_path_buf("/tmp").abs(),
             }
+        );
+    }
+
+    #[test]
+    fn default_command_approval_decisions_include_session_scope() {
+        assert_eq!(
+            ExecApprovalRequestEvent::default_available_decisions(None, None, None, None),
+            vec![
+                ReviewDecision::Approved,
+                ReviewDecision::ApprovedForSession,
+                ReviewDecision::Abort,
+            ]
+        );
+    }
+
+    #[test]
+    fn additional_permissions_approval_stays_single_prompt() {
+        assert_eq!(
+            ExecApprovalRequestEvent::default_available_decisions(
+                None,
+                None,
+                None,
+                Some(&Default::default()),
+            ),
+            vec![ReviewDecision::Approved, ReviewDecision::Abort]
         );
     }
 

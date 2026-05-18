@@ -1069,7 +1069,6 @@ function DesktopApp() {
   // Map item id -> activity id
   const itemActivity = useRef<Map<string, string>>(new Map())
   const approvalRequests = useRef<Map<string, ApprovalRequest>>(new Map())
-  const autoApprovedTurns = useRef<Set<string>>(new Set())
   const seenTurnStarts = useRef<Set<string>>(new Set())
   const appliedReasoningCompletions = useRef<Set<string>>(new Set())
   const recentNotificationLines = useRef<Map<string, number>>(new Map())
@@ -1864,52 +1863,6 @@ function DesktopApp() {
       return upsertApprovalBlockByTurnOrder(bs, block)
     })
   }
-  const canAutoApproveRequest = (request: ApprovalRequest) => (
-    Boolean(request.turnId && autoApprovedTurns.current.has(request.turnId) && approvalSupportsApproveAll(request))
-  )
-  const autoApproveRequest = (request: ApprovalRequest) => {
-    approvalRequests.current.set(request.key, { ...request, status: 'approvedAll' })
-    setApprovalStatus(request.key, 'approvedAll')
-    if (request.turnId) {
-      upsertTurnBlock(request.turnId, `turn-${request.turnId}`, request.startedAt)
-      const activityId = ensureActivity(request.turnId, `approval-${request.key}`, {
-        kind: 'tool',
-        title: 'Auto-approved workspace step',
-        detail: request.title,
-        actionKind: 'tool'
-      })
-      updateActivity(request.turnId, activityId, {
-        status: 'done',
-        endedAt: Date.now(),
-        title: 'Auto-approved workspace step',
-        detail: request.title
-      })
-    }
-    void sendRpcResult(request.id, approvalResponsePayload(request, 'approveAll'))
-      .then((ok) => {
-        if (!ok) throw new Error('Codex process is not running')
-      })
-      .catch((err: any) => {
-        approvalRequests.current.delete(request.key)
-        if (request.turnId) {
-          updateActivity(request.turnId, `a-approval-${request.key}`, {
-            status: 'failed',
-            endedAt: Date.now(),
-            title: 'Auto-approval failed',
-            detail: err?.message ?? String(err)
-          })
-        }
-        upsertApprovalBlock({ ...request, status: 'pending' })
-        toast('error', err?.message ?? String(err))
-      })
-  }
-  const autoApprovePendingRequestsForTurn = (turnId: string, exceptKey: string) => {
-    for (const request of Array.from(approvalRequests.current.values())) {
-      if (request.key === exceptKey || request.turnId !== turnId || request.status !== 'pending') continue
-      if (!canAutoApproveRequest(request)) continue
-      autoApproveRequest(request)
-    }
-  }
   const resolveApprovalRequest = (requestId: JsonRpcId) => {
     const key = rpcKey(requestId)
     const request = approvalRequests.current.get(key)
@@ -1948,10 +1901,6 @@ function DesktopApp() {
       return
     }
     if (!request.turnId && currentTurn.current) request.turnId = currentTurn.current.turnId
-    if (canAutoApproveRequest(request)) {
-      autoApproveRequest(request)
-      return
-    }
     upsertApprovalBlock(request)
     scrollToLatest('smooth')
   }
@@ -1959,13 +1908,11 @@ function DesktopApp() {
     if (request.status !== 'pending') return
     const effectiveMode = mode === 'approveAll' && !approvalSupportsApproveAll(request) ? 'approve' : mode
     setApprovalStatus(request.key, 'sending')
-    if (effectiveMode === 'approveAll' && request.turnId) autoApprovedTurns.current.add(request.turnId)
     try {
       const ok = await sendRpcResult(request.id, approvalResponsePayload(request, effectiveMode))
       if (!ok) throw new Error('Codex process is not running')
       const status = approvalStatusForDecision(effectiveMode)
       setApprovalStatus(request.key, status)
-      if (effectiveMode === 'approveAll' && request.turnId) autoApprovePendingRequestsForTurn(request.turnId, request.key)
       if (request.turnId) {
         updateActivity(request.turnId, `a-approval-${request.key}`, {
           status: effectiveMode === 'deny' ? 'failed' : 'done',
@@ -1975,7 +1922,6 @@ function DesktopApp() {
         })
       }
     } catch (err: any) {
-      if (effectiveMode === 'approveAll' && request.turnId) autoApprovedTurns.current.delete(request.turnId)
       setApprovalStatus(request.key, 'pending')
       toast('error', err?.message ?? String(err))
     }
@@ -1992,7 +1938,6 @@ function DesktopApp() {
     clearTurnRecoveryTimers(turnId)
     completedWorkByTurn.current.delete(turnId)
     interruptingTurns.current.delete(turnId)
-    autoApprovedTurns.current.delete(turnId)
   }
 
   const releaseTurnLocally = (turnId: string, detail: string) => {

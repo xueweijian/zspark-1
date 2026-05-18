@@ -111,6 +111,12 @@ describe('approvalResponsePayload', () => {
     }), 'approveAll')).toEqual({ decision: 'accept' })
   })
 
+  test('uses session-scoped response when command approval offers it', () => {
+    expect(approvalResponsePayload(request({
+      params: { availableDecisions: ['accept', 'acceptForSession', 'cancel'] }
+    }), 'approveAll')).toEqual({ decision: 'acceptForSession' })
+  })
+
   test('shows resolved approval cards as granted instead of still required', () => {
     expect(approvalTopline('approvedAll')).toBe('Approval granted')
     expect(approvalTopline('pending')).toBe('Approval required')
