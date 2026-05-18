@@ -239,6 +239,7 @@ async fn run_exec_like(args: RunExecLikeArgs) -> Result<FunctionToolOutput, Func
             } else {
                 effective_additional_permissions.sandbox_permissions
             },
+            windows_sandbox_level: turn.windows_sandbox_level,
             prefix_rule,
         })
         .await;

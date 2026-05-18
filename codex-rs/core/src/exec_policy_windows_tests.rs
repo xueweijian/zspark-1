@@ -1,4 +1,5 @@
 use super::*;
+use codex_protocol::config_types::WindowsSandboxLevel;
 use pretty_assertions::assert_eq;
 use std::path::Path;
 
@@ -86,10 +87,52 @@ fn unmatched_safe_powershell_words_are_allowed() {
                 file_system_sandbox_policy: &read_only_file_system_sandbox_policy(),
                 sandbox_cwd: Path::new("/tmp"),
                 sandbox_permissions: SandboxPermissions::UseDefault,
+                windows_sandbox_level: WindowsSandboxLevel::RestrictedToken,
                 used_complex_parsing: false,
                 command_origin: ExecPolicyCommandOrigin::PowerShell,
             },
         )
+    );
+}
+
+#[tokio::test]
+async fn unmatched_powershell_delete_requires_approval_when_windows_sandbox_disabled() {
+    let command = vec![
+        "powershell.exe".to_string(),
+        "-NoProfile".to_string(),
+        "-Command".to_string(),
+        r"Remove-Item C:\Users\root123\Desktop\unsafe.txt".to_string(),
+    ];
+    let file_system_sandbox_policy = FileSystemSandboxPolicy::from_legacy_sandbox_policy_for_cwd(
+        &SandboxPolicy::new_workspace_write_policy(),
+        Path::new(r"C:\Users\root123\zspark"),
+    );
+    let manager = ExecPolicyManager::default();
+
+    let requirement = manager
+        .create_exec_approval_requirement_for_command(ExecApprovalRequest {
+            command: &command,
+            approval_policy: AskForApproval::OnRequest,
+            permission_profile: permission_profile_from_sandbox_policy(
+                &SandboxPolicy::new_workspace_write_policy(),
+            ),
+            file_system_sandbox_policy: &file_system_sandbox_policy,
+            sandbox_cwd: Path::new(r"C:\Users\root123\zspark"),
+            sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: WindowsSandboxLevel::Disabled,
+            prefix_rule: None,
+        })
+        .await;
+
+    assert_eq!(
+        requirement,
+        ExecApprovalRequirement::NeedsApproval {
+            reason: None,
+            proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
+                "Remove-Item".to_string(),
+                r"C:\Users\root123\Desktop\unsafe.txt".to_string(),
+            ])),
+        }
     );
 }
 

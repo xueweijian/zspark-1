@@ -1016,6 +1016,7 @@ impl UnifiedExecProcessManager {
                 } else {
                     request.sandbox_permissions
                 },
+                windows_sandbox_level: context.turn.windows_sandbox_level,
                 prefix_rule: request.prefix_rule.clone(),
             })
             .await;

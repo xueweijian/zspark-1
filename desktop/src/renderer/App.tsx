@@ -225,6 +225,14 @@ const starters = [
 // in `appTypes.ts`, `appHelpers.ts`, `activityHelpers.ts`, and `ipc.ts`.
 const USER_APPROVAL_REVIEWER = 'user'
 const ZSPARK_APPROVAL_POLICY = 'on-request'
+const ZSPARK_SANDBOX_MODE = 'workspace-write'
+const ZSPARK_SANDBOX_POLICY = {
+  type: 'workspaceWrite',
+  writableRoots: [],
+  networkAccess: false,
+  excludeTmpdirEnvVar: false,
+  excludeSlashTmp: false
+}
 const MAX_STDOUT_BUFFER_CHARS = 2_000_000
 
 function candidateWorkspacePaths(path: string, runtime: RuntimeInfo) {
@@ -437,6 +445,14 @@ function rpcKey(id: JsonRpcId) {
 
 function userApprovalParams() {
   return { approvalPolicy: ZSPARK_APPROVAL_POLICY, approvalsReviewer: USER_APPROVAL_REVIEWER }
+}
+
+function userThreadRuntimeParams() {
+  return { ...userApprovalParams(), sandbox: ZSPARK_SANDBOX_MODE }
+}
+
+function userTurnRuntimeParams() {
+  return { ...userApprovalParams(), sandboxPolicy: ZSPARK_SANDBOX_POLICY }
 }
 
 function isApprovalRequest(method: string) {
@@ -2500,7 +2516,7 @@ function DesktopApp() {
       try {
         const init = await send('initialize', { clientInfo: { name: 'zspark-desktop', version: '0.0.1' } })
         if (init.error && init.error.message !== 'Already initialized') { toast('error', init.error.message); return }
-        const t = await send('thread/start', userApprovalParams())
+        const t = await send('thread/start', userThreadRuntimeParams())
         const tid = t.result?.thread?.id ?? null
         applyThreadRuntime(t.result)
         setThread(tid); setReady(true)
@@ -2641,7 +2657,7 @@ function DesktopApp() {
     resetLiveTurnState()
     setBlocks([])
     try {
-      const t = await send('thread/start', userApprovalParams())
+      const t = await send('thread/start', userThreadRuntimeParams())
       if (seq !== switchThreadSeq.current) return false
       applyThreadRuntime(t.result)
       setThread(t.result?.thread?.id ?? null)
@@ -2660,7 +2676,7 @@ function DesktopApp() {
     resetLiveTurnState()
     setBlocks([])
     try {
-      const t = await send('thread/resume', { threadId: id, ...userApprovalParams() })
+      const t = await send('thread/resume', { threadId: id, ...userThreadRuntimeParams() })
       if (seq !== switchThreadSeq.current) return
       if (t.error) throw new Error(t.error.message)
       applyThreadRuntime(t.result)
@@ -2708,7 +2724,7 @@ function DesktopApp() {
     setBlocks([])
     setWorkspaceFiles([])
     try {
-      const t = await send('thread/start', userApprovalParams())
+      const t = await send('thread/start', userThreadRuntimeParams())
       if (seq !== switchThreadSeq.current) return null
       if (t.error) throw new Error(t.error.message)
       applyThreadRuntime(t.result)
@@ -2757,7 +2773,7 @@ function DesktopApp() {
       let replayed = false
       if (localThreadId) {
         try {
-          const t = await send('thread/resume', { threadId: localThreadId, ...userApprovalParams() })
+          const t = await send('thread/resume', { threadId: localThreadId, ...userThreadRuntimeParams() })
           if (seq !== switchThreadSeq.current) return
           if (t.error) throw new Error(t.error.message)
           applyThreadRuntime(t.result)
@@ -2781,7 +2797,7 @@ function DesktopApp() {
         }
       }
       if (!replayed) {
-        const t = await send('thread/start', userApprovalParams())
+        const t = await send('thread/start', userThreadRuntimeParams())
         if (seq !== switchThreadSeq.current) return
         if (t.error) throw new Error(t.error.message)
         applyThreadRuntime(t.result)
@@ -2850,7 +2866,7 @@ function DesktopApp() {
         resetLiveTurnState()
         setBlocks([])
         setThread(null)
-        const t = await send('thread/start', userApprovalParams())
+        const t = await send('thread/start', userThreadRuntimeParams())
         applyThreadRuntime(t.result)
         setThread(t.result?.thread?.id ?? null)
       }
@@ -3192,7 +3208,7 @@ function DesktopApp() {
     }
     let accepted = false
     try {
-      const res = await send('turn/start', { threadId: targetThreadId, input: inputItems, ...userApprovalParams() })
+      const res = await send('turn/start', { threadId: targetThreadId, input: inputItems, ...userTurnRuntimeParams() })
       if (res.error) {
         if (shouldClearComposer) {
           setInput(text)

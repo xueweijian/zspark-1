@@ -9037,6 +9037,7 @@ async fn rejects_escalated_permissions_when_policy_not_on_request() {
             file_system_sandbox_policy: &file_system_sandbox_policy,
             sandbox_cwd: turn_context.cwd.as_path(),
             sandbox_permissions: SandboxPermissions::UseDefault,
+            windows_sandbox_level: turn_context.windows_sandbox_level,
             prefix_rule: None,
         })
         .await;
