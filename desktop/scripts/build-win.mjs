@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from 'node:child_process'
-import { existsSync, rmSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { setTimeout as sleep } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
@@ -10,22 +10,47 @@ const useShell = process.platform === 'win32'
 const scriptDir = dirname(fileURLToPath(import.meta.url))
 const desktopDir = resolve(scriptDir, '..')
 const repoRoot = resolve(desktopDir, '..')
+const codexRsDir = resolve(repoRoot, 'codex-rs')
 const codexExe = resolve(repoRoot, 'codex-rs/target/release/codex.exe')
 const winUnpackedDir = resolve(desktopDir, 'dist/win-unpacked')
+const rendererAssetsDir = resolve(desktopDir, 'out/renderer/assets')
 
-if (!existsSync(codexExe)) {
-  console.error(`Missing Windows Codex binary: ${codexExe}`)
-  console.error('Build codex-rs for Windows first so the packaged app can launch resources/bin/codex.exe.')
-  process.exit(1)
-}
-
-function run(command, args) {
-  const result = spawnSync(command, args, { stdio: 'inherit', env, shell: useShell })
+function run(command, args, options = {}) {
+  const result = spawnSync(command, args, { stdio: 'inherit', env, shell: useShell, ...options })
   if (result.error) {
     console.error(result.error.message)
     process.exit(1)
   }
   if (result.status !== 0) process.exit(result.status ?? 1)
+}
+
+function ensureWindowsCodexExe() {
+  if (process.platform === 'win32') {
+    run('cargo', ['build', '--release', '-p', 'codex-cli'], { cwd: codexRsDir })
+  }
+
+  if (!existsSync(codexExe)) {
+    console.error(`Missing Windows Codex binary: ${codexExe}`)
+    console.error('Build codex-rs for Windows first so the packaged app can launch resources/bin/codex.exe.')
+    process.exit(1)
+  }
+}
+
+function verifyRendererSandboxBundle() {
+  if (!existsSync(rendererAssetsDir)) {
+    console.error(`Missing renderer assets after build: ${rendererAssetsDir}`)
+    process.exit(1)
+  }
+
+  const jsFiles = readdirSync(rendererAssetsDir)
+    .filter((name) => name.endsWith('.js'))
+    .map((name) => resolve(rendererAssetsDir, name))
+  const bundledJs = jsFiles.map((path) => readFileSync(path, 'utf8')).join('\n')
+  if (!bundledJs.includes('workspace-write') || !bundledJs.includes('workspaceWrite')) {
+    console.error('Renderer bundle is missing the zspark workspace-write sandbox policy.')
+    console.error('Refusing to package a Windows app that can start turns without sandbox metadata.')
+    process.exit(1)
+  }
 }
 
 function psSingleQuote(value) {
@@ -80,7 +105,9 @@ async function removeWinUnpackedDir() {
   throw lastError
 }
 
+ensureWindowsCodexExe()
 await import(new URL('./build-gmail-mcp.mjs', import.meta.url))
 run('electron-vite', ['build'])
+verifyRendererSandboxBundle()
 await removeWinUnpackedDir()
 run('electron-builder', ['--win', 'nsis', ...process.argv.slice(2)])
