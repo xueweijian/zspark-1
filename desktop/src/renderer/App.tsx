@@ -675,10 +675,11 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
     pythonRuntimeLine,
     'Use these bundled Node.js dependencies for presentations and other Node-based artifact helpers. Use Python only when the selected skill/helper requires it.',
     'Hard delivery contract: create an actual editable artifact file in the workspace. A prose specification is a failure unless a real command fails and you report that command error.',
+    'If the user asks for multiple distinct artifacts (for example two PPTs, two PPTX files, separate decks, or one file per topic/subagent), create and verify that many separate final files. Do not merge separate requested deliverables into one deck unless the user explicitly asks for one deck with multiple slides/pages.',
     'Before using @oai/artifact-tool from an output work directory, run this preflight pattern:',
     `  mkdir -p "$WORKSPACE" && cd "$WORKSPACE" && ln -sfn "${rt.nodeModulesPath}" node_modules`,
     `  "${rt.nodePath}" -e "import('@oai/artifact-tool').then(() => console.log('artifact-tool ok'))"`,
-    'Before the final answer, verify the delivered file with `test -s "$FINAL_ARTIFACT" && ls -lh "$FINAL_ARTIFACT"`. Do not claim success or report a final path until that command succeeds.'
+    'Before the final answer, verify every delivered file with `test -s "$FINAL_ARTIFACT" && ls -lh "$FINAL_ARTIFACT"` or an equivalent loop over all final artifacts. Do not claim success or report final paths until verification succeeds for each file.'
   ]
   if (presentationSkillDir) {
     lines.push(
@@ -687,7 +688,7 @@ function officeRuntimeContext(skills: SkillMeta[], runtime: RuntimeInfo): string
       `- Build/export helper: "${rt.nodePath}" "${presentationSkillDir}/scripts/build_artifact_deck.mjs" --slides-dir "$SLIDES_DIR" --out "$FINAL_PPTX" --preview-dir "$PREVIEW_DIR" --layout-dir "$LAYOUT_DIR"`,
       'Artifact-tool compose rules: write plain ESM slide modules, not raw JSX/HTML; `panel` accepts one child; use `row`/`column` with array children; `justify` values are start, center, end, or stretch.',
       'If the build helper fails, patch the slide source and rerun it until `test -s "$FINAL_PPTX"` passes.',
-      'The final response must include only a PPTX path that exists after the verification command.'
+      'The final response must include only PPTX path(s) that exist after the verification command.'
     )
   }
   return [
@@ -1559,7 +1560,7 @@ function DesktopApp() {
     try {
       const result = await window.zspark.scanRecentArtifacts({
         sinceMs: Math.max(0, startedAt - 2000),
-        limit: 1
+        limit: 8
       })
       let files: WorkspaceFile[] = result.artifacts
         .filter((artifact) => shouldDisplayScannedArtifact(artifact, shownArtifactRevisions.current))
