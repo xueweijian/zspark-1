@@ -92,6 +92,13 @@ const MAX_CODEX_LOG_BYTES = 8 * 1024 * 1024
 // Server enforces a 50 MB artifact size + 70 MB JSON body cap; keep the
 // renderer-side guard below the JSON cap (base64 inflates ~1.37×).
 const MAX_ARTIFACT_UPLOAD_BYTES = 50 * 1024 * 1024
+const ZSPARK_SPAWN_AGENT_USAGE_HINT = [
+  'Zspark artifact task guidance:',
+  'For Office artifact work such as PPTX, DOCX, XLSX, or PDF generation, prefer bounded workers that write directly to disjoint output directories and return only verified final paths.',
+  'Do not combine fork_context=true with agent_type, model, or reasoning_effort overrides; if a worker needs a role or override, spawn without a full-context fork and put the required cwd, skill path, output path, and verification command in the message.',
+  'For parallel PPTX work, each worker should own exactly one slide or one final deck path, run the export command itself when assigned, verify with test -s or an equivalent file-size check, and avoid dumping slide source code or old outputs into the final reply.',
+  'The parent should keep doing non-overlapping local work while workers run, then inspect each assigned output path and recover locally if a worker reports a stream disconnect after writing files.'
+].join(' ')
 const BRIDGE_API_KEY = randomBytes(32).toString('hex')
 ensureWorkspaceRoot(WORKSPACE_ROOT)
 
@@ -593,7 +600,10 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
     '-c', `features.memories=true`,
     // Use the compatibility collab feature so existing agents.max_threads
     // settings keep working while spawn_agent/wait_agent tools are enabled.
-    '-c', `features.collab=true`
+    '-c', `features.collab=true`,
+    // Keep the legacy collab tool surface for users with agents.max_threads,
+    // but tune its prompt so artifact-heavy parallel work stays bounded.
+    '-c', `features.multi_agent_v2.usage_hint_text=${tomlString(ZSPARK_SPAWN_AGENT_USAGE_HINT)}`
   ]
   if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: baseArgs, env: mcpConfig.env }
 

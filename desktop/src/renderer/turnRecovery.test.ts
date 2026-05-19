@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest'
 import {
   shouldReleaseCompletedWorkAfterProviderFailure,
-  shouldRecoverFromProviderRetry
+  shouldRecoverFromProviderRetry,
+  turnStatusAfterServerCompletion
 } from './turnRecovery'
 
 describe('shouldRecoverFromProviderRetry', () => {
@@ -59,5 +60,31 @@ describe('shouldReleaseCompletedWorkAfterProviderFailure', () => {
       alreadyInterrupting: false,
       isStreamDisconnect: false
     })).toBe(false)
+  })
+})
+
+describe('turnStatusAfterServerCompletion', () => {
+  it('does not let a late failed completion override a locally released turn', () => {
+    expect(turnStatusAfterServerCompletion({
+      serverStatus: 'failed',
+      locallyReleased: true
+    })).toBe('interrupted')
+  })
+
+  it('keeps normal server completion states unchanged', () => {
+    expect(turnStatusAfterServerCompletion({
+      serverStatus: 'failed',
+      locallyReleased: false
+    })).toBe('failed')
+
+    expect(turnStatusAfterServerCompletion({
+      serverStatus: 'interrupted',
+      locallyReleased: true
+    })).toBe('interrupted')
+
+    expect(turnStatusAfterServerCompletion({
+      serverStatus: 'completed',
+      locallyReleased: false
+    })).toBe('completed')
   })
 })

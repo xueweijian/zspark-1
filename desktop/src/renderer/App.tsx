@@ -40,6 +40,7 @@ import {
   TURN_INTERRUPT_FALLBACK_RELEASE_MS,
   shouldReleaseCompletedWorkAfterProviderFailure,
   shouldRecoverFromProviderRetry,
+  turnStatusAfterServerCompletion,
   type CompletedTurnWorkKind
 } from './turnRecovery'
 import { responseForMcpElicitationRequest } from './mcpElicitation'
@@ -1093,6 +1094,7 @@ function DesktopApp() {
   const restoredActivityThreads = useRef<Set<string>>(new Set())
   const checkedArtifactMessages = useRef<Map<string, string>>(new Map())
   const completedWorkByTurn = useRef<Map<string, Set<CompletedTurnWorkKind>>>(new Map())
+  const locallyReleasedTurns = useRef<Set<string>>(new Set())
   const commandFailuresByTurn = useRef<Map<string, CommandFailureSignal>>(new Map())
   const switchThreadSeq = useRef(0)
   const providerRetryTimers = useRef<Map<string, number>>(new Map())
@@ -2029,6 +2031,16 @@ function DesktopApp() {
     completedWorkByTurn.current.set(turnId, current)
   }
 
+  const rememberLocallyReleasedTurn = (turnId: string) => {
+    if (!turnId) return
+    locallyReleasedTurns.current.add(turnId)
+    while (locallyReleasedTurns.current.size > 100) {
+      const oldest = locallyReleasedTurns.current.values().next().value
+      if (!oldest) break
+      locallyReleasedTurns.current.delete(oldest)
+    }
+  }
+
   const settleTurnRecovery = (turnId: string) => {
     clearTurnRecoveryTimers(turnId)
     completedWorkByTurn.current.delete(turnId)
@@ -2061,6 +2073,7 @@ function DesktopApp() {
         return a
       })
     }))
+    rememberLocallyReleasedTurn(turnId)
     void scanTurnArtifacts(turnId, active.startedAt, `scan-${turnId}-released`)
     currentTurn.current = null
     settleTurnRecovery(turnId)
@@ -2181,6 +2194,7 @@ function DesktopApp() {
           const blockId = `turn-${turnId}`
           const startedAt = Date.now()
           currentTurn.current = { turnId, blockId, startedAt }
+          locallyReleasedTurns.current.delete(turnId)
           settleTurnRecovery(turnId)
           if (!seenTurnStarts.current.has(turnId)) {
             seenTurnStarts.current.add(turnId)
@@ -2199,13 +2213,15 @@ function DesktopApp() {
           setStreaming(false)
           const turnId = turnIdFromParams(params)
           if (!turnId) return
+          const turnStatus = params?.turn?.status
+          const locallyReleased = locallyReleasedTurns.current.has(turnId)
           updateTurn(turnId, (t) => {
             // Mark any still-running activities done at end of turn (incl. our placeholder Thinking)
             const acts = t.activities.map((a) => (a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now(), title: a.kind === 'reasoning' ? 'Thought' : a.title } : a))
-            const turnStatus = params?.turn?.status
-            const status = turnStatus === 'interrupted' ? 'interrupted' : turnStatus === 'failed' ? 'failed' : 'completed'
+            const status = turnStatusAfterServerCompletion({ serverStatus: turnStatus, locallyReleased })
             return { ...t, endedAt: Date.now(), collapsed: false, status, activities: acts }
           })
+          locallyReleasedTurns.current.delete(turnId)
           const startedAt = currentTurn.current?.turnId === turnId ? currentTurn.current.startedAt : Date.now()
           void scanTurnArtifacts(turnId, startedAt, `scan-${turnId}-completed`)
           currentTurn.current = null
