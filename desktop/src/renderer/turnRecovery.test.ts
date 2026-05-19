@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  shouldReleaseCompletedWorkAfterProviderFailure,
   shouldRecoverFromProviderRetry
 } from './turnRecovery'
 
@@ -23,6 +24,40 @@ describe('shouldRecoverFromProviderRetry', () => {
       willRetry: true,
       completedWorkCount: 2,
       alreadyInterrupting: true
+    })).toBe(false)
+  })
+})
+
+describe('shouldReleaseCompletedWorkAfterProviderFailure', () => {
+  it('releases final stream disconnects after local work was recorded', () => {
+    expect(shouldReleaseCompletedWorkAfterProviderFailure({
+      willRetry: false,
+      completedWorkCount: 1,
+      alreadyInterrupting: false,
+      isStreamDisconnect: true
+    })).toBe(true)
+
+    expect(shouldReleaseCompletedWorkAfterProviderFailure({
+      willRetry: false,
+      completedWorkCount: 0,
+      alreadyInterrupting: false,
+      isStreamDisconnect: true
+    })).toBe(false)
+  })
+
+  it('does not hide retrying or non-stream provider failures', () => {
+    expect(shouldReleaseCompletedWorkAfterProviderFailure({
+      willRetry: true,
+      completedWorkCount: 1,
+      alreadyInterrupting: false,
+      isStreamDisconnect: true
+    })).toBe(false)
+
+    expect(shouldReleaseCompletedWorkAfterProviderFailure({
+      willRetry: false,
+      completedWorkCount: 1,
+      alreadyInterrupting: false,
+      isStreamDisconnect: false
     })).toBe(false)
   })
 })

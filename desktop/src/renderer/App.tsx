@@ -38,6 +38,7 @@ import {
 import {
   PROVIDER_RECONNECT_AUTO_INTERRUPT_MS,
   TURN_INTERRUPT_FALLBACK_RELEASE_MS,
+  shouldReleaseCompletedWorkAfterProviderFailure,
   shouldRecoverFromProviderRetry,
   type CompletedTurnWorkKind
 } from './turnRecovery'
@@ -2133,6 +2134,15 @@ function DesktopApp() {
     providerRetryTimers.current.set(turnId, timer)
   }
 
+  const isProviderStreamDisconnect = (params: any, message: string) => {
+    const info = params?.error?.codexErrorInfo
+    return Boolean(
+      info?.responseStreamDisconnected ||
+      /stream disconnected before completion|response\.failed event received/i.test(message) ||
+      /stream disconnected before completion|response\.failed event received/i.test(String(params?.error?.additionalDetails ?? params?.additionalDetails ?? ''))
+    )
+  }
+
   useEffect(() => { runtimeRef.current = runtime }, [runtime])
   useEffect(() => { threadRef.current = thread }, [thread])
   useEffect(() => { workspaceFilesRef.current = workspaceFiles }, [workspaceFiles])
@@ -2276,10 +2286,21 @@ function DesktopApp() {
             }
             return
           }
+          const cur = currentTurn.current
+          const completedWorkCount = cur ? completedWorkByTurn.current.get(cur.turnId)?.size ?? 0 : 0
+          if (cur && shouldReleaseCompletedWorkAfterProviderFailure({
+            willRetry: Boolean(params?.willRetry),
+            completedWorkCount,
+            alreadyInterrupting: interruptingTurns.current.has(cur.turnId),
+            isStreamDisconnect: isProviderStreamDisconnect(params, msg)
+          })) {
+            releaseTurnLocally(cur.turnId, '\nProvider stream failed after local work was recorded; partial files were kept.')
+            toast('warn', 'Provider stream ended after local work; kept the generated files and released the chat.')
+            return
+          }
           submitInFlight.current = false
           setSubmitting(false)
           setStreaming(false)
-          const cur = currentTurn.current
           if (cur) {
             updateTurn(cur.turnId, (t) => ({
               ...t,

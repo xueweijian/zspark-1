@@ -14,3 +14,17 @@ export function shouldRecoverFromProviderRetry({
 }) {
   return willRetry && completedWorkCount > 0 && !alreadyInterrupting
 }
+
+export function shouldReleaseCompletedWorkAfterProviderFailure({
+  willRetry,
+  completedWorkCount,
+  alreadyInterrupting,
+  isStreamDisconnect
+}: {
+  willRetry: boolean
+  completedWorkCount: number
+  alreadyInterrupting: boolean
+  isStreamDisconnect: boolean
+}) {
+  return !willRetry && isStreamDisconnect && completedWorkCount > 0 && !alreadyInterrupting
+}
