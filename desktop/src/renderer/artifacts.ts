@@ -48,6 +48,14 @@ export function extractDisplayableArtifactPathCandidates(text: string): string[]
   )
 }
 
+export function extractPrimaryArtifactPathCandidates(text: string): string[] {
+  return sortArtifactPathCandidatesForDisplay(
+    extractArtifactPathCandidates(text).filter((candidate) => (
+      PRIMARY_ARTIFACT_EXTENSION_RE.test(candidate) && isDisplayableArtifactPath(candidate, true)
+    ))
+  )
+}
+
 export function isAbsolutePath(path: string) {
   return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)
 }

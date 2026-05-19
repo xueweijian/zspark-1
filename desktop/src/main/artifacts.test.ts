@@ -51,6 +51,18 @@ describe('artifact scanning', () => {
     expect(scanRecentArtifacts(workspace, { sinceMs: afterOldDeck })).toEqual([])
   })
 
+  test('skips contact sheets outside the qa directory', () => {
+    const workspace = tempDir()
+    const outputDir = join(workspace, 'outputs', 'turn-1', 'presentations', 'demo')
+    mkdirSync(outputDir, { recursive: true })
+    writeFileSync(join(outputDir, 'contact-sheet.png'), 'preview')
+    writeFileSync(join(outputDir, 'deck.pptx'), 'pptx')
+
+    expect(scanRecentArtifacts(workspace, { sinceMs: 0 })).toEqual([
+      expect.objectContaining({ name: 'deck.pptx' })
+    ])
+  })
+
   test('can return only the newest deliverable for chat fallback cards', () => {
     const workspace = tempDir()
     const outputDir = join(workspace, 'outputs', 'turn-1', 'documents', 'demo', 'output')

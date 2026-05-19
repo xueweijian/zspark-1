@@ -3,6 +3,7 @@ import {
   dirname,
   extractDisplayableArtifactPathCandidates,
   extractArtifactPathCandidates,
+  extractPrimaryArtifactPathCandidates,
   findRecentArtifactForCandidate,
   isDisplayableArtifactPath,
   resolveWorkspacePath
@@ -79,6 +80,19 @@ describe('artifact helpers', () => {
     expect(extractDisplayableArtifactPathCandidates(output)).toEqual([
       '/repo/outputs/run/presentations/demo/output/final.pptx',
       '/repo/outputs/run/gallery/final.png'
+    ])
+  })
+
+  test('extracts primary deliverables without displayable image artifacts', () => {
+    const output = [
+      'Preview: /repo/outputs/run/dpo-vs-ppo/test_preview.png',
+      'Deck: /repo/outputs/run/presentations/demo/output/final.pptx',
+      'Report: /repo/outputs/run/report.pdf'
+    ].join('\n')
+
+    expect(extractPrimaryArtifactPathCandidates(output)).toEqual([
+      '/repo/outputs/run/presentations/demo/output/final.pptx',
+      '/repo/outputs/run/report.pdf'
     ])
   })
 

@@ -22,6 +22,7 @@ import {
   dirname,
   extractDisplayableArtifactPathCandidates,
   extractArtifactPathCandidates,
+  extractPrimaryArtifactPathCandidates,
   findRecentArtifactForCandidate,
   isDisplayableArtifactPath,
   resolveWorkspacePath,
@@ -1564,13 +1565,24 @@ function DesktopApp() {
     })
   }
 
+  const shouldCaptureCommandOutputArtifacts = (item: any, output: string) => {
+    const command = String(item?.command ?? '').toLowerCase()
+    const actions = Array.isArray(item?.commandActions) ? item.commandActions : []
+    const actionTypes = actions.map((action: any) => String(action?.type ?? ''))
+    if (actionTypes.length && actionTypes.every((type: string) => (
+      type === 'read' || type === 'search' || type === 'listFiles'
+    ))) return false
+    if (/\bbuild_artifact_deck\.mjs\b|artifact-build-manifest|test\s+-s\b|ls\s+-lh\b/.test(command)) return true
+    return /"output"\s*:/.test(output) && /\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|zip)\b/i.test(output)
+  }
+
   const captureCommandOutputArtifacts = async (
     turnId: string,
     itemId: string,
     output: string,
     commandCwd?: string
   ) => {
-    const candidates = extractDisplayableArtifactPathCandidates(output).slice(0, 16)
+    const candidates = extractPrimaryArtifactPathCandidates(output).slice(0, 16)
     if (!candidates.length) return
 
     const now = Date.now()
@@ -1630,9 +1642,10 @@ function DesktopApp() {
 
   const scanTurnArtifacts = async (turnId: string, startedAt: number, itemId: string) => {
     try {
+      const scanStartedAt = timestampToMs(startedAt, Date.now())
       const result = await window.zspark.scanRecentArtifacts({
-        sinceMs: Math.max(0, startedAt - 2000),
-        limit: 48
+        sinceMs: Math.max(0, scanStartedAt - 2000),
+        limit: 24
       })
       let files: WorkspaceFile[] = result.artifacts
         .filter((artifact) => shouldDisplayScannedArtifact(artifact, shownArtifactRevisions.current))
@@ -2440,7 +2453,9 @@ function DesktopApp() {
                 for (const deleted of extractDeletedPathsFromCommand(item)) {
                   rememberDeletedArtifact(turnId, deleted)
                 }
-                void captureCommandOutputArtifacts(turnId, itemId, output, typeof item.cwd === 'string' ? item.cwd : undefined)
+                if (shouldCaptureCommandOutputArtifacts(item, output)) {
+                  void captureCommandOutputArtifacts(turnId, itemId, output, typeof item.cwd === 'string' ? item.cwd : undefined)
+                }
               }
             }
             return
