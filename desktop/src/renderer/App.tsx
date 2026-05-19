@@ -132,6 +132,8 @@ import {
   activityDetailWeight,
   activitySummaryLabels,
   cleanShellCommand,
+  collabAgentActivityInfo,
+  collabAgentActivityStatus,
   commandActionInfo,
   commandActivityDetail,
   commandActivityInfo,
@@ -749,7 +751,7 @@ function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; 
       if (item?.type === 'userMessage') {
         const txt = formatUserInputContent(item.content ?? [])
         if (txt) userBlocks.push({ type: 'user', id: `replay-u-${item.id}`, text: txt, turnId, input: normalizeInputItemsForResubmit(item.content ?? []) })
-      } else if (item?.type === 'reasoning' || item?.type === 'commandExecution' || item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall' || item?.type === 'webSearch' || item?.type === 'contextCompaction') {
+      } else if (item?.type === 'reasoning' || item?.type === 'commandExecution' || item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall' || item?.type === 'collabAgentToolCall' || item?.type === 'webSearch' || item?.type === 'contextCompaction') {
         const activity = replayActivityFromItem(item, startedAt)
         if (activity) ensureTurnBlock().activities.push(activity)
       } else if (item?.type === 'agentMessage') {
@@ -2383,14 +2385,15 @@ function DesktopApp() {
             }
             return
           }
-          if (item.type === 'mcpToolCall' || item.type === 'dynamicToolCall') {
+          if (item.type === 'mcpToolCall' || item.type === 'dynamicToolCall' || item.type === 'collabAgentToolCall') {
             const itemId = item.id as string
-            const info = toolActivityInfo(item)
+            const info = item.type === 'collabAgentToolCall' ? collabAgentActivityInfo(item) : toolActivityInfo(item)
             if (method === 'item/started') ensureActivity(turnId, itemId, { kind: 'tool', title: info.title, detail: info.detail, actionKind: info.actionKind })
             else {
               if (!itemActivity.current.has(itemId)) ensureActivity(turnId, itemId, { kind: 'tool', title: info.title, actionKind: info.actionKind })
-              updateActivity(turnId, itemActivity.current.get(itemId)!, { status: item.status === 'failed' ? 'failed' : 'done', endedAt: Date.now(), title: info.title, detail: info.detail, actionKind: info.actionKind })
-              if (item.status !== 'failed') noteCompletedTurnWork(turnId, 'tool')
+              const status = item.type === 'collabAgentToolCall' ? collabAgentActivityStatus(item) : item.status === 'failed' ? 'failed' : 'done'
+              updateActivity(turnId, itemActivity.current.get(itemId)!, { status, endedAt: status === 'running' ? undefined : Date.now(), title: info.title, detail: info.detail, actionKind: info.actionKind })
+              if (status === 'done') noteCompletedTurnWork(turnId, 'tool')
             }
             return
           }

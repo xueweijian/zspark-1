@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'vitest'
 import {
   cleanShellCommand,
+  collabAgentActivityInfo,
+  collabAgentActivityStatus,
   deletedArtifactReference,
   deletedArtifactReferenceMatchesCandidate,
   extractDeletedPathsFromCommand,
@@ -8,6 +10,7 @@ import {
   inferCommandInfo,
   normalizeActivity,
   publicActivityTitleText,
+  replayActivityFromItem,
   shortenCommand,
   timestampToMs,
   truncateActivityDetail
@@ -63,6 +66,45 @@ describe('normalizeActivity', () => {
     expect(normalizeActivity(null)).toBeNull()
     expect(normalizeActivity({ id: 1, title: 't' })).toBeNull()
     expect(normalizeActivity({ id: 'x', title: 't' })?.kind).toBe('reasoning')
+  })
+})
+
+describe('collab agent activities', () => {
+  test('summarizes spawn agent calls', () => {
+    const item = {
+      type: 'collabAgentToolCall',
+      id: 'call-1',
+      tool: 'spawnAgent',
+      status: 'completed',
+      receiverThreadIds: ['thread-1'],
+      model: 'gpt-5.4',
+      reasoningEffort: 'high',
+      prompt: 'Review the renderer path'
+    }
+
+    expect(collabAgentActivityInfo(item)).toEqual({
+      title: 'Spawned agent',
+      detail: 'Model: gpt-5.4\nReasoning: high\nAgents: 1\nPrompt: Review the renderer path',
+      actionKind: 'tool'
+    })
+    expect(collabAgentActivityStatus(item)).toBe('done')
+  })
+
+  test('replays running collab calls without ending them', () => {
+    const activity = replayActivityFromItem({
+      type: 'collabAgentToolCall',
+      id: 'call-2',
+      tool: 'wait',
+      status: 'inProgress'
+    }, 1700000000000)
+
+    expect(activity).toMatchObject({
+      kind: 'tool',
+      title: 'Waiting for agents',
+      status: 'running',
+      startedAt: 1700000000000
+    })
+    expect(activity?.endedAt).toBeUndefined()
   })
 })
 

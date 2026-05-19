@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest'
 import {
+  buildMcpServersLaunchConfig,
   buildMcpServersTomlValue,
   duplicateMcpServerNames,
   generateMcpServerId,
@@ -78,8 +79,8 @@ describe('buildMcpServersTomlValue', () => {
     ).toBe('{}')
   })
 
-  test('encodes command/args/env with TOML-safe escaping', () => {
-    const toml = buildMcpServersTomlValue([
+  test('encodes command/args/env var names with TOML-safe escaping', () => {
+    const launch = buildMcpServersLaunchConfig([
       {
         id: 'gmail',
         name: 'gmail',
@@ -89,12 +90,15 @@ describe('buildMcpServersTomlValue', () => {
         enabled: true
       }
     ])
+    const toml = launch.toml
     expect(toml).toContain('gmail = {')
     expect(toml).toContain('command = "node"')
     expect(toml).toContain('"C:\\\\bin\\\\server.js"')
     expect(toml).toContain('"flag=\\"x\\""')
-    expect(toml).toContain('GMAIL_CLIENT_ID = "cid"')
-    expect(toml).toContain('SECRET = "a\\"b"')
+    expect(toml).toContain('env_vars = ["GMAIL_CLIENT_ID", "SECRET"]')
+    expect(toml).not.toContain('cid')
+    expect(toml).not.toContain('a\\"b')
+    expect(launch.env).toEqual({ GMAIL_CLIENT_ID: 'cid', SECRET: 'a"b' })
   })
 
   test('quotes server names that are not bare TOML keys', () => {

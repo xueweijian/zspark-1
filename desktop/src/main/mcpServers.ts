@@ -16,6 +16,11 @@ export interface McpServerEntry {
   enabled: boolean
 }
 
+export interface McpServersLaunchConfig {
+  toml: string
+  env: Record<string, string>
+}
+
 const TOML_KEY_RE = /^[A-Za-z_][A-Za-z0-9_-]*$/
 
 function tomlString(s: string): string {
@@ -31,13 +36,6 @@ function tomlKey(name: string): string {
 
 function tomlArray(values: string[]): string {
   return `[${values.map(tomlString).join(', ')}]`
-}
-
-function tomlInlineTable(env: Record<string, string>): string {
-  const entries = Object.entries(env)
-    .filter(([k]) => typeof k === 'string' && k.length > 0)
-    .map(([k, v]) => `${tomlKey(k)} = ${tomlString(v)}`)
-  return `{ ${entries.join(', ')} }`
 }
 
 export function sanitizeMcpServer(raw: unknown): McpServerEntry | null {
@@ -97,16 +95,13 @@ export function duplicateMcpServerNames(entries: McpServerEntry[]): string[] {
 }
 
 /**
- * Build the TOML fragment passed to codex-rs via `-c mcp_servers=...`.
- * codex-rs accepts a single inline-table value: each key is the server
- * name (used in routing), and each value is an inline table with
- * `command`, `args`, and `env` fields.
+ * Build the MCP launch config passed to codex-rs.
  *
- * If no entries are enabled we emit an empty inline table so codex-rs
- * still parses cleanly (this is the same value the previous implementation
- * passed unconditionally).
+ * Secret values must not be embedded in `-c mcp_servers=...` because argv is
+ * visible via process listings. Instead, pass only `env_vars` names in the
+ * TOML and provide the actual values in the app-server process environment.
  */
-export function buildMcpServersTomlValue(entries: McpServerEntry[]): string {
+export function buildMcpServersLaunchConfig(entries: McpServerEntry[]): McpServersLaunchConfig {
   const active: McpServerEntry[] = []
   const seenNames = new Set<string>()
   for (const entry of entries) {
@@ -115,18 +110,38 @@ export function buildMcpServersTomlValue(entries: McpServerEntry[]): string {
     seenNames.add(entry.name)
     active.push(entry)
   }
-  if (active.length === 0) return '{}'
+  if (active.length === 0) return { toml: '{}', env: {} }
+
+  const env: Record<string, string> = {}
   const body = active
     .map((entry) => {
+      const envNames = Object.keys(entry.env).filter(Boolean)
+      for (const name of envNames) {
+        if (env[name] === undefined) env[name] = entry.env[name]
+      }
       const fields = [
         `command = ${tomlString(entry.command)}`,
         `args = ${tomlArray(entry.args)}`,
-        `env = ${tomlInlineTable(entry.env)}`
+        ...(envNames.length ? [`env_vars = ${tomlArray(envNames)}`] : [])
       ]
       return `${tomlKey(entry.name)} = { ${fields.join(', ')} }`
     })
     .join(', ')
-  return `{ ${body} }`
+  return { toml: `{ ${body} }`, env }
+}
+
+/**
+ * Build the TOML fragment passed to codex-rs via `-c mcp_servers=...`.
+ * codex-rs accepts a single inline-table value: each key is the server
+ * name (used in routing), and each value is an inline table with
+ * `command`, `args`, and `env_vars` fields.
+ *
+ * If no entries are enabled we emit an empty inline table so codex-rs
+ * still parses cleanly (this is the same value the previous implementation
+ * passed unconditionally).
+ */
+export function buildMcpServersTomlValue(entries: McpServerEntry[]): string {
+  return buildMcpServersLaunchConfig(entries).toml
 }
 
 /**

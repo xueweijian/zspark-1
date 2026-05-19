@@ -470,6 +470,47 @@ export function toolActivityInfo(item: any): ActivityInfo {
   }
 }
 
+function collabAgentToolTitle(tool: string, status?: string): string {
+  const running = status === 'inProgress'
+  switch (tool) {
+    case 'spawnAgent': return running ? 'Spawning agent' : 'Spawned agent'
+    case 'sendInput': return running ? 'Messaging agent' : 'Messaged agent'
+    case 'resumeAgent': return running ? 'Resuming agent' : 'Resumed agent'
+    case 'wait': return running ? 'Waiting for agents' : 'Waited for agents'
+    case 'closeAgent': return running ? 'Closing agent' : 'Closed agent'
+    default: return `Used ${titleizeToolName(tool)}`
+  }
+}
+
+export function collabAgentActivityStatus(item: any): Activity['status'] {
+  if (item?.status === 'failed') return 'failed'
+  if (item?.status === 'inProgress') return 'running'
+  return 'done'
+}
+
+export function collabAgentActivityInfo(item: any): ActivityInfo {
+  const tool = String(item?.tool ?? '')
+  const detailParts: string[] = []
+  const receiverThreadIds = Array.isArray(item?.receiverThreadIds) ? item.receiverThreadIds : []
+  const agentStates = item?.agentsStates && typeof item.agentsStates === 'object' ? item.agentsStates : null
+  if (item?.model) detailParts.push(`Model: ${item.model}`)
+  if (item?.reasoningEffort) detailParts.push(`Reasoning: ${item.reasoningEffort}`)
+  if (receiverThreadIds.length) detailParts.push(`Agents: ${receiverThreadIds.length}`)
+  if (agentStates) {
+    const states = Object.entries(agentStates)
+      .slice(0, 4)
+      .map(([id, state]) => `${String(id).slice(0, 8)}: ${String((state as any)?.status ?? state)}`)
+    if (states.length) detailParts.push(states.join('\n'))
+  }
+  const prompt = String(item?.prompt ?? '').trim()
+  if (prompt) detailParts.push(`Prompt: ${prompt}`)
+  return {
+    title: collabAgentToolTitle(tool, item?.status),
+    detail: truncateActivityDetail(detailParts.join('\n'), 900),
+    actionKind: 'tool'
+  }
+}
+
 export function webSearchActivityInfo(item: any): ActivityInfo {
   const query = String(item?.query ?? '').trim()
   return {
@@ -668,17 +709,20 @@ export function replayActivityFromItem(item: any, fallbackStartedAt: number): Ac
       endedAt
     }
   }
-  if (item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall') {
-    const info = toolActivityInfo(item)
+  if (item?.type === 'mcpToolCall' || item?.type === 'dynamicToolCall' || item?.type === 'collabAgentToolCall') {
+    const info = item?.type === 'collabAgentToolCall' ? collabAgentActivityInfo(item) : toolActivityInfo(item)
+    const status = item?.type === 'collabAgentToolCall'
+      ? collabAgentActivityStatus(item)
+      : item.status === 'failed' ? 'failed' : 'done'
     return {
       id: `replay-a-${id}`,
       kind: 'tool',
       title: info.title,
       detail: info.detail,
       actionKind: info.actionKind,
-      status: item.status === 'failed' ? 'failed' : 'done',
+      status,
       startedAt,
-      endedAt
+      endedAt: status === 'running' ? undefined : endedAt
     }
   }
   if (item?.type === 'webSearch') {

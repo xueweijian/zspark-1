@@ -12,7 +12,7 @@ import { importAttachmentFiles } from './attachments'
 import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
 import {
-  buildMcpServersTomlValue,
+  buildMcpServersLaunchConfig,
   duplicateMcpServerNames,
   sanitizeMcpServerList,
   type McpServerEntry
@@ -561,12 +561,13 @@ function formatCodexLogChunk(channel: 'stdout' | 'stderr', chunk: string): strin
  * trust the zspark workspace so the chat doesn't get spammed by config
  * warnings or MCP startup failures (those bundled MCPs need optional
  * platform binaries that aren't relevant inside zspark). zspark opts into
- * Codex's native memory feature so persisted memory generation/use works
- * even though the upstream feature flag is experimental and off by default.
+ * Codex's native memory and collaboration tools so product-level agent
+ * capabilities are available by default even while those upstream feature
+ * flags are experimental and off by default.
  */
 function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<string, string> } {
   const tomlString = (s: string) => `"${s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`
-  const mcpToml = buildMcpServersTomlValue(sanitizeMcpServerList(loadSettings().mcpServers))
+  const mcpConfig = buildMcpServersLaunchConfig(sanitizeMcpServerList(loadSettings().mcpServers))
   const baseArgs = [
     // Trust our own workspace so codex stops nagging about project-local
     // config every spawn. The path is whatever directory the binary
@@ -574,12 +575,15 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
     '-c', `projects.${tomlString(WORKSPACE_ROOT)}.trust_level=${tomlString('trusted')}`,
     // User-configured MCP servers, plus any built-in zspark MCP servers
     // (e.g. Gmail) that the user has enabled in Settings.
-    '-c', `mcp_servers=${mcpToml}`,
+    '-c', `mcp_servers=${mcpConfig.toml}`,
     // Keep Codex native memories available in zspark. This only enables the
     // feature gate; [memories] use/generate settings still come from config.
-    '-c', `features.memories=true`
+    '-c', `features.memories=true`,
+    // Use the compatibility collab feature so existing agents.max_threads
+    // settings keep working while spawn_agent/wait_agent tools are enabled.
+    '-c', `features.collab=true`
   ]
-  if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: baseArgs, env: {} }
+  if (!p?.baseUrl || !p?.apiKey || !p?.model) return { args: baseArgs, env: mcpConfig.env }
 
   // Decide whether to point codex at the upstream directly (Responses
   // API) or at our in-process Chat→Responses bridge.
@@ -612,7 +616,7 @@ function buildProviderArgs(p?: ProviderConfig): { args: string[]; env: Record<st
     '-c', `model_providers.zspark.env_key=${tomlString('ZSPARK_API_KEY')}`,
     '-c', `model_providers.zspark.requires_openai_auth=false`
   ]
-  return { args, env: { ZSPARK_API_KEY: effectiveKey } }
+  return { args, env: { ...mcpConfig.env, ZSPARK_API_KEY: effectiveKey } }
 }
 
 function spawnCodex() {
