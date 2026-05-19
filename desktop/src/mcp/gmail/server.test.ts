@@ -109,4 +109,57 @@ describe('Gmail MCP JSON-RPC server', () => {
     expect(messages[0].error?.message).toContain('OAuth refresh failed: 400 bad refresh')
     expect(messages[1].error).toEqual({ code: -32000, message: 'tools/call requires name' })
   })
+
+  test('coalesces concurrent OAuth refreshes', async () => {
+    let tokenRefreshes = 0
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'https://oauth2.googleapis.com/token') {
+        tokenRefreshes += 1
+        await new Promise((resolve) => setTimeout(resolve, 10))
+        return json({ access_token: 'access-token', expires_in: 3600 })
+      }
+      if (url.includes('/messages/')) {
+        return json({ id: url.split('/').pop()?.split('?')[0] ?? 'message' })
+      }
+      return text('unexpected', 500)
+    }) as typeof fetch
+    const { server } = testServer(fetchFn)
+
+    await Promise.all([
+      server.dispatchTool('mail.get', { id: 'a' }),
+      server.dispatchTool('mail.get', { id: 'b' })
+    ])
+
+    expect(tokenRefreshes).toBe(1)
+  })
+
+  test('limits parallel Gmail detail fetches for mail.list', async () => {
+    let activeDetailFetches = 0
+    let maxActiveDetailFetches = 0
+    const ids = Array.from({ length: 12 }, (_, index) => ({ id: `m-${index}` }))
+    const fetchFn = (async (input: RequestInfo | URL) => {
+      const url = String(input)
+      if (url === 'https://oauth2.googleapis.com/token') {
+        return json({ access_token: 'access-token', expires_in: 3600 })
+      }
+      if (url.includes('/messages?')) {
+        return json({ messages: ids })
+      }
+      if (url.includes('/messages/')) {
+        activeDetailFetches += 1
+        maxActiveDetailFetches = Math.max(maxActiveDetailFetches, activeDetailFetches)
+        await new Promise((resolve) => setTimeout(resolve, 5))
+        activeDetailFetches -= 1
+        return json({ id: url.split('/').pop()?.split('?')[0] ?? 'message' })
+      }
+      return text('unexpected', 500)
+    }) as typeof fetch
+    const { server } = testServer(fetchFn)
+
+    const result = await server.dispatchTool('mail.list', { max: 12 })
+
+    expect((result as any).messages).toHaveLength(12)
+    expect(maxActiveDetailFetches).toBeLessThanOrEqual(5)
+  })
 })

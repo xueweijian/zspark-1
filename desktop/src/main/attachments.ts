@@ -3,6 +3,7 @@ import {
   copyFileSync,
   existsSync,
   mkdirSync,
+  readFileSync,
   statSync,
   writeFileSync
 } from 'node:fs'
@@ -42,6 +43,7 @@ const MIME_BY_EXTENSION: Record<string, string> = {
   '.xls': 'application/vnd.ms-excel',
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 }
+const ATTACHMENTS_GITIGNORE = '*\n!.gitignore\n'
 
 export function guessMimeType(filePath: string): string {
   return MIME_BY_EXTENSION[extname(filePath).toLowerCase()] ?? 'application/octet-stream'
@@ -62,7 +64,10 @@ export function sanitizeAttachmentName(name: string): string {
 export function importAttachmentFiles(filePaths: string[], workspaceRoot: string): ImportAttachmentsResult {
   const attachmentsDir = join(workspaceRoot, '.zspark-attachments')
   mkdirSync(attachmentsDir, { recursive: true })
-  writeFileSync(join(attachmentsDir, '.gitignore'), '*\n!.gitignore\n')
+  const gitignorePath = join(attachmentsDir, '.gitignore')
+  if (!existsSync(gitignorePath) || readFileSync(gitignorePath, 'utf8') !== ATTACHMENTS_GITIGNORE) {
+    writeFileSync(gitignorePath, ATTACHMENTS_GITIGNORE)
+  }
 
   const attachments: ImportedAttachment[] = []
   const errors: string[] = []

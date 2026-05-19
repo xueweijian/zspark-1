@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react'
-import { marked } from 'marked'
+import { Marked } from 'marked'
 import DOMPurify from 'dompurify'
 import {
   IconNewChat, IconSearch, IconSkills, IconPlugins, IconAutomations,
@@ -238,6 +238,16 @@ const ZSPARK_SANDBOX_POLICY = {
   excludeSlashTmp: false
 }
 const MAX_STDOUT_BUFFER_CHARS = 2_000_000
+const MAX_SHARED_ARTIFACT_UPLOAD_KEYS = 1000
+
+let fallbackIdCounter = 0
+
+function localId(prefix: string) {
+  const uuid = globalThis.crypto?.randomUUID?.()
+  if (uuid) return `${prefix}-${uuid}`
+  fallbackIdCounter += 1
+  return `${prefix}-${Date.now().toString(36)}-${fallbackIdCounter.toString(36)}`
+}
 
 function candidateWorkspacePaths(path: string, runtime: RuntimeInfo) {
   if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) return [path]
@@ -261,7 +271,7 @@ function ActivityDuration({ startedAt, endedAt }: { startedAt: number; endedAt?:
   return <>{fmtDuration((endedAt ?? now) - startedAt)}</>
 }
 
-marked.setOptions({ gfm: true, breaks: true })
+const markdownParser = new Marked({ gfm: true, breaks: true })
 
 function secureMarkdownLinks(html: string) {
   return html.replace(/<a\s+([^>]*?)>/gi, (_match, attrs) => {
@@ -275,7 +285,7 @@ function secureMarkdownLinks(html: string) {
 function Markdown({ text }: { text: string }) {
   const html = useMemo(() => {
     const normalized = normalizeMarkdownForDisplay(text || '')
-    const sanitized = DOMPurify.sanitize(marked.parse(normalized, { async: false }) as string, {
+    const sanitized = DOMPurify.sanitize(markdownParser.parse(normalized, { async: false }) as string, {
       ADD_ATTR: ['target', 'rel'],
       // Only allow http(s)/mailto, fragments, and relative paths. The previous
       // regex was too permissive — anything whose first character was not a–z
@@ -814,7 +824,7 @@ function actIcon(k: ActivityKind) {
 
 function newMcpDraft(): McpServerView {
   return {
-    id: `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+    id: localId('mcp'),
     name: '',
     command: '',
     args: [],
@@ -1116,7 +1126,7 @@ function DesktopApp() {
   const programmaticScroll = useRef(false)
 
   const toast = (kind: ToastKind, text: string) => {
-    const id = `t-${Date.now()}-${Math.random()}`
+    const id = localId('t')
     // Cap on-screen toasts to keep the corner stack readable, and auto-dismiss
     // every kind (errors stay longer but no longer pile up forever).
     setToasts((p) => [...p, { id, kind, text }].slice(-8))
@@ -1469,6 +1479,10 @@ function DesktopApp() {
       const key = `${workspaceId}:${sessionId}:${file.path}:${file.updatedAt}`
       if (sharedArtifactUploads.current.has(key)) return file
       sharedArtifactUploads.current.add(key)
+      if (sharedArtifactUploads.current.size > MAX_SHARED_ARTIFACT_UPLOAD_KEYS) {
+        const oldest = sharedArtifactUploads.current.values().next().value
+        if (oldest) sharedArtifactUploads.current.delete(oldest)
+      }
       try {
         const result = await window.zspark.enterpriseUploadArtifact(workspaceId, sessionId, file.path, {
           name: file.name,
@@ -2852,7 +2866,7 @@ function DesktopApp() {
       const result = await window.zspark.pickAttachments()
       if (result.errors.length) toast('warn', result.errors.join('\n'))
       if (result.attachments.length) {
-        const picked = result.attachments.map((a) => ({ ...a, id: `att-${Date.now()}-${Math.random()}` }))
+        const picked = result.attachments.map((a) => ({ ...a, id: localId('att') }))
         setAttachments((prev) => [
           ...prev,
           ...picked

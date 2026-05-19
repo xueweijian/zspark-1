@@ -28,6 +28,7 @@ const PROTOCOL_VERSION = '2024-11-05'
 const TOKEN_URL = 'https://oauth2.googleapis.com/token'
 const GMAIL_BASE = 'https://gmail.googleapis.com/gmail/v1/users/me'
 const CALENDAR_BASE = 'https://www.googleapis.com/calendar/v3/calendars/primary'
+const MAIL_LIST_FETCH_CONCURRENCY = 5
 
 export interface JsonRpcRequest {
   jsonrpc: '2.0'
@@ -56,6 +57,7 @@ export function createGmailMcpServer(options: GmailMcpServerOptions = {}) {
     process.stdout.write(`${JSON.stringify(msg)}\n`)
   })
   let cachedToken: OAuthToken | null = null
+  let refreshTokenPromise: Promise<OAuthToken> | null = null
 
   function ok(id: number | string | null, result: unknown) {
     writeMessage({ jsonrpc: '2.0', id, result })
@@ -96,8 +98,29 @@ export function createGmailMcpServer(options: GmailMcpServerOptions = {}) {
 
   async function getAccessToken(): Promise<string> {
     if (tokenIsFresh(cachedToken)) return cachedToken!.accessToken
-    cachedToken = await refreshAccessToken()
+    refreshTokenPromise ??= refreshAccessToken().finally(() => {
+      refreshTokenPromise = null
+    })
+    cachedToken = await refreshTokenPromise
     return cachedToken.accessToken
+  }
+
+  async function mapWithConcurrency<T, R>(
+    values: T[],
+    concurrency: number,
+    mapper: (value: T) => Promise<R>
+  ): Promise<R[]> {
+    const results: R[] = []
+    let nextIndex = 0
+    const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+      while (nextIndex < values.length) {
+        const index = nextIndex
+        nextIndex += 1
+        results[index] = await mapper(values[index])
+      }
+    })
+    await Promise.all(workers)
+    return results
   }
 
   async function googleFetch(url: string, init: RequestInit = {}): Promise<any> {
@@ -121,10 +144,10 @@ export function createGmailMcpServer(options: GmailMcpServerOptions = {}) {
     if (params?.query) search.set('q', params.query)
     const list: any = await googleFetch(`${GMAIL_BASE}/messages?${search.toString()}`)
     const ids: string[] = Array.isArray(list?.messages) ? list.messages.map((m: any) => m.id).filter(Boolean) : []
-    const messages = await Promise.all(ids.map(async (id) => {
+    const messages = await mapWithConcurrency(ids, MAIL_LIST_FETCH_CONCURRENCY, async (id) => {
       const detail = await googleFetch(`${GMAIL_BASE}/messages/${encodeURIComponent(id)}?format=full`)
       return parseGmailMessage(detail)
-    }))
+    })
     return { messages: messages.filter(Boolean) }
   }
 

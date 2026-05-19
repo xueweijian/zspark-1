@@ -435,7 +435,7 @@ function sanitizeResponsesInputForUpstream(payload: any): { payload: any; change
   return changed ? { payload: { ...payload, input: sanitized }, changed: true } : { payload, changed: false }
 }
 
-const MAX_RESPONSES_RETRY_ATTEMPTS = 16
+const MAX_RESPONSES_RETRY_ATTEMPTS = 4
 
 function sendResponsesRequest(
   cfg: UpstreamConfig,

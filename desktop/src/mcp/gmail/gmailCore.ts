@@ -3,6 +3,8 @@
  * (network, fs) live in server.ts; everything here is testable with vitest.
  */
 
+import { randomUUID } from 'node:crypto'
+
 export interface OAuthToken {
   accessToken: string
   refreshToken?: string
@@ -182,7 +184,7 @@ export function buildCalendarEventPayload(input: CalendarEventInput) {
     ...(input.conference === 'meet' ? {
       conferenceData: {
         createRequest: {
-          requestId: `zspark-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          requestId: `zspark-${randomUUID()}`,
           conferenceSolutionKey: { type: 'hangoutsMeet' }
         }
       }

@@ -3,6 +3,7 @@
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 const REFRESH_SKEW_MS = 6e4;
 const GMAIL_MESSAGE_BODY_LIMIT = 16e3;
 const EMAIL_RE = /^[^\s@<>(),;:"]+@[^\s@<>(),;:"]+\.[^\s@<>(),;:"]+$/;
@@ -118,7 +119,7 @@ function buildCalendarEventPayload(input) {
     ...input.conference === "meet" ? {
       conferenceData: {
         createRequest: {
-          requestId: `zspark-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          requestId: `zspark-${randomUUID()}`,
           conferenceSolutionKey: { type: "hangoutsMeet" }
         }
       }
@@ -194,6 +195,7 @@ const PROTOCOL_VERSION = "2024-11-05";
 const TOKEN_URL = "https://oauth2.googleapis.com/token";
 const GMAIL_BASE = "https://gmail.googleapis.com/gmail/v1/users/me";
 const CALENDAR_BASE = "https://www.googleapis.com/calendar/v3/calendars/primary";
+const MAIL_LIST_FETCH_CONCURRENCY = 5;
 function createGmailMcpServer(options = {}) {
   const env = options.env ?? process.env;
   const fetchFn = options.fetchFn ?? fetch;
@@ -202,6 +204,7 @@ function createGmailMcpServer(options = {}) {
 `);
   });
   let cachedToken = null;
+  let refreshTokenPromise = null;
   function ok(id, result) {
     writeMessage({ jsonrpc: "2.0", id, result });
   }
@@ -238,8 +241,24 @@ function createGmailMcpServer(options = {}) {
   }
   async function getAccessToken() {
     if (tokenIsFresh(cachedToken)) return cachedToken.accessToken;
-    cachedToken = await refreshAccessToken();
+    refreshTokenPromise ??= refreshAccessToken().finally(() => {
+      refreshTokenPromise = null;
+    });
+    cachedToken = await refreshTokenPromise;
     return cachedToken.accessToken;
+  }
+  async function mapWithConcurrency(values, concurrency, mapper) {
+    const results = [];
+    let nextIndex = 0;
+    const workers = Array.from({ length: Math.min(concurrency, values.length) }, async () => {
+      while (nextIndex < values.length) {
+        const index = nextIndex;
+        nextIndex += 1;
+        results[index] = await mapper(values[index]);
+      }
+    });
+    await Promise.all(workers);
+    return results;
   }
   async function googleFetch(url, init = {}) {
     const token = await getAccessToken();
@@ -261,10 +280,10 @@ function createGmailMcpServer(options = {}) {
     if (params?.query) search.set("q", params.query);
     const list = await googleFetch(`${GMAIL_BASE}/messages?${search.toString()}`);
     const ids = Array.isArray(list?.messages) ? list.messages.map((m) => m.id).filter(Boolean) : [];
-    const messages = await Promise.all(ids.map(async (id) => {
+    const messages = await mapWithConcurrency(ids, MAIL_LIST_FETCH_CONCURRENCY, async (id) => {
       const detail = await googleFetch(`${GMAIL_BASE}/messages/${encodeURIComponent(id)}?format=full`);
       return parseGmailMessage(detail);
-    }));
+    });
     return { messages: messages.filter(Boolean) };
   }
   async function callMailGet(params) {

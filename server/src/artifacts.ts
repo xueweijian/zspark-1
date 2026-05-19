@@ -10,6 +10,9 @@ import { canAccessWorkspace } from './workspaces.js'
 
 const MAX_ARTIFACT_BYTES = 50 * 1024 * 1024
 const MAX_ARTIFACT_BODY_BYTES = 70 * 1024 * 1024
+const MIME_TYPE_RE = /^(?:application|audio|font|image|message|model|multipart|text|video)\/[A-Za-z0-9!#$&^_.+-]+(?:\s*;\s*[A-Za-z0-9!#$&^_.+-]+=(?:[A-Za-z0-9!#$&^_.+-]+|"[^"\r\n]*"))*$/i
+const OCTET_STREAM = 'application/octet-stream'
+const DANGEROUS_DOWNLOAD_MIME_TYPES = new Set(['application/xhtml+xml', 'image/svg+xml', 'text/html'])
 
 interface ArtifactEnv {
   ZSPARK_ARTIFACT_STORAGE_DIR?: string
@@ -33,6 +36,16 @@ const BASE64_RE = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=
 
 function safeFileName(name: string) {
   return name.replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').slice(0, 180) || 'artifact'
+}
+
+function safeMimeType(value: unknown) {
+  if (typeof value !== 'string') return OCTET_STREAM
+  const mimeType = value.trim()
+  if (!mimeType || mimeType.length > 200 || /[\r\n]/.test(mimeType) || !MIME_TYPE_RE.test(mimeType)) {
+    return OCTET_STREAM
+  }
+  const essence = mimeType.split(';', 1)[0].toLowerCase()
+  return DANGEROUS_DOWNLOAD_MIME_TYPES.has(essence) ? OCTET_STREAM : mimeType
 }
 
 function storageRoot(env: ArtifactEnv) {
@@ -62,7 +75,7 @@ function artifactMetadata(row: any) {
     workspace_id: row.workspace_id,
     session_id: row.session_id,
     name: row.name,
-    mime_type: row.mime_type,
+    mime_type: safeMimeType(row.mime_type),
     size_bytes: row.size_bytes,
     sha256: row.sha256,
     local_path: row.local_path,
@@ -149,7 +162,7 @@ export async function registerArtifactRoutes(app: FastifyInstance, env: Artifact
           sessionId,
           displayPrincipal(req),
           name,
-          body.mimeType?.trim() || null,
+          safeMimeType(body.mimeType),
           content.length,
           sha256,
           body.localPath || null,
@@ -186,7 +199,7 @@ export async function registerArtifactRoutes(app: FastifyInstance, env: Artifact
     const row = result.rows[0]
     const fileName = safeFileName(row.name)
     const response = reply
-      .header('content-type', row.mime_type || 'application/octet-stream')
+      .header('content-type', safeMimeType(row.mime_type))
       .header('content-disposition', `attachment; filename="${fileName}"`)
     if (row.storage_path) {
       const filePath = resolve(row.storage_path)

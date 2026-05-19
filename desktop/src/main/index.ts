@@ -4,6 +4,7 @@ import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
 import { copyFileSync, existsSync, mkdirSync, openSync, fsyncSync, closeSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync, realpathSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { PublicClientApplication } from '@azure/msal-node'
@@ -96,7 +97,13 @@ ensureWorkspaceRoot(WORKSPACE_ROOT)
 
 function loadSettings(): AppSettings {
   try {
-    const raw = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
+    const parsed = JSON.parse(readFileSync(SETTINGS_PATH, 'utf8'))
+    const source = parsed && typeof parsed === 'object' ? parsed : {}
+    const raw: any = {
+      ...source,
+      provider: source.provider && typeof source.provider === 'object' ? { ...source.provider } : source.provider,
+      enterpriseAuth: source.enterpriseAuth && typeof source.enterpriseAuth === 'object' ? { ...source.enterpriseAuth } : source.enterpriseAuth
+    }
     settingsLoadIssue = null
     if (raw?.provider?.encryptedApiKey && settingsEncryptionAvailable()) {
       raw.provider.apiKey = safeStorage.decryptString(Buffer.from(raw.provider.encryptedApiKey, 'base64'))
@@ -724,7 +731,8 @@ function createWindow() {
     webPreferences: {
       preload: join(__dirname, '..', 'preload', 'index.js'),
       contextIsolation: true,
-      sandbox: false
+      nodeIntegration: false,
+      sandbox: true
     }
   })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
@@ -919,7 +927,7 @@ ipcMain.handle('enterprise:artifacts', (_e, workspaceId: string, sessionId: stri
   enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts`)
 ))
 
-ipcMain.handle('enterprise:uploadArtifact', (_e, workspaceId: string, sessionId: string, filePath: string, meta: any = {}) => {
+ipcMain.handle('enterprise:uploadArtifact', async (_e, workspaceId: string, sessionId: string, filePath: string, meta: any = {}) => {
   try {
     if (!filePath) return { ok: false, error: 'Missing file path' }
     const safePath = resolveAllowedLocalPath(filePath)
@@ -929,7 +937,7 @@ ipcMain.handle('enterprise:uploadArtifact', (_e, workspaceId: string, sessionId:
     if (stat.size > MAX_ARTIFACT_UPLOAD_BYTES) {
       return { ok: false, error: `File exceeds the ${Math.round(MAX_ARTIFACT_UPLOAD_BYTES / (1024 * 1024))} MB upload limit` }
     }
-    const content = readFileSync(safePath)
+    const content = await readFile(safePath)
     return enterpriseRequest(`/workspaces/${encodeURIComponent(workspaceId)}/sessions/${encodeURIComponent(sessionId)}/artifacts`, {
       method: 'POST',
       body: JSON.stringify({

@@ -86,9 +86,33 @@ const ApprovalRequestSchema = z.object({
 
 const TurnBlockStatusSchema = z.enum(['running', 'completed', 'interrupted', 'failed'])
 
-const TurnInputItemSchema = z.object({
-  type: z.enum(['text', 'image', 'localImage', 'skill', 'mention'])
-}).passthrough()
+const TurnInputTextElementSchema = z.unknown()
+const TurnInputItemSchema = z.discriminatedUnion('type', [
+  z.object({
+    type: z.literal('text'),
+    text: z.string().max(200_000),
+    textElements: z.array(TurnInputTextElementSchema).max(200).optional(),
+    text_elements: z.array(TurnInputTextElementSchema).max(200).optional()
+  }).strict(),
+  z.object({
+    type: z.literal('image'),
+    url: z.string().max(4000)
+  }).strict(),
+  z.object({
+    type: z.literal('localImage'),
+    path: z.string().max(1400)
+  }).strict(),
+  z.object({
+    type: z.literal('skill'),
+    name: z.string().max(240),
+    path: z.string().max(1400)
+  }).strict(),
+  z.object({
+    type: z.literal('mention'),
+    name: z.string().max(240),
+    path: z.string().max(1400)
+  }).strict()
+])
 
 const SnapshotBlockSchema = z.discriminatedUnion('type', [
   z.object({

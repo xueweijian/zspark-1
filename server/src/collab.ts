@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify'
 import * as Y from 'yjs'
-import { setupWSConnection } from './yws.js'
+import { destroyDocConnectionState, setupWSConnection } from './yws.js'
 import { canAccessWorkspace } from './workspaces.js'
 
 interface RoomEntry {
@@ -49,7 +49,7 @@ export async function registerCollabRoutes(app: FastifyInstance) {
         if (!entry || entry.doc !== doc || entry.destroyed) return
         entry.destroyed = true
         docs.delete(room)
-        ;(doc as any)._zsparkAwareness?.destroy?.()
+        destroyDocConnectionState(doc)
         doc.destroy()
       }
     })

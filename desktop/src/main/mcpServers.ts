@@ -6,6 +6,7 @@
  * id) so the renderer can CRUD without the main process having to mutate
  * existing records in place.
  */
+import { randomUUID } from 'node:crypto'
 
 export interface McpServerEntry {
   id: string
@@ -170,5 +171,5 @@ export function buildMcpServersTomlValue(entries: McpServerEntry[]): string {
  * just needs to avoid collisions inside one settings file.
  */
 export function generateMcpServerId(): string {
-  return `mcp-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+  return `mcp-${randomUUID()}`
 }

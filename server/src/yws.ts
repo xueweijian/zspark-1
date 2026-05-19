@@ -12,25 +12,51 @@ const wsOpen = 1
 interface ConnOpts { doc: Y.Doc; gc?: boolean; onEmpty?: () => void }
 
 type ConnMap = Map<WebSocket, Set<number>>
+interface DocConnectionState {
+  awareness: awarenessProtocol.Awareness
+  conns: ConnMap
+  updateHandlerInstalled: boolean
+  awarenessHandlerInstalled: boolean
+}
+
+const docConnectionStates = new WeakMap<Y.Doc, DocConnectionState>()
+
+function connectionStateForDoc(doc: Y.Doc): DocConnectionState {
+  let state = docConnectionStates.get(doc)
+  if (!state) {
+    state = {
+      awareness: new awarenessProtocol.Awareness(doc),
+      conns: new Map(),
+      updateHandlerInstalled: false,
+      awarenessHandlerInstalled: false
+    }
+    docConnectionStates.set(doc, state)
+  }
+  return state
+}
+
+export function destroyDocConnectionState(doc: Y.Doc) {
+  const state = docConnectionStates.get(doc)
+  state?.awareness.destroy()
+  docConnectionStates.delete(doc)
+}
 
 export function setupWSConnection(ws: WebSocket, _req: IncomingMessage, { doc, onEmpty }: ConnOpts) {
-  const awareness = (doc as any)._zsparkAwareness ?? new awarenessProtocol.Awareness(doc)
-  ;(doc as any)._zsparkAwareness = awareness
-  const conns: ConnMap = (doc as any)._zsparkConns ?? new Map()
-  ;(doc as any)._zsparkConns = conns
+  const state = connectionStateForDoc(doc)
+  const { awareness, conns } = state
 
-  if (!(doc as any)._zsparkUpdateHandler) {
+  if (!state.updateHandlerInstalled) {
     const updateHandler = (update: Uint8Array, origin: unknown) => {
       const encoder = encoding.createEncoder()
       encoding.writeVarUint(encoder, messageSync)
       syncProtocol.writeUpdate(encoder, update)
       broadcast(conns, encoding.toUint8Array(encoder), origin)
     }
-    ;(doc as any)._zsparkUpdateHandler = updateHandler
+    state.updateHandlerInstalled = true
     doc.on('update', updateHandler)
   }
 
-  if (!(doc as any)._zsparkAwarenessHandler) {
+  if (!state.awarenessHandlerInstalled) {
     const awarenessHandler = ({ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] }, origin: unknown) => {
       const controlledIds = conns.get(origin as WebSocket)
       if (controlledIds) {
@@ -43,7 +69,7 @@ export function setupWSConnection(ws: WebSocket, _req: IncomingMessage, { doc, o
       encoding.writeVarUint8Array(encoder, awarenessProtocol.encodeAwarenessUpdate(awareness, changed))
       broadcast(conns, encoding.toUint8Array(encoder), origin)
     }
-    ;(doc as any)._zsparkAwarenessHandler = awarenessHandler
+    state.awarenessHandlerInstalled = true
     awareness.on('update', awarenessHandler)
   }
 

@@ -20,6 +20,14 @@ import {
 } from './appHelpers'
 
 export const ACTIVITY_STORAGE_PREFIX = 'zspark:activity:v1:'
+let fallbackReplayIdCounter = 0
+
+function replayFallbackId() {
+  const uuid = globalThis.crypto?.randomUUID?.()
+  if (uuid) return `replay-${uuid}`
+  fallbackReplayIdCounter += 1
+  return `replay-${Date.now().toString(36)}-${fallbackReplayIdCounter.toString(36)}`
+}
 
 export function activityStorageKey(threadId: string): string {
   return `${ACTIVITY_STORAGE_PREFIX}${threadId}`
@@ -601,14 +609,19 @@ export function displayActivities(activities: Activity[]): Array<Activity & { di
       previous.status === activity.status &&
       previous.kind === activity.kind
     ) {
-      previous.repeatCount += 1
-      previous.endedAt = activity.endedAt ?? previous.endedAt
       const existingDetail = previous.detail?.trim()
       const nextDetail = activity.detail?.trim()
+      let detail = previous.detail
       if (nextDetail && !existingDetail) {
-        previous.detail = nextDetail
+        detail = nextDetail
       } else if (nextDetail && existingDetail && !existingDetail.includes(nextDetail)) {
-        previous.detail = `${existingDetail}\n\n${nextDetail}`
+        detail = `${existingDetail}\n\n${nextDetail}`
+      }
+      visible[visible.length - 1] = {
+        ...previous,
+        repeatCount: previous.repeatCount + 1,
+        endedAt: activity.endedAt ?? previous.endedAt,
+        detail
       }
       continue
     }
@@ -670,7 +683,7 @@ export function memoryCitationDetail(citation?: MemoryCitation | null): string |
 }
 
 export function replayActivityFromItem(item: any, fallbackStartedAt: number): Activity | undefined {
-  const id = String(item?.id ?? `replay-${Math.random()}`)
+  const id = String(item?.id ?? replayFallbackId())
   const startedAt = itemTimeMs(item, 'startedAtMs', fallbackStartedAt)
   const endedAt = itemTimeMs(item, 'completedAtMs', startedAt)
   if (item?.type === 'reasoning') {

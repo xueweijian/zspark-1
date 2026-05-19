@@ -19,7 +19,12 @@ function numberEnv(value: string | undefined, fallback: number) {
 }
 
 function requestKey(req: FastifyRequest) {
-  return String((req as any).oid ?? (req as any).principal ?? req.ip)
+  const oid = (req as any).oid
+  if (oid) return `oid:${oid}`
+  const principal = (req as any).principal
+  if (principal) return `principal:${String(principal).toLowerCase()}`
+  const userAgent = String(req.headers['user-agent'] ?? 'unknown').slice(0, 120)
+  return `anonymous:${req.ip}:${requestPath(req.url)}:${userAgent}`
 }
 
 function requestWeight(req: FastifyRequest) {
