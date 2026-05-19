@@ -37,6 +37,7 @@ function isArtifactFile(path: string) {
 }
 
 function isScratchArtifact(workspaceRoot: string, path: string) {
+  if (basename(path).toLowerCase() === 'contact-sheet.png') return true
   const segments = relative(join(workspaceRoot, 'outputs'), path).split(sep)
   return segments.some((segment) => SCRATCH_SEGMENTS.has(segment))
 }

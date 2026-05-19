@@ -20,6 +20,7 @@ import { normalizeMarkdownForDisplay } from './markdown'
 import { clearDisplayedArtifactRevisions, rememberDisplayedArtifactRevisions, shouldDisplayScannedArtifact } from './artifactDisplay'
 import {
   dirname,
+  extractDisplayableArtifactPathCandidates,
   extractArtifactPathCandidates,
   findRecentArtifactForCandidate,
   isDisplayableArtifactPath,
@@ -1549,6 +1550,61 @@ function DesktopApp() {
       : [...sourceWithoutResolvedMissing, block]
   }
 
+  const candidateCommandOutputPaths = (path: string, commandCwd?: string) => {
+    if (path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)) return [path]
+    const bases = [commandCwd, runtimeRef.current.cwd, runtimeRef.current.workspaceRoot]
+      .filter((base): base is string => Boolean(base))
+    const candidates = bases.length ? bases.map((base) => resolveWorkspacePath(path, base)) : [path]
+    const seen = new Set<string>()
+    return candidates.filter((candidate) => {
+      const key = candidate.replace(/\\/g, '/').toLowerCase()
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+  }
+
+  const captureCommandOutputArtifacts = async (
+    turnId: string,
+    itemId: string,
+    output: string,
+    commandCwd?: string
+  ) => {
+    const candidates = extractDisplayableArtifactPathCandidates(output).slice(0, 16)
+    if (!candidates.length) return
+
+    const now = Date.now()
+    const files: WorkspaceFile[] = []
+    const seen = new Set<string>()
+    for (const candidate of candidates) {
+      for (const path of candidateCommandOutputPaths(candidate, commandCwd)) {
+        const key = path.replace(/\\/g, '/').toLowerCase()
+        if (seen.has(key)) break
+        const stat = await window.zspark.statPath(path)
+        if (!stat.exists || !stat.isFile) continue
+        seen.add(key)
+        files.push({
+          id: `command-output-${itemId}-${files.length}-${stat.mtimeMs ?? now}`,
+          name: basename(path),
+          path,
+          source: 'change',
+          status: 'created',
+          detail: `Captured from command output${stat.size ? ` (${fmtBytes(stat.size)})` : ''}`,
+          updatedAt: stat.mtimeMs ?? now
+        })
+        break
+      }
+    }
+    if (!files.length) return
+
+    const uploadedFiles = await uploadSharedArtifacts(files, turnId)
+    upsertWorkspaceFiles(uploadedFiles)
+    upsertArtifactBlock(turnId, `command-output-${itemId}`, uploadedFiles, {
+      title: `${uploadedFiles.length} generated artifact${uploadedFiles.length === 1 ? '' : 's'} ready`,
+      subtitle: 'Captured from command output'
+    })
+  }
+
   const refreshSharedArtifactsForActiveSession = async (showErrors = false) => {
     const workspaceId = activeSharedWorkspaceRef.current
     const sessionId = activeSharedSessionRef.current
@@ -1576,7 +1632,7 @@ function DesktopApp() {
     try {
       const result = await window.zspark.scanRecentArtifacts({
         sinceMs: Math.max(0, startedAt - 2000),
-        limit: 8
+        limit: 48
       })
       let files: WorkspaceFile[] = result.artifacts
         .filter((artifact) => shouldDisplayScannedArtifact(artifact, shownArtifactRevisions.current))
@@ -2384,6 +2440,7 @@ function DesktopApp() {
                 for (const deleted of extractDeletedPathsFromCommand(item)) {
                   rememberDeletedArtifact(turnId, deleted)
                 }
+                void captureCommandOutputArtifacts(turnId, itemId, output, typeof item.cwd === 'string' ? item.cwd : undefined)
               }
             }
             return

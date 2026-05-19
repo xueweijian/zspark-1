@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'vitest'
 import {
   dirname,
+  extractDisplayableArtifactPathCandidates,
   extractArtifactPathCandidates,
   findRecentArtifactForCandidate,
   isDisplayableArtifactPath,
@@ -52,6 +53,33 @@ describe('artifact helpers', () => {
     expect(isDisplayableArtifactPath('/repo/outputs/run/presentations/demo/slides/slide-01.mjs')).toBe(false)
     expect(isDisplayableArtifactPath('/repo/outputs/run/presentations/demo/preview/slide-01.png')).toBe(false)
     expect(isDisplayableArtifactPath('https://example.com/final.pptx')).toBe(false)
+  })
+
+  test('extracts command-output artifacts without preview scratch files', () => {
+    const output = JSON.stringify({
+      output: '/repo/outputs/run/presentations/demo/output/final.pptx',
+      previewPaths: [
+        '/repo/outputs/run/presentations/demo/preview/slide-01.png',
+        '/repo/outputs/run/presentations/demo/preview/slide-02.png'
+      ],
+      contactSheet: '/repo/outputs/run/presentations/demo/qa/contact-sheet.png'
+    }, null, 2)
+
+    expect(extractDisplayableArtifactPathCandidates(output)).toEqual([
+      '/repo/outputs/run/presentations/demo/output/final.pptx'
+    ])
+  })
+
+  test('prioritizes Office-style deliverables over displayable images', () => {
+    const output = [
+      'Image: /repo/outputs/run/gallery/final.png',
+      'Deck: /repo/outputs/run/presentations/demo/output/final.pptx'
+    ].join('\n')
+
+    expect(extractDisplayableArtifactPathCandidates(output)).toEqual([
+      '/repo/outputs/run/presentations/demo/output/final.pptx',
+      '/repo/outputs/run/gallery/final.png'
+    ])
   })
 
 })

@@ -1,5 +1,6 @@
 const ARTIFACT_EXTENSION_RE = /\.(pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip)\b/i
 const PATH_TOKEN_RE = /`([^`\n\r]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))`|["']([^"'\n\r]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))["']|([^\s`"'<>()[\]{}，。；：、]+\.(?:pptx|ppt|docx|doc|xlsx|xls|csv|pdf|png|jpe?g|webp|zip))/gi
+const PRIMARY_ARTIFACT_EXTENSION_RE = /\.(pptx|ppt|docx|doc|xlsx|xls|csv|pdf|zip)\b/i
 const SCRATCH_ARTIFACT_SEGMENTS = new Set(['assets', 'layout', 'preview', 'qa', 'slides'])
 
 export interface RecentArtifactLike {
@@ -33,6 +34,20 @@ export function extractArtifactPathCandidates(text: string): string[] {
   return result
 }
 
+function artifactDisplayRank(path: string) {
+  return PRIMARY_ARTIFACT_EXTENSION_RE.test(path) ? 0 : 1
+}
+
+export function sortArtifactPathCandidatesForDisplay(paths: string[]) {
+  return [...paths].sort((a, b) => artifactDisplayRank(a) - artifactDisplayRank(b))
+}
+
+export function extractDisplayableArtifactPathCandidates(text: string): string[] {
+  return sortArtifactPathCandidatesForDisplay(
+    extractArtifactPathCandidates(text).filter((candidate) => isDisplayableArtifactPath(candidate, true))
+  )
+}
+
 export function isAbsolutePath(path: string) {
   return path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path)
 }
@@ -46,11 +61,11 @@ function normalizeArtifactPath(path: string) {
   return stripTrailingPunctuation(path.trim()).replace(/\\/g, '/').replace(/\/+/g, '/')
 }
 
-export function isDisplayableArtifactPath(path: string) {
+export function isDisplayableArtifactPath(path: string, allowBareName = false) {
   const trimmed = stripTrailingPunctuation(path.trim())
   if (/^https?:\/\//i.test(trimmed)) return false
   const normalized = normalizeArtifactPath(trimmed)
-  if (!looksLikeWorkspaceArtifact(normalized)) return false
+  if (!looksLikeWorkspaceArtifact(normalized, allowBareName)) return false
   const segments = normalized.split('/').filter(Boolean)
   return !segments.some((segment) => SCRATCH_ARTIFACT_SEGMENTS.has(segment))
 }
