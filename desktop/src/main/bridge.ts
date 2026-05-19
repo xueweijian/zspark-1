@@ -53,10 +53,34 @@ interface UpstreamConfig {
   mode?: 'chat' | 'responses'
 }
 
+export interface BridgeDiagnosticEvent {
+  kind: 'responses_passthrough_failed' | 'responses_passthrough_http_error' | 'responses_passthrough_network_error'
+  mode: 'responses'
+  path: string
+  stream: boolean
+  attempt: number
+  status?: number
+  requestId?: string
+  error?: {
+    type?: string
+    code?: string | null
+    message?: string
+  }
+  responseId?: string
+}
+
+type BridgeDiagnosticLogger = (event: BridgeDiagnosticEvent) => void
+
 let upstream: UpstreamConfig | null = null
 export function setUpstream(cfg: UpstreamConfig | null) { upstream = cfg }
 
+let bridgeDiagnosticsLogger: BridgeDiagnosticLogger | null = null
+export function setBridgeDiagnosticsLogger(logger: BridgeDiagnosticLogger | null) {
+  bridgeDiagnosticsLogger = logger
+}
+
 const UPSTREAM_TIMEOUT_MS = 120_000
+const MAX_DIAGNOSTIC_MESSAGE_CHARS = 2_000
 
 function isAuthorized(req: IncomingMessage, authToken?: string): boolean {
   if (!authToken) return true
@@ -161,6 +185,90 @@ function writeJsonError(res: ServerResponse, statusCode: number, message: string
   if (!responseWritable(res)) return
   res.writeHead(statusCode, responseHeaders(false))
   endIfOpen(res, JSON.stringify({ error: { message } }))
+}
+
+function truncateDiagnosticMessage(value: string) {
+  return value.length > MAX_DIAGNOSTIC_MESSAGE_CHARS
+    ? `${value.slice(0, MAX_DIAGNOSTIC_MESSAGE_CHARS)}...`
+    : value
+}
+
+function diagnosticString(value: unknown): string | undefined {
+  if (typeof value === 'string') return truncateDiagnosticMessage(value)
+  if (value === null || value === undefined) return undefined
+  return truncateDiagnosticMessage(String(value))
+}
+
+function diagnosticError(value: unknown): BridgeDiagnosticEvent['error'] | undefined {
+  if (!value || typeof value !== 'object') {
+    const message = diagnosticString(value)
+    return message ? { message } : undefined
+  }
+  const error = value as Record<string, unknown>
+  const out: NonNullable<BridgeDiagnosticEvent['error']> = {}
+  const type = diagnosticString(error.type)
+  const code = error.code === null ? null : diagnosticString(error.code)
+  const message = diagnosticString(error.message)
+  if (type) out.type = type
+  if (code !== undefined) out.code = code
+  if (message) out.message = message
+  return Object.keys(out).length ? out : undefined
+}
+
+function diagnosticRequestId(headers: ClientResponse['headers']) {
+  for (const name of ['x-request-id', 'apim-request-id', 'x-ms-request-id', 'request-id']) {
+    const value = headers[name]
+    if (typeof value === 'string' && value) return value
+    if (Array.isArray(value) && value[0]) return value[0]
+  }
+  return undefined
+}
+
+function emitBridgeDiagnostic(event: BridgeDiagnosticEvent) {
+  try { bridgeDiagnosticsLogger?.(event) } catch {}
+}
+
+function diagnosticErrorFromJsonText(raw: string) {
+  try {
+    const parsed = JSON.parse(raw)
+    return diagnosticError(parsed?.error ?? parsed?.response?.error)
+  } catch {
+    return undefined
+  }
+}
+
+function parseSseResponseFailedFrame(frame: string) {
+  let eventName = ''
+  const dataLines: string[] = []
+  for (const line of frame.split(/\r?\n/)) {
+    if (line.startsWith('event:')) eventName = line.slice('event:'.length).trim()
+    else if (line.startsWith('data:')) dataLines.push(line.slice('data:'.length).trimStart())
+  }
+  const data = dataLines.join('\n').trim()
+  if (!data || data === '[DONE]') return null
+  let parsed: any
+  try { parsed = JSON.parse(data) } catch { return null }
+  if (eventName !== 'response.failed' && parsed?.type !== 'response.failed') return null
+  return {
+    responseId: diagnosticString(parsed?.response?.id ?? parsed?.id),
+    error: diagnosticError(parsed?.response?.error ?? parsed?.error)
+  }
+}
+
+function drainSseFrames(buffer: string, final: boolean, onFrame: (frame: string) => void) {
+  let pending = buffer
+  while (true) {
+    const match = /\r?\n\r?\n/.exec(pending)
+    if (!match) break
+    const frame = pending.slice(0, match.index)
+    pending = pending.slice(match.index + match[0].length)
+    if (frame.trim()) onFrame(frame)
+  }
+  if (final && pending.trim()) {
+    onFrame(pending)
+    return ''
+  }
+  return pending
 }
 
 
@@ -475,6 +583,7 @@ async function handleResponsesPassthrough(
 ) {
   // Sniff the original payload once. We only ever rebuild it when we have
   // to retry after a 400 reasoning-orphan rejection.
+  const upstreamPath = buildUpstreamUrl(cfg.baseUrl, RESPONSES_SUFFIX).pathname
   let payload: any = null
   let stream = false
   try {
@@ -532,6 +641,16 @@ async function handleResponsesPassthrough(
                 return
               }
             }
+            emitBridgeDiagnostic({
+              kind: 'responses_passthrough_http_error',
+              mode: 'responses',
+              path: upstreamPath,
+              stream,
+              attempt: attemptIndex,
+              status,
+              requestId: diagnosticRequestId(upstreamRes.headers),
+              error: diagnosticErrorFromJsonText(raw)
+            })
             // Couldn't recover — forward the original 400 verbatim.
             if (responseWritable(res)) {
               res.writeHead(status, upstreamRes.headers as any)
@@ -543,9 +662,62 @@ async function handleResponsesPassthrough(
           })
           return
         }
+        if (status >= 400) {
+          emitBridgeDiagnostic({
+            kind: 'responses_passthrough_http_error',
+            mode: 'responses',
+            path: upstreamPath,
+            stream,
+            attempt: attemptIndex,
+            status,
+            requestId: diagnosticRequestId(upstreamRes.headers)
+          })
+        }
         if (responseWritable(res)) {
           res.writeHead(status, upstreamRes.headers as any)
-          upstreamRes.pipe(res)
+          const contentType = String(upstreamRes.headers['content-type'] ?? '').toLowerCase()
+          if (stream && status < 400 && contentType.includes('text/event-stream')) {
+            const decoder = new StringDecoder('utf8')
+            let sseBuffer = ''
+            let ended = false
+            const inspectFrame = (frame: string) => {
+              const failed = parseSseResponseFailedFrame(frame)
+              if (!failed) return
+              emitBridgeDiagnostic({
+                kind: 'responses_passthrough_failed',
+                mode: 'responses',
+                path: upstreamPath,
+                stream,
+                attempt: attemptIndex,
+                status,
+                requestId: diagnosticRequestId(upstreamRes.headers),
+                responseId: failed.responseId,
+                error: failed.error
+              })
+            }
+            upstreamRes.on('data', (chunk: Buffer) => {
+              sseBuffer = drainSseFrames(sseBuffer + decoder.write(chunk), false, inspectFrame)
+              if (!writeIfOpen(res, chunk)) {
+                upstreamRes.pause()
+                res.once('drain', () => {
+                  if (responseWritable(res)) upstreamRes.resume()
+                })
+              }
+            })
+            upstreamRes.on('end', () => {
+              ended = true
+              sseBuffer = drainSseFrames(sseBuffer + decoder.end(), true, inspectFrame)
+              endIfOpen(res)
+            })
+            upstreamRes.on('error', () => {
+              endIfOpen(res)
+            })
+            upstreamRes.on('close', () => {
+              if (!ended) endIfOpen(res)
+            })
+          } else {
+            upstreamRes.pipe(res)
+          }
         } else {
           upstreamRes.resume()
         }
@@ -554,6 +726,14 @@ async function handleResponsesPassthrough(
         if (activeAttempt !== attemptToken) return
         upstreamDone = true
         if (String(err.message).includes('downstream closed')) return
+        emitBridgeDiagnostic({
+          kind: 'responses_passthrough_network_error',
+          mode: 'responses',
+          path: upstreamPath,
+          stream,
+          attempt: attemptIndex,
+          error: { message: err.message }
+        })
         if (responseWritable(res)) {
           writeJsonError(res, 502, `upstream error: ${err.message}`)
         }

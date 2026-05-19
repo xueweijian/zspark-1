@@ -3,14 +3,14 @@ import type { OpenDialogOptions } from 'electron'
 import { randomBytes } from 'node:crypto'
 import { spawn, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { basename, delimiter, dirname, join, resolve } from 'node:path'
-import { copyFileSync, existsSync, mkdirSync, openSync, fsyncSync, closeSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync, realpathSync } from 'node:fs'
+import { appendFileSync, copyFileSync, existsSync, mkdirSync, openSync, fsyncSync, closeSync, readFileSync, writeFileSync, createWriteStream, WriteStream, statSync, renameSync, realpathSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { PublicClientApplication } from '@azure/msal-node'
 import { scanRecentArtifacts } from './artifacts'
 import { importAttachmentFiles } from './attachments'
-import { startBridge, setUpstream } from './bridge'
+import { startBridge, setBridgeDiagnosticsLogger, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
 import {
   buildMcpServersLaunchConfig,
@@ -82,6 +82,7 @@ const DEFAULT_ENTRA_AUTHORITY = process.env.ZSPARK_AUTHORITY ?? (DEFAULT_ENTRA_T
 const DEFAULT_WORKSPACE_SERVER_URL = process.env.ZSPARK_SERVER_URL ?? ''
 
 const SETTINGS_PATH = join(app.getPath('userData'), 'zspark-settings.json')
+const PROVIDER_BRIDGE_LOG_PATH = join(app.getPath('userData'), 'provider-bridge.log')
 const WORKSPACE_ROOT = resolveWorkspaceRoot(process.cwd())
 const ATTACHMENTS_DIR = join(WORKSPACE_ROOT, '.zspark-attachments')
 const CODEX_RUNTIME_DEPS_DIR = join(app.getPath('home'), '.cache', 'codex-runtimes', 'codex-primary-runtime', 'dependencies')
@@ -535,6 +536,21 @@ function scrubExistingCodexLog(path: string) {
     if (redacted !== content) rewriteCodexLog(path, redacted)
   } catch {
     // Log cleanup must never prevent the app-server from starting.
+  }
+}
+
+function appendProviderBridgeLog(event: unknown) {
+  try {
+    mkdirSync(app.getPath('userData'), { recursive: true })
+    scrubExistingCodexLog(PROVIDER_BRIDGE_LOG_PATH)
+    rotateLogIfLarge(PROVIDER_BRIDGE_LOG_PATH)
+    const line = redactSensitiveLogLine(JSON.stringify({
+      timestamp: new Date().toISOString(),
+      ...(event && typeof event === 'object' ? (event as Record<string, unknown>) : { event })
+    }))
+    appendFileSync(PROVIDER_BRIDGE_LOG_PATH, `${line}\n`, { mode: 0o600 })
+  } catch {
+    // Provider diagnostics must never block request forwarding.
   }
 }
 
@@ -1149,6 +1165,7 @@ ipcMain.handle('artifacts:scanRecent', (_e, options: { sinceMs?: number; limit?:
 }))
 
 app.whenReady().then(async () => {
+  setBridgeDiagnosticsLogger(appendProviderBridgeLog)
   const b = await startBridge(BRIDGE_API_KEY)
   bridgePort = b.port
   bridgeClose = b.close

@@ -5,6 +5,9 @@ export type CompletedTurnWorkKind = 'command' | 'file' | 'tool' | 'web'
 export type ServerTurnStatus = 'completed' | 'failed' | 'interrupted' | string | undefined
 export type LocalTurnStatus = 'completed' | 'failed' | 'interrupted'
 
+const READ_ONLY_COMMAND_ACTION_TYPES = new Set(['read', 'search', 'listFiles'])
+const READ_ONLY_COMMAND_ACTION_KINDS = new Set(['read', 'search', 'list'])
+
 export function shouldRecoverFromProviderRetry({
   willRetry,
   completedWorkCount,
@@ -29,6 +32,20 @@ export function shouldReleaseCompletedWorkAfterProviderFailure({
   isStreamDisconnect: boolean
 }) {
   return !willRetry && isStreamDisconnect && completedWorkCount > 0 && !alreadyInterrupting
+}
+
+export function shouldCountCommandExecutionAsCompletedWork({
+  commandActions,
+  actionKind
+}: {
+  commandActions?: unknown
+  actionKind?: string
+}) {
+  if (actionKind && READ_ONLY_COMMAND_ACTION_KINDS.has(actionKind)) return false
+  if (!Array.isArray(commandActions) || commandActions.length === 0) return true
+  return !commandActions.every((action) => (
+    READ_ONLY_COMMAND_ACTION_TYPES.has(String((action as any)?.type ?? ''))
+  ))
 }
 
 export function turnStatusAfterServerCompletion({

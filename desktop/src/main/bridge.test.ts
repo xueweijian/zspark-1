@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { request as httpRequest } from 'node:http'
 import { afterEach, describe, expect, test } from 'vitest'
-import { setUpstream, startBridge } from './bridge'
+import { setBridgeDiagnosticsLogger, setUpstream, startBridge } from './bridge'
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
 
@@ -15,6 +15,7 @@ const cleanup: Array<() => Promise<void> | void> = []
 
 afterEach(async () => {
   setUpstream(null)
+  setBridgeDiagnosticsLogger(null)
   const pending = cleanup.splice(0).map((close) => close())
   await Promise.all(pending)
 })
@@ -549,6 +550,55 @@ describe('chat responses bridge', () => {
 
     expect(response.status).toBe(200)
     expect(upstream.requests).toHaveLength(1)
+  })
+
+  test('logs upstream response.failed details in Responses passthrough mode', async () => {
+    const diagnostics: any[] = []
+    setBridgeDiagnosticsLogger((event) => diagnostics.push(event))
+    const upstream = await startUpstream((_req, res) => {
+      res.writeHead(200, { 'content-type': 'text/event-stream' })
+      res.write(`event: response.failed\ndata: ${JSON.stringify({
+        type: 'response.failed',
+        response: {
+          id: 'resp_failed',
+          status: 'failed',
+          error: {
+            type: 'invalid_request_error',
+            code: 'bad_tool_state',
+            message: 'tool output is missing'
+          }
+        }
+      })}\n\n`)
+      res.end()
+    })
+    cleanup.push(upstream.close)
+    setUpstream({ baseUrl: `${upstream.baseUrl}/v1`, apiKey: 'test-key', mode: 'responses' })
+
+    const bridgeUrl = await startBridgeForTest()
+    const response = await postJson(`${bridgeUrl}/v1/responses`, {
+      model: 'test-model',
+      stream: true,
+      input: 'go'
+    })
+
+    expect(response.status).toBe(200)
+    expect(response.body).toContain('response.failed')
+    expect(diagnostics).toEqual([
+      expect.objectContaining({
+        kind: 'responses_passthrough_failed',
+        mode: 'responses',
+        path: '/v1/responses',
+        stream: true,
+        attempt: 0,
+        status: 200,
+        responseId: 'resp_failed',
+        error: {
+          type: 'invalid_request_error',
+          code: 'bad_tool_state',
+          message: 'tool output is missing'
+        }
+      })
+    ])
   })
 
   test('retries Responses passthrough after moving required reasoning before function_call on 400', async () => {

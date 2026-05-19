@@ -573,38 +573,19 @@ pub fn process_responses_event(
         }
         "response.failed" => {
             if let Some(resp_val) = event.response {
-                let mut response_error = ApiError::Stream("response.failed event received".into());
                 if let Some(error) = resp_val.get("error")
                     && let Ok(error) = serde_json::from_value::<Error>(error.clone())
                 {
-                    if is_context_window_error(&error) {
-                        response_error = ApiError::ContextWindowExceeded;
-                    } else if is_quota_exceeded_error(&error) {
-                        response_error = ApiError::QuotaExceeded;
-                    } else if is_usage_not_included(&error) {
-                        response_error = ApiError::UsageNotIncluded;
-                    } else if is_cyber_policy_error(&error) {
-                        let message = cyber_policy_message(error.message);
-                        response_error = ApiError::CyberPolicy { message };
-                    } else if is_invalid_prompt_error(&error) {
-                        let message = error
-                            .message
-                            .unwrap_or_else(|| "Invalid request.".to_string());
-                        response_error = ApiError::InvalidRequest { message };
-                    } else if is_server_overloaded_error(&error) {
-                        response_error = ApiError::ServerOverloaded;
-                    } else {
-                        let delay = try_parse_retry_after(&error);
-                        let message = error.message.unwrap_or_default();
-                        response_error = ApiError::Retryable { message, delay };
-                    }
+                    return Err(ResponsesEventError::Api(response_failed_api_error(error)));
                 }
-                return Err(ResponsesEventError::Api(response_error));
+                return Err(ResponsesEventError::Api(ApiError::InvalidRequest {
+                    message: "response.failed event received without error details".to_string(),
+                }));
             }
 
-            return Err(ResponsesEventError::Api(ApiError::Stream(
-                "response.failed event received".into(),
-            )));
+            return Err(ResponsesEventError::Api(ApiError::InvalidRequest {
+                message: "response.failed event received without response details".to_string(),
+            }));
         }
         "response.incomplete" => {
             let reason = event.response.as_ref().and_then(|response| {
@@ -799,6 +780,79 @@ fn try_parse_retry_after(err: &Error) -> Option<Duration> {
     None
 }
 
+fn response_failed_api_error(error: Error) -> ApiError {
+    if is_context_window_error(&error) {
+        ApiError::ContextWindowExceeded
+    } else if is_quota_exceeded_error(&error) {
+        ApiError::QuotaExceeded
+    } else if is_usage_not_included(&error) {
+        ApiError::UsageNotIncluded
+    } else if is_cyber_policy_error(&error) {
+        let message = cyber_policy_message(error.message);
+        ApiError::CyberPolicy { message }
+    } else if is_invalid_prompt_error(&error) {
+        let message = error
+            .message
+            .unwrap_or_else(|| "Invalid request.".to_string());
+        ApiError::InvalidRequest { message }
+    } else if is_server_overloaded_error(&error) {
+        ApiError::ServerOverloaded
+    } else if is_retryable_response_failed_error(&error) {
+        let delay = try_parse_retry_after(&error);
+        let message = error
+            .message
+            .clone()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| response_failed_message(&error));
+        ApiError::Retryable { message, delay }
+    } else {
+        ApiError::InvalidRequest {
+            message: response_failed_message(&error),
+        }
+    }
+}
+
+fn is_retryable_response_failed_error(error: &Error) -> bool {
+    matches!(
+        error.code.as_deref(),
+        Some(
+            "rate_limit_exceeded"
+                | "server_error"
+                | "internal_error"
+                | "internal_server_error"
+                | "service_unavailable"
+                | "temporarily_unavailable"
+        )
+    ) || error.r#type.as_deref() == Some("server_error")
+}
+
+fn response_failed_message(error: &Error) -> String {
+    let mut details = Vec::new();
+    if let Some(code) = error.code.as_deref().filter(|code| !code.trim().is_empty()) {
+        details.push(format!("code={code}"));
+    }
+    if let Some(error_type) = error
+        .r#type
+        .as_deref()
+        .filter(|error_type| !error_type.trim().is_empty())
+    {
+        details.push(format!("type={error_type}"));
+    }
+    if let Some(message) = error
+        .message
+        .as_deref()
+        .filter(|message| !message.trim().is_empty())
+    {
+        details.push(format!("message={message}"));
+    }
+
+    if details.is_empty() {
+        "response.failed event received without error details".to_string()
+    } else {
+        format!("response.failed event received: {}", details.join(", "))
+    }
+}
+
 fn is_context_window_error(error: &Error) -> bool {
     error.code.as_deref() == Some("context_length_exceeded")
 }
@@ -838,7 +892,10 @@ fn rate_limit_regex() -> &'static regex_lite::Regex {
     static RE: std::sync::OnceLock<regex_lite::Regex> = std::sync::OnceLock::new();
     #[expect(clippy::unwrap_used)]
     RE.get_or_init(|| {
-        regex_lite::Regex::new(r"(?i)try again in\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)").unwrap()
+        regex_lite::Regex::new(
+            r"(?i)(?:try again in|retry after)\s*(\d+(?:\.\d+)?)\s*(s|ms|seconds?)",
+        )
+        .unwrap()
     })
 }
 
@@ -1470,6 +1527,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_response_failed_error_is_fatal_with_details() {
+        let raw_error = r#"{"type":"response.failed","sequence_number":3,"response":{"id":"resp_unknown","object":"response","created_at":1759771628,"status":"failed","background":false,"error":{"type":"invalid_request_error","code":"bad_tool_state","message":"tool output is missing"},"incomplete_details":null}}"#;
+
+        let sse1 = format!("event: response.failed\ndata: {raw_error}\n\n");
+
+        let events = collect_events(&[sse1.as_bytes()]).await;
+
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            Err(ApiError::InvalidRequest { message }) => {
+                assert_eq!(
+                    message,
+                    "response.failed event received: code=bad_tool_state, type=invalid_request_error, message=tool output is missing"
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn table_driven_event_kinds() {
         struct TestCase {
             name: &'static str,
@@ -1847,6 +1925,19 @@ mod tests {
         };
         let delay = try_parse_retry_after(&err);
         assert_eq!(delay, Some(Duration::from_secs(35)));
+    }
+
+    #[test]
+    fn test_try_parse_retry_after_azure_retry_after() {
+        let err = Error {
+            r#type: None,
+            message: Some("Rate limit exceeded. Please retry after 42 seconds.".to_string()),
+            code: Some("rate_limit_exceeded".to_string()),
+            plan_type: None,
+            resets_at: None,
+        };
+        let delay = try_parse_retry_after(&err);
+        assert_eq!(delay, Some(Duration::from_secs(42)));
     }
 
     const CYBER_RESTRICTED_MODEL_FOR_TESTS: &str = "gpt-5.3-codex";

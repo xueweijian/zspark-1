@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  shouldCountCommandExecutionAsCompletedWork,
   shouldReleaseCompletedWorkAfterProviderFailure,
   shouldRecoverFromProviderRetry,
   turnStatusAfterServerCompletion
@@ -26,6 +27,36 @@ describe('shouldRecoverFromProviderRetry', () => {
       completedWorkCount: 2,
       alreadyInterrupting: true
     })).toBe(false)
+  })
+})
+
+describe('shouldCountCommandExecutionAsCompletedWork', () => {
+  it('ignores read-only command activity', () => {
+    expect(shouldCountCommandExecutionAsCompletedWork({
+      commandActions: [
+        { type: 'read', command: 'sed -n 1,80p file.ts' },
+        { type: 'search', command: 'rg build_artifact_deck' },
+        { type: 'listFiles', command: 'find outputs -type f' }
+      ],
+      actionKind: 'run'
+    })).toBe(false)
+
+    expect(shouldCountCommandExecutionAsCompletedWork({
+      commandActions: [{ type: 'unknown', command: 'sed -n 1,80p file.ts' }],
+      actionKind: 'read'
+    })).toBe(false)
+  })
+
+  it('counts commands that can produce or verify artifacts', () => {
+    expect(shouldCountCommandExecutionAsCompletedWork({
+      commandActions: [{ type: 'write', path: 'slides/slide-01.mjs' }],
+      actionKind: 'write'
+    })).toBe(true)
+
+    expect(shouldCountCommandExecutionAsCompletedWork({
+      commandActions: [{ type: 'unknown', command: 'node build_artifact_deck.mjs' }],
+      actionKind: 'build'
+    })).toBe(true)
   })
 })
 

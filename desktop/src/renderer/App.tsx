@@ -38,10 +38,12 @@ import {
 import {
   PROVIDER_RECONNECT_AUTO_INTERRUPT_MS,
   TURN_INTERRUPT_FALLBACK_RELEASE_MS,
+  shouldCountCommandExecutionAsCompletedWork,
   shouldReleaseCompletedWorkAfterProviderFailure,
   shouldRecoverFromProviderRetry,
   turnStatusAfterServerCompletion,
-  type CompletedTurnWorkKind
+  type CompletedTurnWorkKind,
+  type LocalTurnStatus
 } from './turnRecovery'
 import { responseForMcpElicitationRequest } from './mcpElicitation'
 import {
@@ -2238,10 +2240,14 @@ function DesktopApp() {
           setSubmitting(false)
           setStreaming(false)
           if (cur) {
+            const nextStatus: LocalTurnStatus =
+              statusType === 'interrupted' ? 'interrupted' :
+              statusType === 'failed' || statusType === 'systemError' ? 'failed' :
+              'completed'
             updateTurn(cur.turnId, (t) => ({
               ...t,
               endedAt: Date.now(),
-              status: statusType === 'interrupted' ? 'interrupted' : 'completed',
+              status: nextStatus,
               activities: t.activities.map((a) => (
                 a.status === 'running' ? { ...a, status: 'done' as const, endedAt: Date.now() } : a
               ))
@@ -2486,7 +2492,12 @@ function DesktopApp() {
                 recordCommandFailure(turnId, maskedFailure)
               }
               if (status === 'done') {
-                noteCompletedTurnWork(turnId, 'command')
+                if (shouldCountCommandExecutionAsCompletedWork({
+                  commandActions: item.commandActions,
+                  actionKind: info.actionKind
+                })) {
+                  noteCompletedTurnWork(turnId, 'command')
+                }
                 for (const deleted of extractDeletedPathsFromCommand(item)) {
                   rememberDeletedArtifact(turnId, deleted)
                 }
