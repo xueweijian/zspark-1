@@ -13,6 +13,7 @@ import { startBridge, setUpstream } from './bridge'
 import { discoverLocalSkills } from './localSkills'
 import {
   buildMcpServersLaunchConfig,
+  conflictingMcpEnvVarNames,
   duplicateMcpServerNames,
   sanitizeMcpServerList,
   type McpServerEntry
@@ -164,6 +165,10 @@ function settingsWarnings(s: AppSettings) {
   const duplicateNames = duplicateMcpServerNames(sanitizeMcpServerList(s.mcpServers))
   if (duplicateNames.length > 0) {
     warnings.push(`Duplicate enabled MCP server names are configured; only the first enabled server for each name will be launched: ${duplicateNames.join(', ')}`)
+  }
+  const conflictingEnvNames = conflictingMcpEnvVarNames(sanitizeMcpServerList(s.mcpServers))
+  if (conflictingEnvNames.length > 0) {
+    warnings.push(`Multiple enabled MCP servers use the same env var name with different values; zspark can only pass one argv-safe value for each env_vars entry: ${conflictingEnvNames.join(', ')}`)
   }
   if (isRemoteHttpEnterpriseUrl(s.enterprise?.serverUrl)) {
     warnings.push('Shared workspace server is using plain HTTP. This is acceptable for a controlled demo or private tunnel, but use HTTPS before customer or production use.')

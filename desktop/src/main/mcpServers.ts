@@ -94,6 +94,27 @@ export function duplicateMcpServerNames(entries: McpServerEntry[]): string[] {
   return duplicates
 }
 
+export function conflictingMcpEnvVarNames(entries: McpServerEntry[]): string[] {
+  const seenServerNames = new Set<string>()
+  const envValues = new Map<string, string>()
+  const conflicts = new Set<string>()
+
+  for (const entry of entries) {
+    if (!entry.enabled) continue
+    if (seenServerNames.has(entry.name)) continue
+    seenServerNames.add(entry.name)
+
+    for (const [name, value] of Object.entries(entry.env)) {
+      if (!name) continue
+      const previous = envValues.get(name)
+      if (previous !== undefined && previous !== value) conflicts.add(name)
+      else envValues.set(name, value)
+    }
+  }
+
+  return [...conflicts].sort()
+}
+
 /**
  * Build the MCP launch config passed to codex-rs.
  *

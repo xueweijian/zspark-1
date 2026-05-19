@@ -1,12 +1,26 @@
 import { describe, expect, test } from 'vitest'
 import {
   buildMcpServersLaunchConfig,
+  conflictingMcpEnvVarNames,
   buildMcpServersTomlValue,
   duplicateMcpServerNames,
   generateMcpServerId,
   sanitizeMcpServer,
-  sanitizeMcpServerList
+  sanitizeMcpServerList,
+  type McpServerEntry
 } from './mcpServers'
+
+function entry(overrides: Partial<McpServerEntry>): McpServerEntry {
+  return {
+    id: 'id',
+    name: 'server',
+    command: 'node',
+    args: [],
+    env: {},
+    enabled: true,
+    ...overrides
+  }
+}
 
 describe('sanitizeMcpServer', () => {
   test('returns null for malformed input', () => {
@@ -66,6 +80,27 @@ describe('duplicateMcpServerNames', () => {
       { id: '3', name: 'disabled', command: 'e', args: [], env: {}, enabled: false },
       { id: '4', name: 'disabled', command: 'f', args: [], env: {}, enabled: true }
     ])).toEqual(['gmail'])
+  })
+})
+
+describe('conflictingMcpEnvVarNames', () => {
+  test('detects enabled servers that need different values for the same env var', () => {
+    const servers: McpServerEntry[] = [
+      entry({ id: 'a', name: 'a', env: { API_KEY: 'one', SHARED: 'same' } }),
+      entry({ id: 'b', name: 'b', env: { API_KEY: 'two', SHARED: 'same' } }),
+      entry({ id: 'c', name: 'c', env: { API_KEY: 'ignored' }, enabled: false })
+    ]
+
+    expect(conflictingMcpEnvVarNames(servers)).toEqual(['API_KEY'])
+  })
+
+  test('ignores duplicate server names because only the first launches', () => {
+    const servers: McpServerEntry[] = [
+      entry({ id: 'a', name: 'same', env: { TOKEN: 'one' } }),
+      entry({ id: 'b', name: 'same', env: { TOKEN: 'two' } })
+    ]
+
+    expect(conflictingMcpEnvVarNames(servers)).toEqual([])
   })
 })
 

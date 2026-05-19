@@ -22,6 +22,7 @@ import {
   dirname,
   extractArtifactPathCandidates,
   findRecentArtifactForCandidate,
+  isDisplayableArtifactPath,
   resolveWorkspacePath,
   type RecentArtifactLike
 } from './artifacts'
@@ -774,14 +775,15 @@ function blocksFromThreadTurns(turns: any[], base?: string): { blocks: Block[]; 
         const activity = replayActivityFromItem(item, startedAt)
         if (activity) ensureTurnBlock().activities.push(activity)
         const changed = filesFromChanges(item.changes ?? [], base, Date.now())
-        if (changed.length) {
-          files.push(...changed)
+        const displayChanged = changed.filter((file) => isDisplayableArtifactPath(file.path))
+        if (changed.length) files.push(...changed)
+        if (displayChanged.length) {
           trailingBlocks.push({
             type: 'files',
             id: `replay-files-${item.id}`,
             turnId: String(turn?.id ?? ''),
-            title: `${changed.length} file${changed.length === 1 ? '' : 's'} ready`,
-            files: changed
+            title: `${displayChanged.length} file${displayChanged.length === 1 ? '' : 's'} ready`,
+            files: displayChanged
           })
         }
       }
@@ -1731,7 +1733,10 @@ function DesktopApp() {
     if (!files.length) return
     const uploadedFiles = await uploadSharedArtifacts(files, agentBlock.turnId ?? `agent-${agentBlock.id}`)
     upsertWorkspaceFiles(uploadedFiles)
-    rememberDisplayedArtifacts(uploadedFiles)
+    upsertArtifactBlock(agentBlock.turnId ?? `agent-${agentBlock.id}`, `inline-${agentBlock.id}`, uploadedFiles, {
+      title: `${uploadedFiles.length} generated artifact${uploadedFiles.length === 1 ? '' : 's'} ready`,
+      subtitle: 'Verified from assistant output'
+    })
   }
 
   const updateTurn = (turnId: string, fn: (t: Extract<Block, { type: 'turn' }>) => Extract<Block, { type: 'turn' }>) => {

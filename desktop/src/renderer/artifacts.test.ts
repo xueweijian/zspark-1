@@ -3,6 +3,7 @@ import {
   dirname,
   extractArtifactPathCandidates,
   findRecentArtifactForCandidate,
+  isDisplayableArtifactPath,
   resolveWorkspacePath
 } from './artifacts'
 
@@ -43,6 +44,14 @@ describe('artifact helpers', () => {
     expect(findRecentArtifactForCandidate('output/Year-End-Review.pptx', artifacts)).toEqual(artifact)
     expect(findRecentArtifactForCandidate('outputs/final/Year-End-Review.pptx', artifacts)).toEqual(artifact)
     expect(findRecentArtifactForCandidate('outputs/final/Missing.pptx', artifacts)).toBeNull()
+  })
+
+  test('only treats final deliverables as displayable artifacts', () => {
+    expect(isDisplayableArtifactPath('/repo/outputs/run/presentations/demo/output/final.pptx')).toBe(true)
+    expect(isDisplayableArtifactPath('/repo/outputs/run/presentations/demo/package.json')).toBe(false)
+    expect(isDisplayableArtifactPath('/repo/outputs/run/presentations/demo/slides/slide-01.mjs')).toBe(false)
+    expect(isDisplayableArtifactPath('/repo/outputs/run/presentations/demo/preview/slide-01.png')).toBe(false)
+    expect(isDisplayableArtifactPath('https://example.com/final.pptx')).toBe(false)
   })
 
 })
