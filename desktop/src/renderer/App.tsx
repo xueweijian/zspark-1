@@ -1654,7 +1654,10 @@ function DesktopApp() {
     if (existing.length) {
       const sharedExisting = await uploadSharedArtifacts(existing, turnId)
       upsertWorkspaceFiles(sharedExisting)
-      rememberDisplayedArtifacts(sharedExisting)
+      upsertArtifactBlock(turnId, itemId, sharedExisting, {
+        title: `${sharedExisting.length} generated artifact${sharedExisting.length === 1 ? '' : 's'} ready`,
+        subtitle: 'Verified from assistant output'
+      })
     }
     if (missing.length) {
       upsertArtifactBlock(turnId, `${itemId}-missing`, missing, {
