@@ -10,6 +10,7 @@
     "test": "vitest run",
     "build:win": "node scripts/build-win.mjs",
     "build:mac": "node scripts/build-gmail-mcp.mjs && electron-vite build && electron-builder --mac dmg",
+    "build:linux": "node scripts/build-gmail-mcp.mjs && electron-vite build && electron-builder --linux AppImage deb",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
@@ -67,6 +68,11 @@
     "mac": {
       "target": "dmg",
       "category": "public.app-category.productivity"
+    },
+    "linux": {
+      "target": ["AppImage", "deb"],
+      "category": "Development",
+      "artifactName": "zspark-${version}-linux-${arch}.${ext}"
     }
   },
   "pnpm": {

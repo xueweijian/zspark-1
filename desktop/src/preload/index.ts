@@ -1,5 +1,30 @@
 import { contextBridge, ipcRenderer, type IpcRendererEvent } from 'electron'
 
+// Type definitions for IPC API
+export interface Settings {
+  theme?: 'light' | 'dark' | 'system'
+  fontSize?: number
+  [key: string]: unknown
+}
+
+export interface SessionCreateBody {
+  name?: string
+  description?: string
+  [key: string]: unknown
+}
+
+export interface SessionUpdateBody {
+  name?: string
+  description?: string
+  [key: string]: unknown
+}
+
+export interface ArtifactMeta {
+  name?: string
+  type?: string
+  [key: string]: unknown
+}
+
 const api = {
   send: (line: string) => ipcRenderer.invoke('codex:send', line),
   restart: () => ipcRenderer.invoke('codex:restart'),
@@ -14,7 +39,7 @@ const api = {
   openExternalUrl: (url: string) => ipcRenderer.invoke('url:openExternal', url),
   scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => ipcRenderer.invoke('artifacts:scanRecent', options),
   getSettings: () => ipcRenderer.invoke('settings:get'),
-  saveSettings: (s: any) => ipcRenderer.invoke('settings:save', s),
+  saveSettings: (s: Settings) => ipcRenderer.invoke('settings:save', s),
   enterpriseStatus: () => ipcRenderer.invoke('enterprise:status'),
   enterpriseLogin: () => ipcRenderer.invoke('enterprise:login'),
   enterpriseLogout: () => ipcRenderer.invoke('enterprise:logout'),
@@ -22,12 +47,12 @@ const api = {
   enterpriseWorkspaces: () => ipcRenderer.invoke('enterprise:workspaces'),
   enterpriseCreateWorkspace: (name?: string) => ipcRenderer.invoke('enterprise:createWorkspace', name),
   enterpriseSessions: (workspaceId: string) => ipcRenderer.invoke('enterprise:sessions', workspaceId),
-  enterpriseCreateSession: (workspaceId: string, body?: any) => ipcRenderer.invoke('enterprise:createSession', workspaceId, body),
+  enterpriseCreateSession: (workspaceId: string, body?: SessionCreateBody) => ipcRenderer.invoke('enterprise:createSession', workspaceId, body),
   enterpriseReadSession: (workspaceId: string, sessionId: string) => ipcRenderer.invoke('enterprise:readSession', workspaceId, sessionId),
-  enterpriseUpdateSession: (workspaceId: string, sessionId: string, body?: any) => ipcRenderer.invoke('enterprise:updateSession', workspaceId, sessionId, body),
+  enterpriseUpdateSession: (workspaceId: string, sessionId: string, body?: SessionUpdateBody) => ipcRenderer.invoke('enterprise:updateSession', workspaceId, sessionId, body),
   enterpriseDeleteSession: (workspaceId: string, sessionId: string) => ipcRenderer.invoke('enterprise:deleteSession', workspaceId, sessionId),
   enterpriseArtifacts: (workspaceId: string, sessionId: string) => ipcRenderer.invoke('enterprise:artifacts', workspaceId, sessionId),
-  enterpriseUploadArtifact: (workspaceId: string, sessionId: string, filePath: string, meta?: any) => ipcRenderer.invoke('enterprise:uploadArtifact', workspaceId, sessionId, filePath, meta),
+  enterpriseUploadArtifact: (workspaceId: string, sessionId: string, filePath: string, meta?: ArtifactMeta) => ipcRenderer.invoke('enterprise:uploadArtifact', workspaceId, sessionId, filePath, meta),
   enterpriseDownloadArtifact: (workspaceId: string, sessionId: string, artifactId: string, name?: string) => ipcRenderer.invoke('enterprise:downloadArtifact', workspaceId, sessionId, artifactId, name),
   enterpriseDownloadArtifactToCache: (workspaceId: string, sessionId: string, artifactId: string, name?: string) => ipcRenderer.invoke('enterprise:downloadArtifactToCache', workspaceId, sessionId, artifactId, name),
   enterpriseOpenArtifactCache: (workspaceId?: string, sessionId?: string) => ipcRenderer.invoke('enterprise:openArtifactCache', workspaceId, sessionId),

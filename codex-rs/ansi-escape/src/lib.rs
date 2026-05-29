@@ -39,20 +39,24 @@ pub fn ansi_escape_line(s: &str) -> Line<'static> {
 
 pub fn ansi_escape(s: &str) -> Text<'static> {
     // to_text() claims to be faster, but introduces complex lifetime issues
-    // such that it's not worth it.
+    // such that it is not worth it.
     match s.into_text() {
         Ok(text) => text,
-        Err(err) => match err {
-            Error::NomError(message) => {
-                tracing::error!(
-                    "ansi_to_tui NomError docs claim should never happen when parsing `{s}`: {message}"
-                );
-                panic!();
+        Err(err) => {
+            // Return a fallback Text containing the raw string instead of panicking.
+            // This ensures the application remains stable even with malformed ANSI input.
+            match err {
+                Error::NomError(message) => {
+                    tracing::error!(
+                        "ansi_to_tui NomError when parsing input: {message}"
+                    );
+                }
+                Error::Utf8Error(utf8error) => {
+                    tracing::error!("ansi_to_tui Utf8Error: {utf8error}");
+                }
             }
-            Error::Utf8Error(utf8error) => {
-                tracing::error!("Utf8Error: {utf8error}");
-                panic!();
-            }
-        },
+            // Fallback: return the input as plain text without ANSI parsing
+            Text::raw(s.to_string())
+        }
     }
 }

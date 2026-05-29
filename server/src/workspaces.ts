@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { FastifyInstance, FastifyRequest } from 'fastify'
+import type { AuthenticatedRequest } from './types.js'
 import { z } from 'zod'
 import { pool } from './db.js'
 import { displayPrincipal, principalKeys } from './principal.js'
@@ -11,7 +12,7 @@ const CreateWorkspaceBody = z.object({
 export async function canAccessWorkspace(req: FastifyRequest, workspaceId: string) {
   const keys = principalKeys(req)
   if (!pool || keys.length === 0) return false
-  const cache = ((req as any)._workspaceAccessCache ??= new Map<string, boolean>()) as Map<string, boolean>
+  const cache = ((req as AuthenticatedRequest)._workspaceAccessCache ??= new Map<string, boolean>()) 
   const cacheKey = `${workspaceId}:${keys.join('\0')}`
   const cached = cache.get(cacheKey)
   if (cached !== undefined) return cached

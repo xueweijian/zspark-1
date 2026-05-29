@@ -36,6 +36,25 @@ import {
 } from './pathSafety'
 import { ensureWorkspaceRoot, resolveWorkspaceRoot } from './workspaceRoot'
 
+
+/** Helper to safely extract error properties from unknown errors */
+function getErrorInfo(err: unknown): { message: string; code?: string; errorCode?: string; errorMessage?: string; subError?: string } {
+  if (err instanceof Error) {
+    const e = err as Error & { code?: string; errorCode?: string; errorMessage?: string; subError?: string }
+    return { message: e.message, code: e.code, errorCode: e.errorCode, errorMessage: e.errorMessage, subError: e.subError }
+  }
+  if (err && typeof err === "object") {
+    const e = err as Record<string, unknown>
+    return {
+      message: typeof e.message === "string" ? e.message : String(err),
+      code: typeof e.code === "string" ? e.code : undefined,
+      errorCode: typeof e.errorCode === "string" ? e.errorCode : undefined,
+      errorMessage: typeof e.errorMessage === "string" ? e.errorMessage : undefined,
+      subError: typeof e.subError === "string" ? e.subError : undefined
+    }
+  }
+  return { message: String(err) }
+}
 let mainWindow: BrowserWindow | null = null
 let codex: ChildProcessWithoutNullStreams | null = null
 
@@ -133,8 +152,8 @@ function loadSettings(): AppSettings {
       raw.mcpServers = mcpServers
     }
     return raw
-  } catch (err: any) {
-    if (err?.code === 'ENOENT') {
+  } catch (err: unknown) {
+    const errInfo = getErrorInfo(err); if (errInfo.code === 'ENOENT') {
       settingsLoadIssue = null
       mcpSecretDecryptIssues = []
       return {}
@@ -371,7 +390,7 @@ async function enterpriseFetchResponse(path: string, init: RequestInit = {}) {
   let serverUrl: string
   try {
     serverUrl = validateEnterpriseServerUrl(config.serverUrl)
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, status: 400, error: err?.message ?? String(err) }
   }
   if (!serverUrl) {
@@ -819,7 +838,7 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(a
     }
     try {
       next.enterprise.serverUrl = validateEnterpriseServerUrl(next.enterprise.serverUrl ?? '')
-    } catch (err: any) {
+    } catch (err: unknown) {
       return { ok: false, error: err?.message ?? String(err), warnings: settingsWarnings(cur) }
     }
   }
@@ -848,7 +867,7 @@ ipcMain.handle('enterprise:login', async () => withSettingsLock(async () => {
     const config = effectiveEnterpriseConfig(settings)
     try {
       validateEnterpriseServerUrl(config.serverUrl)
-    } catch (err: any) {
+    } catch (err: unknown) {
       return { ok: false, error: err?.message ?? String(err) }
     }
     if (!config.serverUrl || !config.tenantId || !config.clientId || !config.apiScope || !config.authority) {
@@ -893,7 +912,7 @@ ipcMain.handle('enterprise:login', async () => withSettingsLock(async () => {
     }
     saveSettings(next)
     return { ok: true, status: enterpriseStatus(next) }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return {
       ok: false,
       error: formatEnterpriseLoginError(err),
@@ -974,7 +993,7 @@ ipcMain.handle('enterprise:uploadArtifact', async (_e, workspaceId: string, sess
         contentBase64: content.toString('base64')
       })
     })
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -998,7 +1017,7 @@ ipcMain.handle('enterprise:downloadArtifact', async (_e, workspaceId: string, se
     if (!response.body) return { ok: false, error: 'Download response did not include a body' }
     await pipeline(Readable.fromWeb(response.body as any), createWriteStream(save.filePath))
     return { ok: true, path: save.filePath }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -1021,7 +1040,7 @@ ipcMain.handle('enterprise:downloadArtifactToCache', async (_e, workspaceId: str
     const filePath = join(dir, basename(defaultName))
     await pipeline(Readable.fromWeb(response.body as any), createWriteStream(filePath))
     return { ok: true, path: filePath }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -1032,7 +1051,7 @@ ipcMain.handle('enterprise:openArtifactCache', async (_e, workspaceId?: string, 
     mkdirSync(dir, { recursive: true })
     const error = await shell.openPath(dir)
     return error ? { ok: false, error } : { ok: true, path: dir }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -1082,7 +1101,7 @@ ipcMain.handle('path:open', async (_e, filePath: string) => {
     ensureShellOpenAllowed(safePath)
     const error = await shell.openPath(safePath)
     return error ? { ok: false, error } : { ok: true }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -1094,7 +1113,7 @@ ipcMain.handle('skill:open', async (_e, filePath: string) => {
     ensureShellOpenAllowed(safePath)
     const error = await shell.openPath(safePath)
     return error ? { ok: false, error } : { ok: true }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -1104,7 +1123,7 @@ ipcMain.handle('path:reveal', (_e, filePath: string) => {
     if (!filePath) return { ok: false, error: 'Missing file path' }
     shell.showItemInFolder(resolveAllowedLocalPath(filePath))
     return { ok: true }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -1114,7 +1133,7 @@ ipcMain.handle('path:download', async (_e, filePath: string) => {
   try {
     if (!filePath) return { ok: false, error: 'Missing file path' }
     safePath = resolveAllowedLocalPath(filePath)
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
   if (!existsSync(safePath)) return { ok: false, error: 'File does not exist' }
@@ -1125,7 +1144,7 @@ ipcMain.handle('path:download', async (_e, filePath: string) => {
   try {
     copyFileSync(safePath, save.filePath)
     return { ok: true, path: save.filePath }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
@@ -1151,7 +1170,7 @@ ipcMain.handle('url:openExternal', async (_e, rawUrl: string) => {
   try {
     await openExternalUrl(rawUrl)
     return { ok: true }
-  } catch (err: any) {
+  } catch (err: unknown) {
     return { ok: false, error: err?.message ?? String(err) }
   }
 })
