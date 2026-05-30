@@ -86,8 +86,8 @@ export function importAttachmentFiles(filePaths: string[], workspaceRoot: string
         kind: attachmentKindForMime(mime),
         size: statSync(targetPath).size
       })
-    } catch (err: any) {
-      errors.push(`${basename(sourcePath)}: ${err?.message ?? String(err)}`)
+    } catch (err: unknown) {
+      errors.push(`${basename(sourcePath)}: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
 

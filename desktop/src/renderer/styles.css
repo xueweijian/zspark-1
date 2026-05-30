@@ -428,3 +428,92 @@ input,textarea,select{font:inherit}
 .mcp-row-body{display:flex;flex-direction:column;gap:8px;margin-top:10px;padding-top:10px;border-top:1px dashed #e4e4e7}
 .mcp-row-body textarea{font-family:ui-monospace,Menlo,monospace;font-size:12px;resize:vertical}
 .mcp-add{align-self:flex-start;margin-top:4px}
+
+/* ErrorBoundary styles */
+.error-boundary {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background: var(--bg-primary, #1a1a1a);
+  color: var(--text-primary, #ffffff);
+  padding: 2rem;
+}
+
+.error-boundary-content {
+  max-width: 480px;
+  text-align: center;
+}
+
+.error-boundary h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+  margin-bottom: 0.75rem;
+  color: var(--text-primary, #ffffff);
+}
+
+.error-boundary .error-message {
+  font-size: 0.9rem;
+  color: var(--text-secondary, #a0a0a0);
+  margin-bottom: 1.5rem;
+  line-height: 1.5;
+}
+
+.error-boundary .error-actions {
+  display: flex;
+  gap: 0.75rem;
+  justify-content: center;
+}
+
+.error-boundary .error-btn {
+  padding: 0.5rem 1rem;
+  border-radius: 6px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background-color 0.15s ease;
+}
+
+.error-boundary .error-btn.primary {
+  background: var(--accent-primary, #3b82f6);
+  color: white;
+  border: none;
+}
+
+.error-boundary .error-btn.primary:hover {
+  background: var(--accent-primary-hover, #2563eb);
+}
+
+.error-boundary .error-btn.secondary {
+  background: transparent;
+  color: var(--text-secondary, #a0a0a0);
+  border: 1px solid var(--border-primary, #333);
+}
+
+.error-boundary .error-btn.secondary:hover {
+  background: var(--bg-secondary, #2a2a2a);
+}
+
+.error-boundary .error-details {
+  margin-top: 1.5rem;
+  text-align: left;
+}
+
+.error-boundary .error-details summary {
+  cursor: pointer;
+  font-size: 0.8rem;
+  color: var(--text-secondary, #a0a0a0);
+  margin-bottom: 0.5rem;
+}
+
+.error-boundary .error-details pre {
+  font-size: 0.75rem;
+  background: var(--bg-secondary, #2a2a2a);
+  padding: 0.75rem;
+  border-radius: 4px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-secondary, #a0a0a0);
+  margin-top: 0.5rem;
+}

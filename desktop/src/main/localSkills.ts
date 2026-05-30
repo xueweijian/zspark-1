@@ -77,8 +77,8 @@ function findSkillFiles(root: string, errors: string[], maxDepth = 12): string[]
     let entries
     try {
       entries = readdirSync(dir, { withFileTypes: true })
-    } catch (err: any) {
-      errors.push(`${dir}: ${err?.message ?? String(err)}`)
+    } catch (err: unknown) {
+      errors.push(`${dir}: ${err instanceof Error ? err.message : String(err)}`)
       return
     }
 
@@ -99,8 +99,8 @@ function findSkillFiles(root: string, errors: string[], maxDepth = 12): string[]
 function readSkill(path: string, source: LocalSkillSource, errors: string[]): LocalSkillMetadata | null {
   try {
     return parseSkillMarkdown(readFileSync(path, 'utf8'), path, source)
-  } catch (err: any) {
-    errors.push(`${path}: ${err?.message ?? String(err)}`)
+  } catch (err: unknown) {
+    errors.push(`${path}: ${err instanceof Error ? err.message : String(err)}`)
     return null
   }
 }

@@ -163,8 +163,8 @@ function loadSettings(): AppSettings {
     try {
       if (existsSync(SETTINGS_PATH)) renameSync(SETTINGS_PATH, backupPath)
       settingsLoadIssue = `Settings could not be read and were preserved at ${backupPath}.`
-    } catch (renameErr: any) {
-      settingsLoadIssue = `Settings could not be read. ${renameErr?.message ?? String(renameErr)}`
+    } catch (renameErr: unknown) {
+      settingsLoadIssue = `Settings could not be read. ${getErrorInfo(renameErr).message ?? String(renameErr)}`
     }
     return {}
   }
@@ -391,7 +391,7 @@ async function enterpriseFetchResponse(path: string, init: RequestInit = {}) {
   try {
     serverUrl = validateEnterpriseServerUrl(config.serverUrl)
   } catch (err: unknown) {
-    return { ok: false, status: 400, error: err?.message ?? String(err) }
+    return { ok: false, status: 400, error: getErrorInfo(err).message ?? String(err) }
   }
   if (!serverUrl) {
     return { ok: false, status: 400, error: 'Shared workspace server URL is not configured.' }
@@ -718,7 +718,7 @@ function spawnCodex() {
   child.on('error', (err) => {
     // Spawn-time failure (ENOENT, EACCES, ...). The 'exit' handler may not
     // fire, so we have to release the log fd and notify the renderer here.
-    closeLogStream(`[error] ${err?.message ?? String(err)}\n`)
+    closeLogStream(`[error] ${getErrorInfo(err).message ?? String(err)}\n`)
     if (codex === child) {
       codex = null
       mainWindow?.webContents.send('codex:exit', null)
@@ -839,7 +839,7 @@ ipcMain.handle('settings:save', (_e, partial: AppSettings) => withSettingsLock(a
     try {
       next.enterprise.serverUrl = validateEnterpriseServerUrl(next.enterprise.serverUrl ?? '')
     } catch (err: unknown) {
-      return { ok: false, error: err?.message ?? String(err), warnings: settingsWarnings(cur) }
+      return { ok: false, error: getErrorInfo(err).message ?? String(err), warnings: settingsWarnings(cur) }
     }
   }
   saveSettings(next)
@@ -868,7 +868,7 @@ ipcMain.handle('enterprise:login', async () => withSettingsLock(async () => {
     try {
       validateEnterpriseServerUrl(config.serverUrl)
     } catch (err: unknown) {
-      return { ok: false, error: err?.message ?? String(err) }
+      return { ok: false, error: getErrorInfo(err).message ?? String(err) }
     }
     if (!config.serverUrl || !config.tenantId || !config.clientId || !config.apiScope || !config.authority) {
       return { ok: false, error: 'Shared workspace Entra configuration is incomplete. Open Settings and fill Server URL, Tenant ID, Client ID, API Scope, and Authority.' }
@@ -916,13 +916,13 @@ ipcMain.handle('enterprise:login', async () => withSettingsLock(async () => {
     return {
       ok: false,
       error: formatEnterpriseLoginError(err),
-      code: err?.errorCode ?? err?.code ?? null
+      code: getErrorInfo(err).errorCode ?? getErrorInfo(err).code ?? null
     }
   }
 }))
 
-function formatEnterpriseLoginError(err: any) {
-  const raw = [err?.errorMessage, err?.message, err?.subError].filter(Boolean).join(' ')
+function formatEnterpriseLoginError(err: unknown) {
+  const raw = [getErrorInfo(err).errorMessage, getErrorInfo(err).message, getErrorInfo(err).subError].filter(Boolean).join(' ')
   if (/invalid_client|AADSTS7000218/i.test(raw)) {
     return 'Entra rejected zspark as a public desktop client. In Azure Portal, open zspark-desktop -> Authentication -> Advanced settings -> Allow public client flows -> Yes, then try signing in again.'
   }
@@ -994,7 +994,7 @@ ipcMain.handle('enterprise:uploadArtifact', async (_e, workspaceId: string, sess
       })
     })
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1018,7 +1018,7 @@ ipcMain.handle('enterprise:downloadArtifact', async (_e, workspaceId: string, se
     await pipeline(Readable.fromWeb(response.body as any), createWriteStream(save.filePath))
     return { ok: true, path: save.filePath }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1041,7 +1041,7 @@ ipcMain.handle('enterprise:downloadArtifactToCache', async (_e, workspaceId: str
     await pipeline(Readable.fromWeb(response.body as any), createWriteStream(filePath))
     return { ok: true, path: filePath }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1052,7 +1052,7 @@ ipcMain.handle('enterprise:openArtifactCache', async (_e, workspaceId?: string, 
     const error = await shell.openPath(dir)
     return error ? { ok: false, error } : { ok: true, path: dir }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1102,7 +1102,7 @@ ipcMain.handle('path:open', async (_e, filePath: string) => {
     const error = await shell.openPath(safePath)
     return error ? { ok: false, error } : { ok: true }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1114,7 +1114,7 @@ ipcMain.handle('skill:open', async (_e, filePath: string) => {
     const error = await shell.openPath(safePath)
     return error ? { ok: false, error } : { ok: true }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1124,7 +1124,7 @@ ipcMain.handle('path:reveal', (_e, filePath: string) => {
     shell.showItemInFolder(resolveAllowedLocalPath(filePath))
     return { ok: true }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1134,7 +1134,7 @@ ipcMain.handle('path:download', async (_e, filePath: string) => {
     if (!filePath) return { ok: false, error: 'Missing file path' }
     safePath = resolveAllowedLocalPath(filePath)
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
   if (!existsSync(safePath)) return { ok: false, error: 'File does not exist' }
   const save = mainWindow
@@ -1145,7 +1145,7 @@ ipcMain.handle('path:download', async (_e, filePath: string) => {
     copyFileSync(safePath, save.filePath)
     return { ok: true, path: save.filePath }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 
@@ -1171,7 +1171,7 @@ ipcMain.handle('url:openExternal', async (_e, rawUrl: string) => {
     await openExternalUrl(rawUrl)
     return { ok: true }
   } catch (err: unknown) {
-    return { ok: false, error: err?.message ?? String(err) }
+    return { ok: false, error: getErrorInfo(err).message ?? String(err) }
   }
 })
 

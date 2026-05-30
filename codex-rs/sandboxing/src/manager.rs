@@ -5,6 +5,7 @@ use crate::bwrap::is_wsl1;
 use crate::landlock::CODEX_LINUX_SANDBOX_ARG0;
 use crate::landlock::allow_network_for_proxy;
 use crate::landlock::create_linux_sandbox_command_args_for_permission_profile;
+use crate::landlock::LandlockError;
 use crate::policy_transforms::effective_permission_profile;
 use crate::policy_transforms::should_require_platform_sandbox;
 use codex_network_proxy::NetworkProxy;
@@ -61,6 +62,7 @@ pub fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<SandboxType
     }
 }
 
+
 #[derive(Debug)]
 pub struct SandboxCommand {
     pub program: OsString,
@@ -69,6 +71,7 @@ pub struct SandboxCommand {
     pub env: HashMap<String, String>,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
 }
+
 
 #[derive(Debug)]
 pub struct SandboxExecRequest {
@@ -103,6 +106,7 @@ pub struct SandboxTransformRequest<'a> {
     pub windows_sandbox_private_desktop: bool,
 }
 
+
 #[derive(Debug)]
 pub enum SandboxTransformError {
     MissingLinuxSandboxExecutable,
@@ -110,6 +114,7 @@ pub enum SandboxTransformError {
     Wsl1UnsupportedForBubblewrap,
     #[cfg(not(target_os = "macos"))]
     SeatbeltUnavailable,
+    Landlock(LandlockError),
 }
 
 impl std::fmt::Display for SandboxTransformError {
@@ -122,11 +127,18 @@ impl std::fmt::Display for SandboxTransformError {
             Self::Wsl1UnsupportedForBubblewrap => write!(f, "{WSL1_BWRAP_WARNING}"),
             #[cfg(not(target_os = "macos"))]
             Self::SeatbeltUnavailable => write!(f, "seatbelt sandbox is only available on macOS"),
+            Self::Landlock(err) => write!(f, "landlock error: {err}"),
         }
     }
 }
 
 impl std::error::Error for SandboxTransformError {}
+
+impl From<LandlockError> for SandboxTransformError {
+    fn from(err: LandlockError) -> Self {
+        Self::Landlock(err)
+    }
+}
 
 #[derive(Default)]
 pub struct SandboxManager;
@@ -223,6 +235,7 @@ impl SandboxManager {
                     &effective_file_system_policy,
                     use_legacy_landlock,
                     allow_proxy_network,
+                )?;
                     is_wsl1(),
                 )?;
                 let mut args = create_linux_sandbox_command_args_for_permission_profile(
@@ -232,6 +245,7 @@ impl SandboxManager {
                     sandbox_policy_cwd,
                     use_legacy_landlock,
                     allow_proxy_network,
+                )?;
                 );
                 let mut full_command = Vec::with_capacity(1 + args.len());
                 full_command.push(os_string_to_command_component(exe.as_os_str().to_owned()));

@@ -66,13 +66,13 @@ export function decryptSensitiveMcpEnvWithIssues(
       if (!isSensitiveMcpEnvKey(key) || !encryptedValue(value)) continue
       try {
         server.env[key] = decrypt(value.slice(ENCRYPTED_VALUE_PREFIX.length))
-      } catch (err: any) {
+      } catch (err: unknown) {
         server.env[key] = ''
         issues.push({
           serverId: server.id,
           serverName: server.name,
           key,
-          error: err?.message ?? String(err)
+          error: err instanceof Error ? err.message : String(err)
         })
       }
     }

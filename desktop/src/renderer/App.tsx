@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { ErrorBoundary } from './ErrorBoundary'
 import { Marked } from 'marked'
 import DOMPurify from 'dompurify'
 import {
@@ -1049,7 +1050,7 @@ function BridgeMissing() {
 
 export function App() {
   if (!window.zspark) return <BridgeMissing />
-  return <DesktopApp />
+  return <ErrorBoundary><DesktopApp /></ErrorBoundary>
 }
 
 function DesktopApp() {
@@ -2666,14 +2667,17 @@ function DesktopApp() {
   useEffect(() => {
     if (!activeSharedWorkspace || !activeSharedSession || !blocks.length) return
     if (sharedSyncTimer.current) window.clearTimeout(sharedSyncTimer.current)
+    let cancelled = false
     sharedSyncTimer.current = window.setTimeout(() => {
       const title = titleFromBlocks(blocks)
+      if (cancelled) return
       const localThreadId = threadRef.current
       const snapshot = { version: 1, blocks, localThreadId, title, updatedAt: Date.now() }
       const snapshotKey = JSON.stringify({ activeSharedWorkspace, activeSharedSession, localThreadId, title, blocks })
       if (snapshotKey === lastSharedSnapshotKey.current) return
       inFlightSharedSnapshotKey.current = snapshotKey
       const nextSync = sharedSnapshotSyncQueue.current.catch(() => undefined).then(async () => {
+        if (cancelled) return
         if (activeSharedWorkspaceRef.current !== activeSharedWorkspace || activeSharedSessionRef.current !== activeSharedSession) return
         if (snapshotKey === lastSharedSnapshotKey.current) return
         const result = await window.zspark.enterpriseUpdateSession(activeSharedWorkspace, activeSharedSession, {
@@ -2706,6 +2710,7 @@ function DesktopApp() {
       void nextSync
     }, 800)
     return () => {
+      cancelled = true
       if (sharedSyncTimer.current) window.clearTimeout(sharedSyncTimer.current)
     }
   }, [blocks, activeSharedWorkspace, activeSharedSession, thread])
