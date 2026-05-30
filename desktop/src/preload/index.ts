@@ -38,6 +38,10 @@ const api = {
   statPath: (path: string) => ipcRenderer.invoke('path:stat', path),
   openExternalUrl: (url: string) => ipcRenderer.invoke('url:openExternal', url),
   scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => ipcRenderer.invoke('artifacts:scanRecent', options),
+  // Window attention/notification APIs for approval requests
+  requestWindowAttention: (options?: { critical?: boolean }) => ipcRenderer.invoke('window:requestAttention', options),
+  focusWindow: () => ipcRenderer.invoke('window:focus'),
+  isWindowVisible: () => ipcRenderer.invoke('window:isVisible'),
   getSettings: () => ipcRenderer.invoke('settings:get'),
   saveSettings: (s: Settings) => ipcRenderer.invoke('settings:save', s),
   enterpriseStatus: () => ipcRenderer.invoke('enterprise:status'),

@@ -1183,6 +1183,32 @@ ipcMain.handle('artifacts:scanRecent', (_e, options: { sinceMs?: number; limit?:
   })
 }))
 
+// Window attention/notification handlers for approval requests
+ipcMain.handle('window:requestAttention', (_e, options?: { critical?: boolean }) => {
+  if (!mainWindow) return false
+  // Flash taskbar on Windows, bounce dock on macOS
+  if (process.platform === 'win32' || process.platform === 'darwin') {
+    mainWindow.flashFrame(true)
+  }
+  // On macOS, also bounce the dock icon
+  if (process.platform === 'darwin' && app.dock) {
+    app.dock.bounce(options?.critical ? 'critical' : 'informational')
+  }
+  return true
+})
+
+ipcMain.handle('window:focus', () => {
+  if (!mainWindow) return false
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.focus()
+  return true
+})
+
+ipcMain.handle('window:isVisible', () => {
+  if (!mainWindow) return false
+  return mainWindow.isVisible() && mainWindow.isFocused()
+})
+
 app.whenReady().then(async () => {
   setBridgeDiagnosticsLogger(appendProviderBridgeLog)
   const b = await startBridge(BRIDGE_API_KEY)

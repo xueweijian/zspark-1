@@ -189,6 +189,10 @@ declare global {
       statPath: (path: string) => Promise<PathStatResult>
       openExternalUrl: (url: string) => Promise<{ ok: boolean; error?: string }>
       scanRecentArtifacts: (options?: { sinceMs?: number; limit?: number }) => Promise<ArtifactScanResult>
+      // Window attention/notification APIs for approval requests
+      requestWindowAttention?: (options?: { critical?: boolean }) => Promise<boolean>
+      focusWindow?: () => Promise<boolean>
+      isWindowVisible?: () => Promise<boolean>
       getSettings: () => Promise<AppSettingsView>
       saveSettings: (s: any) => Promise<{ ok: boolean; warnings?: string[]; error?: string }>
       enterpriseStatus: () => Promise<EnterpriseStatus>
@@ -2003,6 +2007,8 @@ function DesktopApp() {
     if (!request.turnId && currentTurn.current) request.turnId = currentTurn.current.turnId
     upsertApprovalBlock(request)
     scrollToLatest('smooth')
+    // Request window attention when approval is needed (flash taskbar/dock)
+    void window.zspark.requestWindowAttention?.({ critical: false })
   }
   const respondApproval = async (request: ApprovalRequest, mode: ApprovalDecisionMode) => {
     if (request.status !== 'pending') return
