@@ -62,7 +62,6 @@ pub fn get_platform_sandbox(windows_sandbox_enabled: bool) -> Option<SandboxType
     }
 }
 
-
 #[derive(Debug)]
 pub struct SandboxCommand {
     pub program: OsString,
@@ -71,7 +70,6 @@ pub struct SandboxCommand {
     pub env: HashMap<String, String>,
     pub additional_permissions: Option<AdditionalPermissionProfile>,
 }
-
 
 #[derive(Debug)]
 pub struct SandboxExecRequest {
@@ -105,7 +103,6 @@ pub struct SandboxTransformRequest<'a> {
     pub windows_sandbox_level: WindowsSandboxLevel,
     pub windows_sandbox_private_desktop: bool,
 }
-
 
 #[derive(Debug)]
 pub enum SandboxTransformError {
@@ -235,7 +232,6 @@ impl SandboxManager {
                     &effective_file_system_policy,
                     use_legacy_landlock,
                     allow_proxy_network,
-                )?;
                     is_wsl1(),
                 )?;
                 let mut args = create_linux_sandbox_command_args_for_permission_profile(
@@ -246,7 +242,6 @@ impl SandboxManager {
                     use_legacy_landlock,
                     allow_proxy_network,
                 )?;
-                );
                 let mut full_command = Vec::with_capacity(1 + args.len());
                 full_command.push(os_string_to_command_component(exe.as_os_str().to_owned()));
                 full_command.append(&mut args);
