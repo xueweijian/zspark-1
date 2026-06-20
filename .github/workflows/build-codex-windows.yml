@@ -1,24 +1,7 @@
 name: build-codex-windows
 
-# 在 GitHub Actions 的标准 windows-latest runner 上编译 codex.exe,
-# 产物供本地拉取使用(见 scripts/pull-codex.mjs)。
-# 与官方 rust-release-windows.yml 不同:不依赖 OpenAI 私有 runner group,
-# 不做代码签名,仅产出未签名的 dev 用二进制。
-#
-# 设计目标:首次编译尽量快(LTO 关闭 + codegen-units 调大),
-# 配合 Swatinem/rust-cache 让后续增量构建在几分钟内完成。
-#
-# 触发说明:同时支持 workflow_dispatch(手动)与 push(改本文件/codex-rs 时)。
-# 之所以同时保留 push:GitHub 对新注册 workflow 的 dispatch trigger 元数据传播
-# 偶尔严重滞后(dispatch 报 422),push 触发则立即生效,可作可靠兜底。
-
 on:
   workflow_dispatch:
-    inputs:
-      note:
-        description: '构建备注(可选,仅用于日志可读性)'
-        required: false
-        default: ''
   push:
     branches: [main]
     paths:
@@ -30,52 +13,33 @@ permissions:
 
 jobs:
   build:
-    name: Build codex.exe (Windows x64)
     runs-on: windows-latest
     timeout-minutes: 60
     defaults:
       run:
         working-directory: codex-rs
     env:
-      # 关闭 LTO 并调大 codegen-units,显著缩短首次编译时间。
-      # 代价:二进制略大、运行性能略低,但对本地 dev 调试场景完全够用。
       CARGO_PROFILE_RELEASE_LTO: 'off'
       CARGO_PROFILE_RELEASE_CODEGEN_UNITS: '16'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-        with:
-          persist-credentials: false
 
-      - name: Print build note
-        if: ${{ inputs.note != '' }}
-        shell: bash
-        run: echo "Build note: ${{ inputs.note }}"
-
-      - name: Install Rust toolchain (1.93.0, 对齐 rust-toolchain.toml)
-        uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26 # 1.93.0
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@a0b273b48ed29de4470960879e8381ff45632f26
         with:
           targets: x86_64-pc-windows-msvc
 
-      - name: Cargo cache (增量编译关键)
+      - name: Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: codex-rs
-          # 让缓存按 workflow 维度隔离,避免与其他 CI 互相覆盖
           key: build-codex-windows-v1
 
       - name: Build codex.exe
         shell: bash
-        run: cargo build --release --bin codex --timings
-
-      - name: Upload Cargo timings (可选,便于分析编译耗时)
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-timings-build-codex-windows
-          path: codex-rs/target/**/cargo-timings/cargo-timing.html
-          if-no-files-found: warn
-          retention-days: 7
+        run: cargo build --release --bin codex
 
       - name: Stage codex.exe
         shell: bash
